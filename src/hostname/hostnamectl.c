@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <getopt.h>
 #include <locale.h>
@@ -12,7 +12,7 @@
 #include "alloc-util.h"
 #include "architecture.h"
 #include "bus-error.h"
-#include "bus-util.h"
+#include "bus-map-properties.h"
 #include "hostname-util.h"
 #include "main-func.h"
 #include "pretty-print.h"
@@ -43,6 +43,8 @@ typedef struct StatusInfo {
         const char *virtualization;
         const char *architecture;
         const char *home_url;
+        const char *hardware_vendor;
+        const char *hardware_model;
 } StatusInfo;
 
 static void print_status_info(StatusInfo *i) {
@@ -107,6 +109,11 @@ static void print_status_info(StatusInfo *i) {
         if (!isempty(i->architecture))
                 printf("      Architecture: %s\n", i->architecture);
 
+        if (!isempty(i->hardware_vendor))
+                printf("   Hardware Vendor: %s\n", i->hardware_vendor);
+
+        if (!isempty(i->hardware_model))
+                printf("    Hardware Model: %s\n", i->hardware_model);
 }
 
 static int show_one_name(sd_bus *bus, const char* attr) {
@@ -150,6 +157,8 @@ static int show_all_names(sd_bus *bus, sd_bus_error *error) {
                 { "OperatingSystemPrettyName", "s", NULL, offsetof(StatusInfo, os_pretty_name)  },
                 { "OperatingSystemCPEName",    "s", NULL, offsetof(StatusInfo, os_cpe_name)     },
                 { "HomeURL",                   "s", NULL, offsetof(StatusInfo, home_url)        },
+                { "HardwareVendor",            "s", NULL, offsetof(StatusInfo, hardware_vendor) },
+                { "HardwareModel",             "s", NULL, offsetof(StatusInfo, hardware_model)  },
                 {}
         };
 
@@ -194,10 +203,9 @@ static int show_status(int argc, char **argv, void *userdata) {
         if (arg_pretty || arg_static || arg_transient) {
                 const char *attr;
 
-                if (!!arg_static + !!arg_pretty + !!arg_transient > 1) {
-                        log_error("Cannot query more than one name type at a time");
-                        return -EINVAL;
-                }
+                if (!!arg_static + !!arg_pretty + !!arg_transient > 1)
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                               "Cannot query more than one name type at a time");
 
                 attr = arg_pretty ? "PrettyHostname" :
                         arg_static ? "StaticHostname" : "Hostname";
@@ -229,7 +237,7 @@ static int set_simple_string(sd_bus *bus, const char *method, const char *value)
                         &error, NULL,
                         "sb", value, arg_ask_password);
         if (r < 0)
-                return log_error_errno(r, "Could not set property: %s", bus_error_message(&error, -r));
+                return log_error_errno(r, "Could not set property: %s", bus_error_message(&error, r));
 
         return 0;
 }
@@ -249,7 +257,7 @@ static int set_hostname(int argc, char **argv, void *userdata) {
                 /* If the passed hostname is already valid, then assume the user doesn't know anything about pretty
                  * hostnames, so let's unset the pretty hostname, and just set the passed hostname as static/dynamic
                  * hostname. */
-                if (arg_static && hostname_is_valid(hostname, true))
+                if (arg_static && hostname_is_valid(hostname, VALID_HOSTNAME_TRAILING_DOT))
                         p = ""; /* No pretty hostname (as it is redundant), just a static one */
                 else
                         p = hostname; /* Use the passed name as pretty hostname */
@@ -436,9 +444,7 @@ static int run(int argc, char *argv[]) {
         int r;
 
         setlocale(LC_ALL, "");
-        log_show_color(true);
-        log_parse_environment();
-        log_open();
+        log_setup_cli();
 
         r = parse_argv(argc, argv);
         if (r <= 0)
@@ -446,7 +452,7 @@ static int run(int argc, char *argv[]) {
 
         r = bus_connect_transport(arg_transport, arg_host, false, &bus);
         if (r < 0)
-                return log_error_errno(r, "Failed to create bus connection: %m");
+                return bus_log_connect_error(r);
 
         return hostnamectl_main(bus, argc, argv);
 }

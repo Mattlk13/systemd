@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "random-util.h"
 #include "serialize.h"
@@ -333,17 +333,17 @@ static void test_format_timestamp(void) {
                 assert_se(parse_timestamp(buf, &y) >= 0);
                 assert_se(x / USEC_PER_SEC == y / USEC_PER_SEC);
 
-                assert_se(format_timestamp_utc(buf, sizeof(buf), x));
+                assert_se(format_timestamp_style(buf, sizeof(buf), x, TIMESTAMP_UTC));
                 log_info("%s", buf);
                 assert_se(parse_timestamp(buf, &y) >= 0);
                 assert_se(x / USEC_PER_SEC == y / USEC_PER_SEC);
 
-                assert_se(format_timestamp_us(buf, sizeof(buf), x));
+                assert_se(format_timestamp_style(buf, sizeof(buf), x, TIMESTAMP_US));
                 log_info("%s", buf);
                 assert_se(parse_timestamp(buf, &y) >= 0);
                 assert_se(x == y);
 
-                assert_se(format_timestamp_us_utc(buf, sizeof(buf), x));
+                assert_se(format_timestamp_style(buf, sizeof(buf), x, TIMESTAMP_US_UTC));
                 log_info("%s", buf);
                 assert_se(parse_timestamp(buf, &y) >= 0);
                 assert_se(x == y);
@@ -364,7 +364,7 @@ static void test_format_timestamp_utc_one(usec_t val, const char *result) {
         char buf[FORMAT_TIMESTAMP_MAX];
         const char *t;
 
-        t = format_timestamp_utc(buf, sizeof(buf), val);
+        t = format_timestamp_style(buf, sizeof(buf), val, TIMESTAMP_UTC);
         assert_se(streq_ptr(t, result));
 }
 
@@ -433,7 +433,7 @@ static void assert_similar(usec_t a, usec_t b) {
         else
                 d = b - a;
 
-        assert(d < 10*USEC_PER_SEC);
+        assert_se(d < 10*USEC_PER_SEC);
 }
 
 static void test_usec_shift_clock(void) {
@@ -480,7 +480,39 @@ static void test_in_utc_timezone(void) {
         assert_se(streq(tzname[0], "CET"));
         assert_se(streq(tzname[1], "CEST"));
 
-        assert_se(unsetenv("TZ") >= 0);
+        assert_se(unsetenv("TZ") == 0);
+}
+
+static void test_map_clock_usec(void) {
+        usec_t nowr, x, y, z;
+
+        log_info("/* %s */", __func__);
+        nowr = now(CLOCK_REALTIME);
+
+        x = nowr; /* right now */
+        y = map_clock_usec(x, CLOCK_REALTIME, CLOCK_MONOTONIC);
+        z = map_clock_usec(y, CLOCK_MONOTONIC, CLOCK_REALTIME);
+        /* Converting forth and back will introduce inaccuracies, since we cannot query both clocks atomically, but it should be small. Even on the slowest CI smaller than 1h */
+
+        assert_se((z > x ? z - x : x - z) < USEC_PER_HOUR);
+
+        assert_se(nowr < USEC_INFINITY - USEC_PER_DAY*7); /* overflow check */
+        x = nowr + USEC_PER_DAY*7; /* 1 week from now */
+        y = map_clock_usec(x, CLOCK_REALTIME, CLOCK_MONOTONIC);
+        assert_se(y > 0 && y < USEC_INFINITY);
+        z = map_clock_usec(y, CLOCK_MONOTONIC, CLOCK_REALTIME);
+        assert_se(z > 0 && z < USEC_INFINITY);
+        assert_se((z > x ? z - x : x - z) < USEC_PER_HOUR);
+
+        assert_se(nowr > USEC_PER_DAY * 7); /* underflow check */
+        x = nowr - USEC_PER_DAY*7; /* 1 week ago */
+        y = map_clock_usec(x, CLOCK_REALTIME, CLOCK_MONOTONIC);
+        if (y != 0) { /* might underflow if machine is not up long enough for the monotonic clock to be beyond 1w */
+                assert_se(y < USEC_INFINITY);
+                z = map_clock_usec(y, CLOCK_MONOTONIC, CLOCK_REALTIME);
+                assert_se(z > 0 && z < USEC_INFINITY);
+                assert_se((z > x ? z - x : x - z) < USEC_PER_HOUR);
+        }
 }
 
 int main(int argc, char *argv[]) {
@@ -511,6 +543,7 @@ int main(int argc, char *argv[]) {
         test_deserialize_dual_timestamp();
         test_usec_shift_clock();
         test_in_utc_timezone();
+        test_map_clock_usec();
 
         /* Ensure time_t is signed */
         assert_cc((time_t) -1 < (time_t) 1);

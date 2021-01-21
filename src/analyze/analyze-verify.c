@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <stdlib.h>
 
@@ -94,6 +94,7 @@ static int generate_path(char **var, char **filenames) {
 }
 
 static int verify_socket(Unit *u) {
+        Unit *service;
         int r;
 
         assert(u);
@@ -101,35 +102,30 @@ static int verify_socket(Unit *u) {
         if (u->type != UNIT_SOCKET)
                 return 0;
 
-        /* Cannot run this without the service being around */
-
-        /* This makes sure instance is created if necessary. */
-        r = socket_instantiate_service(SOCKET(u));
+        r = socket_load_service_unit(SOCKET(u), -1, &service);
         if (r < 0)
-                return log_unit_error_errno(u, r, "Socket cannot be started, failed to create instance: %m");
+                return log_unit_error_errno(u, r, "service unit for the socket cannot be loaded: %m");
 
-        /* This checks both type of sockets */
-        if (UNIT_ISSET(SOCKET(u)->service)) {
-                Service *service;
+        if (service->load_state != UNIT_LOADED)
+                return log_unit_error_errno(u, SYNTHETIC_ERRNO(ENOENT),
+                                            "service %s not loaded, socket cannot be started.", service->id);
 
-                service = SERVICE(UNIT_DEREF(SOCKET(u)->service));
-                log_unit_debug(u, "Using %s", UNIT(service)->id);
-
-                if (UNIT(service)->load_state != UNIT_LOADED) {
-                        log_unit_error(u, "Service %s not loaded, %s cannot be started.", UNIT(service)->id, u->id);
-                        return -ENOENT;
-                }
-        }
-
+        log_unit_debug(u, "using service unit %s.", service->id);
         return 0;
 }
 
-static int verify_executable(Unit *u, ExecCommand *exec) {
+int verify_executable(Unit *u, const ExecCommand *exec) {
+        int r;
+
         if (!exec)
                 return 0;
 
-        if (access(exec->path, X_OK) < 0)
-                return log_unit_error_errno(u, errno, "Command %s is not executable: %m", exec->path);
+        if (exec->flags & EXEC_COMMAND_IGNORE_FAILURE)
+                return 0;
+
+        r = find_executable_full(exec->path, false, NULL, NULL);
+        if (r < 0)
+                return log_unit_error_errno(u, r, "Command %s is not executable: %m", exec->path);
 
         return 0;
 }
@@ -230,7 +226,7 @@ int verify_units(char **filenames, UnitFileScope scope, bool check_man, bool run
         _cleanup_(manager_freep) Manager *m = NULL;
         Unit *units[strv_length(filenames)];
         _cleanup_free_ char *var = NULL;
-        int r = 0, k, i, count = 0;
+        int r, k, i, count = 0;
         char **filename;
 
         if (strv_isempty(filenames))

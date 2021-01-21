@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 #include <stdbool.h>
@@ -27,6 +27,8 @@ DEFINE_TRIVIAL_CLEANUP_FUNC(CK_FUNCTION_LIST**, p11_kit_modules_finalize_and_rel
 CK_RV pkcs11_get_slot_list_malloc(CK_FUNCTION_LIST *m, CK_SLOT_ID **ret_slotids, CK_ULONG *ret_n_slotids);
 
 char *pkcs11_token_label(const CK_TOKEN_INFO *token_info);
+char *pkcs11_token_manufacturer_id(const CK_TOKEN_INFO *token_info);
+char *pkcs11_token_model(const CK_TOKEN_INFO *token_info);
 
 int pkcs11_token_login(CK_FUNCTION_LIST *m, CK_SESSION_HANDLE session, CK_SLOT_ID slotid, const CK_TOKEN_INFO *token_info, const char *friendly_name, const char *icon_name, const char *keyname, usec_t until, char **ret_used_pin);
 
@@ -42,4 +44,12 @@ int pkcs11_token_acquire_rng(CK_FUNCTION_LIST *m, CK_SESSION_HANDLE session);
 
 typedef int (*pkcs11_find_token_callback_t)(CK_FUNCTION_LIST *m, CK_SESSION_HANDLE session, CK_SLOT_ID slotid, const CK_SLOT_INFO *slot_info, const CK_TOKEN_INFO *token_info, P11KitUri *uri, void *userdata);
 int pkcs11_find_token(const char *pkcs11_uri, pkcs11_find_token_callback_t callback, void *userdata);
+
+#if HAVE_OPENSSL
+int pkcs11_acquire_certificate(const char *uri, const char *askpw_friendly_name, const char *askpw_icon_name, X509 **ret_cert, char **ret_pin_used);
 #endif
+
+#endif
+
+int pkcs11_list_tokens(void);
+int pkcs11_find_token_auto(char **ret);

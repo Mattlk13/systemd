@@ -1,6 +1,7 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
+#include <linux/loadavg.h>
 #include <locale.h>
 #include <math.h>
 #include <sys/socket.h>
@@ -10,6 +11,9 @@
 #include "log.h"
 #include "parse-util.h"
 #include "string-util.h"
+#if HAVE_SECCOMP
+#include "seccomp-util.h"
+#endif
 
 static void test_parse_boolean(void) {
         assert_se(parse_boolean("1") == 1);
@@ -75,14 +79,22 @@ static void test_parse_mode(void) {
         mode_t m;
 
         assert_se(parse_mode("-1", &m) < 0);
+        assert_se(parse_mode("+1", &m) < 0);
         assert_se(parse_mode("", &m) < 0);
         assert_se(parse_mode("888", &m) < 0);
         assert_se(parse_mode("77777", &m) < 0);
 
         assert_se(parse_mode("544", &m) >= 0 && m == 0544);
+        assert_se(parse_mode("0544", &m) >= 0 && m == 0544);
+        assert_se(parse_mode("00544", &m) >= 0 && m == 0544);
         assert_se(parse_mode("777", &m) >= 0 && m == 0777);
+        assert_se(parse_mode("0777", &m) >= 0 && m == 0777);
+        assert_se(parse_mode("00777", &m) >= 0 && m == 0777);
         assert_se(parse_mode("7777", &m) >= 0 && m == 07777);
+        assert_se(parse_mode("07777", &m) >= 0 && m == 07777);
+        assert_se(parse_mode("007777", &m) >= 0 && m == 07777);
         assert_se(parse_mode("0", &m) >= 0 && m == 0);
+        assert_se(parse_mode(" 1", &m) >= 0 && m == 1);
 }
 
 static void test_parse_size(void) {
@@ -358,6 +370,18 @@ static void test_safe_atolli(void) {
         assert_se(r == 0);
         assert_se(l == -12345);
 
+        r = safe_atolli("0x5", &l);
+        assert_se(r == 0);
+        assert_se(l == 5);
+
+        r = safe_atolli("0o6", &l);
+        assert_se(r == 0);
+        assert_se(l == 6);
+
+        r = safe_atolli("0B101", &l);
+        assert_se(r == 0);
+        assert_se(l == 5);
+
         r = safe_atolli("12345678901234567890", &l);
         assert_se(r == -ERANGE);
 
@@ -431,6 +455,14 @@ static void test_safe_atoi16(void) {
         assert_se(r == 0);
         assert_se(l == 32767);
 
+        r = safe_atoi16("0o11", &l);
+        assert_se(r == 0);
+        assert_se(l == 9);
+
+        r = safe_atoi16("0B110", &l);
+        assert_se(r == 0);
+        assert_se(l == 6);
+
         r = safe_atoi16("36536", &l);
         assert_se(r == -ERANGE);
 
@@ -475,6 +507,13 @@ static void test_safe_atoux16(void) {
         r = safe_atoux16("  -1", &l);
         assert_se(r == -ERANGE);
 
+        r = safe_atoux16("0b1", &l);
+        assert_se(r == 0);
+        assert_se(l == 177);
+
+        r = safe_atoux16("0o70", &l);
+        assert_se(r == -EINVAL);
+
         r = safe_atoux16("junk", &l);
         assert_se(r == -EINVAL);
 
@@ -499,6 +538,14 @@ static void test_safe_atou64(void) {
         r = safe_atou64("  12345", &l);
         assert_se(r == 0);
         assert_se(l == 12345);
+
+        r = safe_atou64("0o11", &l);
+        assert_se(r == 0);
+        assert_se(l == 9);
+
+        r = safe_atou64("0b11", &l);
+        assert_se(r == 0);
+        assert_se(l == 3);
 
         r = safe_atou64("18446744073709551617", &l);
         assert_se(r == -ERANGE);
@@ -542,6 +589,14 @@ static void test_safe_atoi64(void) {
         assert_se(r == 0);
         assert_se(l == 32767);
 
+        r = safe_atoi64("  0o20", &l);
+        assert_se(r == 0);
+        assert_se(l == 16);
+
+        r = safe_atoi64("  0b01010", &l);
+        assert_se(r == 0);
+        assert_se(l == 10);
+
         r = safe_atoi64("9223372036854775813", &l);
         assert_se(r == -ERANGE);
 
@@ -558,6 +613,51 @@ static void test_safe_atoi64(void) {
         assert_se(r == -EINVAL);
 
         r = safe_atoi64("", &l);
+        assert_se(r == -EINVAL);
+}
+
+static void test_safe_atoux64(void) {
+        int r;
+        uint64_t l;
+
+        r = safe_atoux64("12345", &l);
+        assert_se(r == 0);
+        assert_se(l == 0x12345);
+
+        r = safe_atoux64("  12345", &l);
+        assert_se(r == 0);
+        assert_se(l == 0x12345);
+
+        r = safe_atoux64("0x12345", &l);
+        assert_se(r == 0);
+        assert_se(l == 0x12345);
+
+        r = safe_atoux64("0b11011", &l);
+        assert_se(r == 0);
+        assert_se(l == 11603985);
+
+        r = safe_atoux64("0o11011", &l);
+        assert_se(r == -EINVAL);
+
+        r = safe_atoux64("18446744073709551617", &l);
+        assert_se(r == -ERANGE);
+
+        r = safe_atoux64("-1", &l);
+        assert_se(r == -ERANGE);
+
+        r = safe_atoux64("  -1", &l);
+        assert_se(r == -ERANGE);
+
+        r = safe_atoux64("junk", &l);
+        assert_se(r == -EINVAL);
+
+        r = safe_atoux64("123x", &l);
+        assert_se(r == -EINVAL);
+
+        r = safe_atoux64("12.3", &l);
+        assert_se(r == -EINVAL);
+
+        r = safe_atoux64("", &l);
         assert_se(r == -EINVAL);
 }
 
@@ -756,6 +856,7 @@ static void test_parse_errno(void) {
 }
 
 static void test_parse_syscall_and_errno(void) {
+#if HAVE_SECCOMP
         _cleanup_free_ char *n = NULL;
         int e;
 
@@ -786,11 +887,16 @@ static void test_parse_syscall_and_errno(void) {
         assert_se(e == 255);
         n = mfree(n);
 
+        assert_se(parse_syscall_and_errno("hoge:kill", &n, &e) >= 0);
+        assert_se(streq(n, "hoge"));
+        assert_se(e == SECCOMP_ERROR_NUMBER_KILL);
+        n = mfree(n);
+
         /* The function checks the syscall name is empty or not. */
         assert_se(parse_syscall_and_errno("", &n, &e) == -EINVAL);
         assert_se(parse_syscall_and_errno(":255", &n, &e) == -EINVAL);
 
-        /* errno must be a valid errno name or number between 0 and ERRNO_MAX == 4095 */
+        /* errno must be a valid errno name or number between 0 and ERRNO_MAX == 4095, or "kill" */
         assert_se(parse_syscall_and_errno("hoge:4096", &n, &e) == -ERANGE);
         assert_se(parse_syscall_and_errno("hoge:-3", &n, &e) == -ERANGE);
         assert_se(parse_syscall_and_errno("hoge:12.3", &n, &e) == -EINVAL);
@@ -800,6 +906,7 @@ static void test_parse_syscall_and_errno(void) {
         assert_se(parse_syscall_and_errno("hoge:-EINVAL", &n, &e) == -EINVAL);
         assert_se(parse_syscall_and_errno("hoge:EINVALaaa", &n, &e) == -EINVAL);
         assert_se(parse_syscall_and_errno("hoge:", &n, &e) == -EINVAL);
+#endif
 }
 
 static void test_parse_mtu(void) {
@@ -823,6 +930,42 @@ static void test_parse_mtu(void) {
         assert_se(parse_mtu(AF_UNSPEC, "", &mtu) == -EINVAL);
 }
 
+static void test_parse_loadavg_fixed_point(void) {
+        loadavg_t fp;
+
+        assert_se(parse_loadavg_fixed_point("1.23", &fp) == 0);
+        assert_se(LOAD_INT(fp) == 1);
+        assert_se(LOAD_FRAC(fp) == 23);
+
+        assert_se(parse_loadavg_fixed_point("1.80", &fp) == 0);
+        assert_se(LOAD_INT(fp) == 1);
+        assert_se(LOAD_FRAC(fp) == 80);
+
+        assert_se(parse_loadavg_fixed_point("0.07", &fp) == 0);
+        assert_se(LOAD_INT(fp) == 0);
+        assert_se(LOAD_FRAC(fp) == 7);
+
+        assert_se(parse_loadavg_fixed_point("0.00", &fp) == 0);
+        assert_se(LOAD_INT(fp) == 0);
+        assert_se(LOAD_FRAC(fp) == 0);
+
+        assert_se(parse_loadavg_fixed_point("4096.57", &fp) == 0);
+        assert_se(LOAD_INT(fp) == 4096);
+        assert_se(LOAD_FRAC(fp) == 57);
+
+        /* Caps out at 2 digit fracs */
+        assert_se(parse_loadavg_fixed_point("1.100", &fp) == -ERANGE);
+
+        assert_se(parse_loadavg_fixed_point("4096.4096", &fp) == -ERANGE);
+        assert_se(parse_loadavg_fixed_point("-4000.5", &fp) == -ERANGE);
+        assert_se(parse_loadavg_fixed_point("18446744073709551615.5", &fp) == -ERANGE);
+        assert_se(parse_loadavg_fixed_point("foobar", &fp) == -EINVAL);
+        assert_se(parse_loadavg_fixed_point("3333", &fp) == -EINVAL);
+        assert_se(parse_loadavg_fixed_point("1.2.3", &fp) == -EINVAL);
+        assert_se(parse_loadavg_fixed_point(".", &fp) == -EINVAL);
+        assert_se(parse_loadavg_fixed_point("", &fp) == -EINVAL);
+}
+
 int main(int argc, char *argv[]) {
         log_parse_environment();
         log_open();
@@ -838,6 +981,7 @@ int main(int argc, char *argv[]) {
         test_safe_atoux16();
         test_safe_atou64();
         test_safe_atoi64();
+        test_safe_atoux64();
         test_safe_atod();
         test_parse_percent();
         test_parse_percent_unbounded();
@@ -848,6 +992,7 @@ int main(int argc, char *argv[]) {
         test_parse_errno();
         test_parse_syscall_and_errno();
         test_parse_mtu();
+        test_parse_loadavg_fixed_point();
 
         return 0;
 }

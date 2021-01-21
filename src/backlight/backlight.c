@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -13,10 +13,35 @@
 #include "main-func.h"
 #include "mkdir.h"
 #include "parse-util.h"
+#include "pretty-print.h"
+#include "terminal-util.h"
 #include "reboot-util.h"
 #include "string-util.h"
 #include "strv.h"
 #include "util.h"
+
+static int help(void) {
+        _cleanup_free_ char *link = NULL;
+        int r;
+
+        r = terminal_urlify_man("systemd-backlight", "8", &link);
+        if (r < 0)
+                return log_oom();
+
+        printf("%s save [backlight|leds]:DEVICE\n"
+               "%s load [backlight|leds]:DEVICE\n"
+               "\n%sSave and restore backlight brightness at shutdown and boot.%s\n\n"
+               "  save            Save current brightness\n"
+               "  load            Set brightness to be the previously saved value\n"
+               "\nSee the %s for details.\n"
+               , program_invocation_short_name
+               , program_invocation_short_name
+               , ansi_highlight(), ansi_normal()
+               , link
+        );
+
+        return 0;
+}
 
 static int find_pci_or_platform_parent(sd_device *device, sd_device **ret) {
         const char *subsystem, *sysname, *value;
@@ -54,7 +79,7 @@ static int find_pci_or_platform_parent(sd_device *device, sd_device **ret) {
 
         } else if (streq(subsystem, "pci") &&
                    sd_device_get_sysattr_value(parent, "class", &value) >= 0) {
-                unsigned long class = 0;
+                unsigned long class;
 
                 r = safe_atolu(value, &class);
                 if (r < 0)
@@ -224,11 +249,10 @@ static int get_max_brightness(sd_device *device, unsigned *ret) {
         if (r < 0)
                 return log_device_warning_errno(device, r, "Failed to parse 'max_brightness' \"%s\": %m", max_brightness_str);
 
-        if (max_brightness <= 0) {
-                log_device_warning(device, "Maximum brightness is 0, ignoring device.");
-                return -EINVAL;
-        }
+        if (max_brightness <= 0)
+                return log_device_warning_errno(device, SYNTHETIC_ERRNO(EINVAL), "Maximum brightness is 0, ignoring device.");
 
+        log_device_debug(device, "Maximum brightness is %u", max_brightness);
         *ret = max_brightness;
         return 0;
 }
@@ -238,17 +262,13 @@ static int get_max_brightness(sd_device *device, unsigned *ret) {
  * max_brightness in case of 'backlight' subsystem. This avoids preserving
  * an unreadably dim screen, which would otherwise force the user to
  * disable state restoration. */
-static int clamp_brightness(sd_device *device, char **value, unsigned max_brightness) {
-        unsigned brightness, new_brightness, min_brightness;
+static int clamp_brightness(sd_device *device, bool saved, unsigned max_brightness, unsigned *brightness) {
+        unsigned new_brightness, min_brightness;
         const char *subsystem;
         int r;
 
-        assert(value);
-        assert(*value);
-
-        r = safe_atou(*value, &brightness);
-        if (r < 0)
-                return log_device_warning_errno(device, r, "Failed to parse brightness \"%s\": %m", *value);
+        assert(device);
+        assert(brightness);
 
         r = sd_device_get_subsystem(device, &subsystem);
         if (r < 0)
@@ -259,22 +279,16 @@ static int clamp_brightness(sd_device *device, char **value, unsigned max_bright
         else
                 min_brightness = 0;
 
-        new_brightness = CLAMP(brightness, min_brightness, max_brightness);
-        if (new_brightness != brightness) {
-                char *new_value;
-
-                r = asprintf(&new_value, "%u", new_brightness);
-                if (r < 0)
-                        return log_oom();
-
-                log_device_info(device, "Saved brightness %s %s to %s.", *value,
-                                new_brightness > brightness ?
+        new_brightness = CLAMP(*brightness, min_brightness, max_brightness);
+        if (new_brightness != *brightness)
+                log_device_info(device, "%s brightness %u is %s to %u.",
+                                saved ? "Saved" : "Current",
+                                *brightness,
+                                new_brightness > *brightness ?
                                 "too low; increasing" : "too high; decreasing",
-                                new_value);
+                                new_brightness);
 
-                free_and_replace(*value, new_value);
-        }
-
+        *brightness = new_brightness;
         return 0;
 }
 
@@ -286,7 +300,8 @@ static bool shall_clamp(sd_device *d) {
 
         r = sd_device_get_property_value(d, "ID_BACKLIGHT_CLAMP", &s);
         if (r < 0) {
-                log_device_debug_errno(d, r, "Failed to get ID_BACKLIGHT_CLAMP property, ignoring: %m");
+                if (r != -ENOENT)
+                        log_device_debug_errno(d, r, "Failed to get ID_BACKLIGHT_CLAMP property, ignoring: %m");
                 return true;
         }
 
@@ -299,19 +314,79 @@ static bool shall_clamp(sd_device *d) {
         return r;
 }
 
+static int read_brightness(sd_device *device, unsigned max_brightness, unsigned *ret_brightness) {
+        const char *subsystem, *value;
+        unsigned brightness;
+        int r;
+
+        assert(device);
+        assert(ret_brightness);
+
+        r = sd_device_get_subsystem(device, &subsystem);
+        if (r < 0)
+                return log_device_debug_errno(device, r, "Failed to get subsystem: %m");
+
+        if (streq(subsystem, "backlight")) {
+                r = sd_device_get_sysattr_value(device, "actual_brightness", &value);
+                if (r == -ENOENT) {
+                        log_device_debug_errno(device, r, "Failed to read 'actual_brightness' attribute, "
+                                               "fall back to use 'brightness' attribute: %m");
+                        goto use_brightness;
+                }
+                if (r < 0)
+                        return log_device_debug_errno(device, r, "Failed to read 'actual_brightness' attribute: %m");
+
+                r = safe_atou(value, &brightness);
+                if (r < 0) {
+                        log_device_debug_errno(device, r, "Failed to parse 'actual_brightness' attribute, "
+                                               "fall back to use 'brightness' attribute: %s", value);
+                        goto use_brightness;
+                }
+
+                if (brightness > max_brightness) {
+                        log_device_debug(device, "actual_brightness=%u is larger than max_brightness=%u, "
+                                         "fall back to use 'brightness' attribute", brightness, max_brightness);
+                        goto use_brightness;
+                }
+
+                log_device_debug(device, "Current actual_brightness is %u", brightness);
+                *ret_brightness = brightness;
+                return 0;
+        }
+
+use_brightness:
+        r = sd_device_get_sysattr_value(device, "brightness", &value);
+        if (r < 0)
+                return log_device_debug_errno(device, r, "Failed to read 'brightness' attribute: %m");
+
+        r = safe_atou(value, &brightness);
+        if (r < 0)
+                return log_device_debug_errno(device, r, "Failed to parse 'brightness' attribute: %s", value);
+
+        if (brightness > max_brightness)
+                return log_device_debug_errno(device, SYNTHETIC_ERRNO(EINVAL),
+                                              "brightness=%u is larger than max_brightness=%u",
+                                              brightness, max_brightness);
+
+        log_device_debug(device, "Current brightness is %u", brightness);
+        *ret_brightness = brightness;
+        return 0;
+}
+
 static int run(int argc, char *argv[]) {
         _cleanup_(sd_device_unrefp) sd_device *device = NULL;
         _cleanup_free_ char *escaped_ss = NULL, *escaped_sysname = NULL, *escaped_path_id = NULL;
         const char *sysname, *path_id, *ss, *saved;
-        unsigned max_brightness;
+        unsigned max_brightness, brightness;
         int r;
 
-        if (argc != 3) {
-                log_error("This program requires two arguments.");
-                return -EINVAL;
-        }
-
         log_setup_service();
+
+        if (strv_contains(strv_skip(argv, 1), "--help"))
+                return help();
+
+        if (argc != 3)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "This program requires two arguments.");
 
         umask(0022);
 
@@ -320,19 +395,15 @@ static int run(int argc, char *argv[]) {
                 return log_error_errno(r, "Failed to create backlight directory /var/lib/systemd/backlight: %m");
 
         sysname = strchr(argv[2], ':');
-        if (!sysname) {
-                log_error("Requires a subsystem and sysname pair specifying a backlight device.");
-                return -EINVAL;
-        }
+        if (!sysname)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Requires a subsystem and sysname pair specifying a backlight device.");
 
         ss = strndupa(argv[2], sysname - argv[2]);
 
         sysname++;
 
-        if (!STR_IN_SET(ss, "backlight", "leds")) {
-                log_error("Not a backlight or LED device: '%s:%s'", ss, sysname);
-                return -EINVAL;
-        }
+        if (!STR_IN_SET(ss, "backlight", "leds"))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Not a backlight or LED device: '%s:%s'", ss, sysname);
 
         r = sd_device_new_from_subsystem_sysname(&device, ss, sysname);
         if (r < 0)
@@ -383,51 +454,56 @@ static int run(int argc, char *argv[]) {
                 clamp = shall_clamp(device);
 
                 r = read_one_line_file(saved, &value);
-                if (IN_SET(r, -ENOENT, 0)) {
-                        const char *curval;
+                if (r < 0 && r != -ENOENT)
+                        return log_error_errno(r, "Failed to read %s: %m", saved);
+                if (r > 0) {
+                        r = safe_atou(value, &brightness);
+                        if (r < 0) {
+                                log_warning_errno(r, "Failed to parse saved brightness '%s', removing %s.",
+                                                  value, saved);
+                                (void) unlink(saved);
+                        } else {
+                                log_debug("Using saved brightness %u.", brightness);
+                                if (clamp)
+                                        (void) clamp_brightness(device, true, max_brightness, &brightness);
 
-                        /* Fallback to clamping current brightness or exit early if
-                         * clamping is not supported/enabled. */
+                                /* Do not fall back to read current brightness below. */
+                                r = 1;
+                        }
+                }
+                if (r <= 0) {
+                        /* Fallback to clamping current brightness or exit early if clamping is not
+                         * supported/enabled. */
                         if (!clamp)
                                 return 0;
 
-                        r = sd_device_get_sysattr_value(device, "brightness", &curval);
+                        r = read_brightness(device, max_brightness, &brightness);
                         if (r < 0)
-                                return log_device_warning_errno(device, r, "Failed to read 'brightness' attribute: %m");
+                                return log_device_error_errno(device, r, "Failed to read current brightness: %m");
 
-                        value = strdup(curval);
-                        if (!value)
-                                return log_oom();
-                } else if (r < 0)
-                        return log_error_errno(r, "Failed to read %s: %m", saved);
+                        (void) clamp_brightness(device, false, max_brightness, &brightness);
+                }
 
-                if (clamp)
-                        (void) clamp_brightness(device, &value, max_brightness);
-
-                r = sd_device_set_sysattr_value(device, "brightness", value);
+                r = sd_device_set_sysattr_valuef(device, "brightness", "%u", brightness);
                 if (r < 0)
                         return log_device_error_errno(device, r, "Failed to write system 'brightness' attribute: %m");
 
         } else if (streq(argv[1], "save")) {
-                const char *value;
-
                 if (validate_device(device) == 0) {
                         (void) unlink(saved);
                         return 0;
                 }
 
-                r = sd_device_get_sysattr_value(device, "brightness", &value);
+                r = read_brightness(device, max_brightness, &brightness);
                 if (r < 0)
-                        return log_device_error_errno(device, r, "Failed to read system 'brightness' attribute: %m");
+                        return log_device_error_errno(device, r, "Failed to read current brightness: %m");
 
-                r = write_string_file(saved, value, WRITE_STRING_FILE_CREATE);
+                r = write_string_filef(saved, WRITE_STRING_FILE_CREATE, "%u", brightness);
                 if (r < 0)
                         return log_device_error_errno(device, r, "Failed to write %s: %m", saved);
 
-        } else {
-                log_error("Unknown verb %s.", argv[1]);
-                return -EINVAL;
-        }
+        } else
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Unknown verb %s.", argv[1]);
 
         return 0;
 }

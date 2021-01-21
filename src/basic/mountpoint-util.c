@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
 #include <fcntl.h>
@@ -8,11 +8,17 @@
 #include "fd-util.h"
 #include "fileio.h"
 #include "fs-util.h"
+#include "label.h"
+#include "missing_stat.h"
+#include "missing_syscall.h"
+#include "mkdir.h"
 #include "mountpoint-util.h"
 #include "parse-util.h"
 #include "path-util.h"
+#include "stat-util.h"
 #include "stdio-util.h"
 #include "strv.h"
+#include "user-util.h"
 
 /* This is the original MAX_HANDLE_SZ definition from the kernel, when the API was introduced. We use that in place of
  * any more currently defined value to future-proof things: if the size is increased in the API headers, and our code
@@ -31,6 +37,8 @@ int name_to_handle_at_loop(
 
         _cleanup_free_ struct file_handle *h = NULL;
         size_t n = ORIGINAL_MAX_HANDLE_SZ;
+
+        assert((flags & ~(AT_SYMLINK_FOLLOW|AT_EMPTY_PATH)) == 0);
 
         /* We need to invoke name_to_handle_at() in a loop, given that it might return EOVERFLOW when the specified
          * buffer is too small. Note that in contrast to what the docs might suggest, MAX_HANDLE_SZ is only good as a
@@ -86,12 +94,15 @@ int name_to_handle_at_loop(
         }
 }
 
-static int fd_fdinfo_mnt_id(int fd, const char *filename, int flags, int *mnt_id) {
+static int fd_fdinfo_mnt_id(int fd, const char *filename, int flags, int *ret_mnt_id) {
         char path[STRLEN("/proc/self/fdinfo/") + DECIMAL_STR_MAX(int)];
         _cleanup_free_ char *fdinfo = NULL;
         _cleanup_close_ int subfd = -1;
         char *p;
         int r;
+
+        assert(ret_mnt_id);
+        assert((flags & ~(AT_SYMLINK_FOLLOW|AT_EMPTY_PATH)) == 0);
 
         if ((flags & AT_EMPTY_PATH) && isempty(filename))
                 xsprintf(path, "/proc/self/fdinfo/%i", fd);
@@ -121,41 +132,77 @@ static int fd_fdinfo_mnt_id(int fd, const char *filename, int flags, int *mnt_id
         p += strspn(p, WHITESPACE);
         p[strcspn(p, WHITESPACE)] = 0;
 
-        return safe_atoi(p, mnt_id);
+        return safe_atoi(p, ret_mnt_id);
+}
+
+static bool filename_possibly_with_slash_suffix(const char *s) {
+        const char *slash, *copied;
+
+        /* Checks whether the specified string is either file name, or a filename with a suffix of
+         * slashes. But nothing else.
+         *
+         * this is OK: foo, bar, foo/, bar/, foo//, bar///
+         * this is not OK: "", "/", "/foo", "foo/bar", ".", ".." … */
+
+        slash = strchr(s, '/');
+        if (!slash)
+                return filename_is_valid(s);
+
+        if (slash - s > FILENAME_MAX) /* We want to allocate on the stack below, hence do a size check first */
+                return false;
+
+        if (slash[strspn(slash, "/")] != 0) /* Check that the suffix consist only of one or more slashes */
+                return false;
+
+        copied = strndupa(s, slash - s);
+        return filename_is_valid(copied);
 }
 
 int fd_is_mount_point(int fd, const char *filename, int flags) {
         _cleanup_free_ struct file_handle *h = NULL, *h_parent = NULL;
         int mount_id = -1, mount_id_parent = -1;
         bool nosupp = false, check_st_dev = true;
+        STRUCT_STATX_DEFINE(sx);
         struct stat a, b;
         int r;
 
         assert(fd >= 0);
         assert(filename);
+        assert((flags & ~(AT_SYMLINK_FOLLOW|AT_EMPTY_PATH)) == 0);
 
-        /* First we will try the name_to_handle_at() syscall, which
-         * tells us the mount id and an opaque file "handle". It is
-         * not supported everywhere though (kernel compile-time
-         * option, not all file systems are hooked up). If it works
-         * the mount id is usually good enough to tell us whether
-         * something is a mount point.
+        /* Insist that the specified filename is actually a filename, and not a path, i.e. some inode further
+         * up or down the tree then immediately below the specified directory fd. */
+        if (!filename_possibly_with_slash_suffix(filename))
+                return -EINVAL;
+
+        /* First we will try statx()' STATX_ATTR_MOUNT_ROOT attribute, which is our ideal API, available
+         * since kernel 5.8.
          *
-         * If that didn't work we will try to read the mount id from
-         * /proc/self/fdinfo/<fd>. This is almost as good as
-         * name_to_handle_at(), however, does not return the
-         * opaque file handle. The opaque file handle is pretty useful
-         * to detect the root directory, which we should always
-         * consider a mount point. Hence we use this only as
-         * fallback. Exporting the mnt_id in fdinfo is a pretty recent
+         * If that fails, our second try is the name_to_handle_at() syscall, which tells us the mount id and
+         * an opaque file "handle". It is not supported everywhere though (kernel compile-time option, not
+         * all file systems are hooked up). If it works the mount id is usually good enough to tell us
+         * whether something is a mount point.
+         *
+         * If that didn't work we will try to read the mount id from /proc/self/fdinfo/<fd>. This is almost
+         * as good as name_to_handle_at(), however, does not return the opaque file handle. The opaque file
+         * handle is pretty useful to detect the root directory, which we should always consider a mount
+         * point. Hence we use this only as fallback. Exporting the mnt_id in fdinfo is a pretty recent
          * kernel addition.
          *
-         * As last fallback we do traditional fstat() based st_dev
-         * comparisons. This is how things were traditionally done,
-         * but unionfs breaks this since it exposes file
-         * systems with a variety of st_dev reported. Also, btrfs
-         * subvolumes have different st_dev, even though they aren't
-         * real mounts of their own. */
+         * As last fallback we do traditional fstat() based st_dev comparisons. This is how things were
+         * traditionally done, but unionfs breaks this since it exposes file systems with a variety of st_dev
+         * reported. Also, btrfs subvolumes have different st_dev, even though they aren't real mounts of
+         * their own. */
+
+        if (statx(fd, filename, (FLAGS_SET(flags, AT_SYMLINK_FOLLOW) ? 0 : AT_SYMLINK_NOFOLLOW) |
+                                (flags & AT_EMPTY_PATH) |
+                                AT_NO_AUTOMOUNT, 0, &sx) < 0) {
+                if (!ERRNO_IS_NOT_SUPPORTED(errno) && !ERRNO_IS_PRIVILEGE(errno))
+                        return -errno;
+
+                /* If statx() is not available or forbidden, fall back to name_to_handle_at() below */
+        } else if (FLAGS_SET(sx.stx_attributes_mask, STATX_ATTR_MOUNT_ROOT)) /* yay! */
+                return FLAGS_SET(sx.stx_attributes, STATX_ATTR_MOUNT_ROOT);
 
         r = name_to_handle_at_loop(fd, filename, &h, &mount_id, flags);
         if (IN_SET(r, -ENOSYS, -EACCES, -EPERM, -EOVERFLOW, -EINVAL))
@@ -166,7 +213,7 @@ int fd_is_mount_point(int fd, const char *filename, int flags) {
                 goto fallback_fdinfo;
         else if (r == -EOPNOTSUPP)
                 /* This kernel or file system does not support name_to_handle_at(), hence let's see if the upper fs
-                 * supports it (in which case it is a mount point), otherwise fallback to the traditional stat()
+                 * supports it (in which case it is a mount point), otherwise fall back to the traditional stat()
                  * logic */
                 nosupp = true;
         else if (r < 0)
@@ -272,13 +319,26 @@ int path_is_mount_point(const char *t, const char *root, int flags) {
 
         fd = open_parent(t, O_PATH|O_CLOEXEC, 0);
         if (fd < 0)
-                return -errno;
+                return fd;
 
         return fd_is_mount_point(fd, last_path_component(t), flags);
 }
 
 int path_get_mnt_id(const char *path, int *ret) {
+        STRUCT_NEW_STATX_DEFINE(buf);
         int r;
+
+        if (statx(AT_FDCWD, path, AT_SYMLINK_NOFOLLOW|AT_NO_AUTOMOUNT, STATX_MNT_ID, &buf.sx) < 0) {
+                if (!ERRNO_IS_NOT_SUPPORTED(errno) && !ERRNO_IS_PRIVILEGE(errno))
+                        return -errno;
+
+                /* Fall back to name_to_handle_at() and then fdinfo if statx is not supported or we lack
+                 * privileges */
+
+        } else if (FLAGS_SET(buf.nsx.stx_mask, STATX_MNT_ID)) {
+                *ret = buf.nsx.stx_mnt_id;
+                return 0;
+        }
 
         r = name_to_handle_at_loop(AT_FDCWD, path, NULL, ret, 0);
         if (IN_SET(r, -EOPNOTSUPP, -ENOSYS, -EACCES, -EPERM, -EOVERFLOW, -EINVAL)) /* kernel/fs don't support this, or seccomp blocks access, or untriggered mount, or name_to_handle_at() is flaky */
@@ -310,7 +370,8 @@ bool fstype_is_network(const char *fstype) {
                           "glusterfs",
                           "pvfs2", /* OrangeFS */
                           "ocfs2",
-                          "lustre");
+                          "lustre",
+                          "davfs");
 }
 
 bool fstype_is_api_vfs(const char *fstype) {
@@ -335,6 +396,16 @@ bool fstype_is_api_vfs(const char *fstype) {
                           "sysfs",
                           "tmpfs",
                           "tracefs");
+}
+
+bool fstype_is_blockdev_backed(const char *fstype) {
+        const char *x;
+
+        x = startswith(fstype, "fuse.");
+        if (x)
+                fstype = x;
+
+        return !streq(fstype, "9p") && !fstype_is_network(fstype) && !fstype_is_api_vfs(fstype);
 }
 
 bool fstype_is_ro(const char *fstype) {
@@ -440,4 +511,26 @@ int mount_propagation_flags_from_string(const char *name, unsigned long *ret) {
         else
                 return -EINVAL;
         return 0;
+}
+
+int make_mount_point_inode_from_stat(const struct stat *st, const char *dest, mode_t mode) {
+        assert(st);
+        assert(dest);
+
+        if (S_ISDIR(st->st_mode))
+                return mkdir_label(dest, mode);
+        else
+                return mknod(dest, S_IFREG|(mode & ~0111), 0);
+}
+
+int make_mount_point_inode_from_path(const char *source, const char *dest, mode_t mode) {
+        struct stat st;
+
+        assert(source);
+        assert(dest);
+
+        if (stat(source, &st) < 0)
+                return -errno;
+
+        return make_mount_point_inode_from_stat(&st, dest, mode);
 }

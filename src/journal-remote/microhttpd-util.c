@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <stddef.h>
 #include <stdio.h>
@@ -78,10 +78,9 @@ int mhd_respondf(struct MHD_Connection *connection,
         errno = -error;
         fmt = strjoina(format, "\n");
         va_start(ap, format);
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wformat-nonliteral"
+        DISABLE_WARNING_FORMAT_NONLITERAL;
         r = vasprintf(&m, fmt, ap);
-#pragma GCC diagnostic pop
+        REENABLE_WARNING;
         va_end(ap);
 
         if (r < 0)

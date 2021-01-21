@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0+ */
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * Copyright © 2003-2004 Greg Kroah-Hartman <greg@kroah.com>
  */
@@ -16,7 +16,7 @@
 
 #include "device-private.h"
 #include "device-util.h"
-#include "libudev-util.h"
+#include "path-util.h"
 #include "string-util.h"
 #include "strxcpyx.h"
 #include "udev-builtin.h"
@@ -25,7 +25,7 @@
 
 static const char *arg_action = "add";
 static ResolveNameTiming arg_resolve_name_timing = RESOLVE_NAME_EARLY;
-static char arg_syspath[UTIL_PATH_SIZE] = {};
+static char arg_syspath[UDEV_PATH_SIZE] = {};
 
 static int help(void) {
 
@@ -90,7 +90,7 @@ static int parse_argv(int argc, char *argv[]) {
                                        "syspath parameter missing.");
 
         /* add /sys if needed */
-        if (!startswith(argv[optind], "/sys"))
+        if (!path_startswith(argv[optind], "/sys"))
                 strscpyl(arg_syspath, sizeof(arg_syspath), "/sys", argv[optind], NULL);
         else
                 strscpy(arg_syspath, sizeof(arg_syspath), argv[optind]);
@@ -104,7 +104,6 @@ int test_main(int argc, char *argv[], void *userdata) {
         _cleanup_(sd_device_unrefp) sd_device *dev = NULL;
         const char *cmd, *key, *value;
         sigset_t mask, sigmask_orig;
-        Iterator i;
         void *val;
         int r;
 
@@ -123,7 +122,7 @@ int test_main(int argc, char *argv[], void *userdata) {
 
         udev_builtin_init();
 
-        r = udev_rules_new(&rules, arg_resolve_name_timing);
+        r = udev_rules_load(&rules, arg_resolve_name_timing);
         if (r < 0) {
                 log_error_errno(r, "Failed to read udev rules: %m");
                 goto out;
@@ -138,20 +137,20 @@ int test_main(int argc, char *argv[], void *userdata) {
         /* don't read info from the db */
         device_seal(dev);
 
-        event = udev_event_new(dev, 0, NULL);
+        event = udev_event_new(dev, 0, NULL, LOG_DEBUG);
 
         assert_se(sigfillset(&mask) >= 0);
         assert_se(sigprocmask(SIG_SETMASK, &mask, &sigmask_orig) >= 0);
 
-        udev_event_execute_rules(event, 60 * USEC_PER_SEC, NULL, rules);
+        udev_event_execute_rules(event, 60 * USEC_PER_SEC, SIGKILL, NULL, rules);
 
         FOREACH_DEVICE_PROPERTY(dev, key, value)
                 printf("%s=%s\n", key, value);
 
-        ORDERED_HASHMAP_FOREACH_KEY(val, cmd, event->run_list, i) {
-                char program[UTIL_PATH_SIZE];
+        ORDERED_HASHMAP_FOREACH_KEY(val, cmd, event->run_list) {
+                char program[UDEV_PATH_SIZE];
 
-                udev_event_apply_format(event, cmd, program, sizeof(program), false);
+                (void) udev_event_apply_format(event, cmd, program, sizeof(program), false);
                 printf("run: '%s'\n", program);
         }
 

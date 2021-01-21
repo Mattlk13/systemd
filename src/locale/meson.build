@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: LGPL-2.1+
+# SPDX-License-Identifier: LGPL-2.1-or-later
 
 systemd_localed_sources = files('''
         localed.c
@@ -32,7 +32,5 @@ endif
 tests += [
         [['src/locale/test-keymap-util.c',
           'src/locale/keymap-util.c',
-          'src/locale/keymap-util.h'],
-         [libshared],
-         [libdl]],
+          'src/locale/keymap-util.h']],
 ]

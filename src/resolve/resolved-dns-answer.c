@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <stdio.h>
 
@@ -8,8 +8,45 @@
 #include "resolved-dns-dnssec.h"
 #include "string-util.h"
 
+static void dns_answer_item_hash_func(const DnsAnswerItem *a, struct siphash *state) {
+        assert(a);
+        assert(state);
+
+        siphash24_compress(&a->ifindex, sizeof(a->ifindex), state);
+
+        dns_resource_record_hash_func(a->rr, state);
+}
+
+static int dns_answer_item_compare_func(const DnsAnswerItem *a, const DnsAnswerItem *b) {
+        int r;
+
+        assert(a);
+        assert(b);
+
+        r = CMP(a->ifindex, b->ifindex);
+        if (r != 0)
+                return r;
+
+        return dns_resource_record_compare_func(a->rr, b->rr);
+}
+
+DEFINE_PRIVATE_HASH_OPS(dns_answer_item_hash_ops, DnsAnswerItem, dns_answer_item_hash_func, dns_answer_item_compare_func);
+
 DnsAnswer *dns_answer_new(size_t n) {
+        _cleanup_set_free_ Set *s = NULL;
         DnsAnswer *a;
+
+        if (n > UINT16_MAX) /* We can only place 64K RRs in an answer at max */
+                n = UINT16_MAX;
+
+        s = set_new(&dns_answer_item_hash_ops);
+        if (!s)
+                return NULL;
+
+        /* Higher multipliers give slightly higher efficiency through hash collisions, but the gains
+         * quickly drop off after 2. */
+        if (set_reserve(s, n * 2) < 0)
+                return NULL;
 
         a = malloc0(offsetof(DnsAnswer, items) + sizeof(DnsAnswerItem) * n);
         if (!a)
@@ -17,6 +54,7 @@ DnsAnswer *dns_answer_new(size_t n) {
 
         a->n_ref = 1;
         a->n_allocated = n;
+        a->set_items = TAKE_PTR(s);
 
         return a;
 }
@@ -26,6 +64,8 @@ static void dns_answer_flush(DnsAnswer *a) {
 
         if (!a)
                 return;
+
+        a->set_items = set_free(a->set_items);
 
         DNS_ANSWER_FOREACH(rr, a)
                 dns_resource_record_unref(rr);
@@ -43,6 +83,8 @@ static DnsAnswer *dns_answer_free(DnsAnswer *a) {
 DEFINE_TRIVIAL_REF_UNREF_FUNC(DnsAnswer, dns_answer, dns_answer_free);
 
 static int dns_answer_add_raw(DnsAnswer *a, DnsResourceRecord *rr, int ifindex, DnsAnswerFlags flags) {
+        int r;
+
         assert(rr);
 
         if (!a)
@@ -51,11 +93,20 @@ static int dns_answer_add_raw(DnsAnswer *a, DnsResourceRecord *rr, int ifindex, 
         if (a->n_rrs >= a->n_allocated)
                 return -ENOSPC;
 
-        a->items[a->n_rrs++] = (DnsAnswerItem) {
-                .rr = dns_resource_record_ref(rr),
+        a->items[a->n_rrs] = (DnsAnswerItem) {
+                .rr = rr,
                 .ifindex = ifindex,
                 .flags = flags,
         };
+
+        r = set_put(a->set_items, &a->items[a->n_rrs]);
+        if (r < 0)
+                return r;
+        if (r == 0)
+                return -EEXIST;
+
+        dns_resource_record_ref(rr);
+        a->n_rrs++;
 
         return 1;
 }
@@ -75,8 +126,7 @@ static int dns_answer_add_raw_all(DnsAnswer *a, DnsAnswer *source) {
 }
 
 int dns_answer_add(DnsAnswer *a, DnsResourceRecord *rr, int ifindex, DnsAnswerFlags flags) {
-        size_t i;
-        int r;
+        DnsAnswerItem tmp, *exist;
 
         assert(rr);
 
@@ -85,36 +135,26 @@ int dns_answer_add(DnsAnswer *a, DnsResourceRecord *rr, int ifindex, DnsAnswerFl
         if (a->n_ref > 1)
                 return -EBUSY;
 
-        for (i = 0; i < a->n_rrs; i++) {
-                if (a->items[i].ifindex != ifindex)
-                        continue;
+        tmp = (DnsAnswerItem) {
+                .rr = rr,
+                .ifindex = ifindex,
+        };
 
-                r = dns_resource_key_equal(a->items[i].rr->key, rr->key);
-                if (r < 0)
-                        return r;
-                if (r == 0)
-                        continue;
-
+        exist = set_get(a->set_items, &tmp);
+        if (exist) {
                 /* There's already an RR of the same RRset in place! Let's see if the TTLs more or less
                  * match. We don't really care if they match precisely, but we do care whether one is 0 and
                  * the other is not. See RFC 2181, Section 5.2. */
-                if ((rr->ttl == 0) != (a->items[i].rr->ttl == 0))
+                if ((rr->ttl == 0) != (exist->rr->ttl == 0))
                         return -EINVAL;
 
-                r = dns_resource_record_payload_equal(a->items[i].rr, rr);
-                if (r < 0)
-                        return r;
-                if (r == 0)
-                        continue;
-
-                /* Entry already exists, keep the entry with the higher RR. */
-                if (rr->ttl > a->items[i].rr->ttl) {
-                        dns_resource_record_ref(rr);
-                        dns_resource_record_unref(a->items[i].rr);
-                        a->items[i].rr = rr;
+                /* Entry already exists, keep the entry with the higher TTL. */
+                if (rr->ttl > exist->rr->ttl) {
+                        dns_resource_record_unref(exist->rr);
+                        exist->rr = dns_resource_record_ref(rr);
                 }
 
-                a->items[i].flags |= flags;
+                exist->flags |= flags;
                 return 0;
         }
 
@@ -317,6 +357,11 @@ int dns_answer_merge(DnsAnswer *a, DnsAnswer *b, DnsAnswer **ret) {
         int r;
 
         assert(ret);
+
+        if (a == b) {
+                *ret = dns_answer_ref(a);
+                return 0;
+        }
 
         if (dns_answer_size(a) <= 0) {
                 *ret = dns_answer_ref(b);
@@ -619,23 +664,40 @@ int dns_answer_reserve(DnsAnswer **a, size_t n_free) {
 
         if (*a) {
                 size_t ns;
+                int r;
 
                 if ((*a)->n_ref > 1)
                         return -EBUSY;
 
                 ns = (*a)->n_rrs + n_free;
+                if (ns > UINT16_MAX) /* Maximum number of RRs we can stick into a DNS packet section */
+                        ns = UINT16_MAX;
 
                 if ((*a)->n_allocated >= ns)
                         return 0;
 
                 /* Allocate more than we need */
                 ns *= 2;
+                if (ns > UINT16_MAX)
+                        ns = UINT16_MAX;
+
+                /* This must be done before realloc() below. Otherwise, the original DnsAnswer object
+                 * may be broken. */
+                r = set_reserve((*a)->set_items, ns);
+                if (r < 0)
+                        return r;
 
                 n = realloc(*a, offsetof(DnsAnswer, items) + sizeof(DnsAnswerItem) * ns);
                 if (!n)
                         return -ENOMEM;
 
                 n->n_allocated = ns;
+
+                /* Previously all items are stored in the set, and the enough memory area is allocated
+                 * in the above. So set_put() in the below cannot fail. */
+                set_clear(n->set_items);
+                for (size_t i = 0; i < n->n_rrs; i++)
+                        assert_se(set_put(n->set_items, &n->items[i]) > 0);
         } else {
                 n = dns_answer_new(n_free);
                 if (!n)
@@ -678,6 +740,9 @@ int dns_answer_reserve_or_clone(DnsAnswer **a, size_t n_free) {
         return 0;
 }
 
+/*
+ * This function is not used in the code base, but is useful when debugging. Do not delete.
+ */
 void dns_answer_dump(DnsAnswer *answer, FILE *f) {
         DnsResourceRecord *rr;
         DnsAnswerFlags flags;
@@ -699,17 +764,21 @@ void dns_answer_dump(DnsAnswer *answer, FILE *f) {
 
                 fputs(t, f);
 
-                if (ifindex != 0 || flags & (DNS_ANSWER_AUTHENTICATED|DNS_ANSWER_CACHEABLE|DNS_ANSWER_SHARED_OWNER))
+                if (ifindex != 0 || flags != 0)
                         fputs("\t;", f);
 
                 if (ifindex != 0)
-                        printf(" ifindex=%i", ifindex);
+                        fprintf(f, " ifindex=%i", ifindex);
                 if (flags & DNS_ANSWER_AUTHENTICATED)
                         fputs(" authenticated", f);
                 if (flags & DNS_ANSWER_CACHEABLE)
-                        fputs(" cachable", f);
+                        fputs(" cacheable", f);
                 if (flags & DNS_ANSWER_SHARED_OWNER)
                         fputs(" shared-owner", f);
+                if (flags & DNS_ANSWER_CACHE_FLUSH)
+                        fputs(" cache-flush", f);
+                if (flags & DNS_ANSWER_GOODBYE)
+                        fputs(" goodbye", f);
 
                 fputc('\n', f);
         }

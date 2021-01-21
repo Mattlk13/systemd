@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 #include "conf-parser.h"
@@ -53,7 +53,7 @@ enum DnsOverTlsMode {
         DNS_OVER_TLS_NO,
 
         /* Try to connect using DNS-over-TLS, but if connection fails,
-         * fallback to using an unencrypted connection */
+         * fall back to using an unencrypted connection */
         DNS_OVER_TLS_OPPORTUNISTIC,
 
         /* Enforce DNS-over-TLS and require valid server certificates */
@@ -81,3 +81,12 @@ bool dns_server_address_valid(int family, const union in_addr_union *sa);
 
 const char* dns_cache_mode_to_string(DnsCacheMode p) _const_;
 DnsCacheMode dns_cache_mode_from_string(const char *s) _pure_;
+
+/* A resolv.conf file containing the DNS server and domain data we learnt from uplink, i.e. the full uplink data */
+#define PRIVATE_UPLINK_RESOLV_CONF "/run/systemd/resolve/resolv.conf"
+
+/* A resolv.conf file containing the domain data we learnt from uplink, but our own DNS server address. */
+#define PRIVATE_STUB_RESOLV_CONF "/run/systemd/resolve/stub-resolv.conf"
+
+/* A static resolv.conf file containing no domains, but only our own DNS server address */
+#define PRIVATE_STATIC_RESOLV_CONF ROOTLIBEXECDIR "/resolv.conf"

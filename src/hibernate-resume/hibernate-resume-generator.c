@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
 #include <stdio.h>
@@ -45,7 +45,7 @@ static int parse_proc_cmdline_item(const char *key, const char *value, void *dat
                 if (proc_cmdline_value_missing(key, value))
                         return 0;
 
-                if (!strextend_with_separator(&arg_resume_options, ",", value, NULL))
+                if (!strextend_with_separator(&arg_resume_options, ",", value))
                         return log_oom();
 
         } else if (streq(key, "rootflags")) {
@@ -53,7 +53,7 @@ static int parse_proc_cmdline_item(const char *key, const char *value, void *dat
                 if (proc_cmdline_value_missing(key, value))
                         return 0;
 
-                if (!strextend_with_separator(&arg_root_options, ",", value, NULL))
+                if (!strextend_with_separator(&arg_root_options, ",", value))
                         return log_oom();
 
         } else if (streq(key, "noresume")) {

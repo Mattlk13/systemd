@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 #define SPECIAL_DEFAULT_TARGET "default.target"
@@ -42,6 +42,7 @@
 #define SPECIAL_SWAP_TARGET "swap.target"
 #define SPECIAL_NETWORK_ONLINE_TARGET "network-online.target"
 #define SPECIAL_TIME_SYNC_TARGET "time-sync.target"       /* LSB's $time */
+#define SPECIAL_TIME_SET_TARGET "time-set.target"
 #define SPECIAL_BASIC_TARGET "basic.target"
 
 /* LSB compatibility */
@@ -82,6 +83,7 @@
 #define SPECIAL_QUOTAON_SERVICE "quotaon.service"
 #define SPECIAL_REMOUNT_FS_SERVICE "systemd-remount-fs.service"
 #define SPECIAL_VOLATILE_ROOT_SERVICE "systemd-volatile-root.service"
+#define SPECIAL_UDEVD_SERVICE "systemd-udevd.service"
 
 /* Services systemd relies on */
 #define SPECIAL_DBUS_SERVICE "dbus.service"
@@ -106,3 +108,8 @@
 
 /* The root directory. */
 #define SPECIAL_ROOT_MOUNT "-.mount"
+
+/* Special slices valid for the user instance */
+#define SPECIAL_SESSION_SLICE "session.slice"
+#define SPECIAL_APP_SLICE "app.slice"
+#define SPECIAL_BACKGROUND_SLICE "background.slice"

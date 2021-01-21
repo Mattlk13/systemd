@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+
+/* SPDX-License-Identifier: LGPL-2.1-or-later
  * Copyright © 2020 VMware, Inc. */
 
 #include <linux/pkt_sched.h>
@@ -66,35 +66,39 @@ int config_parse_drr_size(
         assert(data);
 
         r = tclass_new_static(TCLASS_KIND_DRR, network, filename, section_line, &tclass);
-        if (r < 0)
-                return log_syntax(unit, LOG_ERR, filename, line, r,
-                                  "Failed to create traffic control class, ignoring assignment: %m");
+        if (r == -ENOMEM)
+                return log_oom();
+        if (r < 0) {
+                log_syntax(unit, LOG_WARNING, filename, line, r,
+                           "Failed to create traffic control class, ignoring assignment: %m");
+                return 0;
+        }
 
         drr = TCLASS_TO_DRR(tclass);
 
         if (isempty(rvalue)) {
                 drr->quantum = 0;
 
-                tclass = NULL;
+                TAKE_PTR(tclass);
                 return 0;
         }
 
-        r = parse_size(rvalue, 1000, &u);
+        r = parse_size(rvalue, 1024, &u);
         if (r < 0) {
-                log_syntax(unit, LOG_ERR, filename, line, r,
+                log_syntax(unit, LOG_WARNING, filename, line, r,
                            "Failed to parse '%s=', ignoring assignment: %s",
                            lvalue, rvalue);
                 return 0;
         }
         if (u > UINT32_MAX) {
-                log_syntax(unit, LOG_ERR, filename, line, 0, "Invalid '%s=', ignoring assignment: %s",
+                log_syntax(unit, LOG_WARNING, filename, line, 0, "Invalid '%s=', ignoring assignment: %s",
                            lvalue, rvalue);
                 return 0;
         }
 
         drr->quantum = (uint32_t) u;
 
-        tclass = NULL;
+        TAKE_PTR(tclass);
         return 0;
 }
 

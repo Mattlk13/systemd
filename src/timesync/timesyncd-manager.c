@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
 #include <math.h>
@@ -50,7 +50,6 @@
 /* Maximum number of missed replies before selecting another source. */
 #define NTP_MAX_MISSED_REPLIES          2
 
-#define RETRY_USEC (30*USEC_PER_SEC)
 #define RATELIMIT_INTERVAL_USEC (10*USEC_PER_SEC)
 #define RATELIMIT_BURST 10
 
@@ -137,11 +136,10 @@ static int manager_send_request(Manager *m) {
         }
 
         /* re-arm timer with increasing timeout, in case the packets never arrive back */
-        if (m->retry_interval > 0) {
-                if (m->retry_interval < m->poll_interval_max_usec)
-                        m->retry_interval *= 2;
-        } else
-                m->retry_interval = m->poll_interval_min_usec;
+        if (m->retry_interval == 0)
+                m->retry_interval = NTP_RETRY_INTERVAL_MIN_USEC;
+        else
+                m->retry_interval = MIN(m->retry_interval * 4/3, NTP_RETRY_INTERVAL_MAX_USEC);
 
         r = manager_arm_timer(m, m->retry_interval);
         if (r < 0)
@@ -181,18 +179,18 @@ static int manager_arm_timer(Manager *m, usec_t next) {
         }
 
         if (m->event_timer) {
-                r = sd_event_source_set_time(m->event_timer, now(clock_boottime_or_monotonic()) + next);
+                r = sd_event_source_set_time_relative(m->event_timer, next);
                 if (r < 0)
                         return r;
 
                 return sd_event_source_set_enabled(m->event_timer, SD_EVENT_ONESHOT);
         }
 
-        return sd_event_add_time(
+        return sd_event_add_time_relative(
                         m->event,
                         &m->event_timer,
                         clock_boottime_or_monotonic(),
-                        now(clock_boottime_or_monotonic()) + next, 0,
+                        next, 0,
                         manager_timer, m);
 }
 
@@ -407,10 +405,7 @@ static int manager_receive_response(sd_event_source *source, int fd, uint32_t re
                 .iov_base = &ntpmsg,
                 .iov_len = sizeof(ntpmsg),
         };
-        union {
-                struct cmsghdr cmsghdr;
-                uint8_t buf[CMSG_SPACE(sizeof(struct timeval))];
-        } control;
+        CMSG_BUFFER_TYPE(CMSG_SPACE(sizeof(struct timeval))) control;
         union sockaddr_union server_addr;
         struct msghdr msghdr = {
                 .msg_iov = &iov,
@@ -438,12 +433,11 @@ static int manager_receive_response(sd_event_source *source, int fd, uint32_t re
                 return manager_connect(m);
         }
 
-        len = recvmsg(fd, &msghdr, MSG_DONTWAIT);
+        len = recvmsg_safe(fd, &msghdr, MSG_DONTWAIT);
+        if (len == -EAGAIN)
+                return 0;
         if (len < 0) {
-                if (errno == EAGAIN)
-                        return 0;
-
-                log_warning("Error receiving message. Disconnecting.");
+                log_warning_errno(len, "Error receiving message, disconnecting: %m");
                 return manager_connect(m);
         }
 
@@ -652,7 +646,8 @@ static int manager_listen_setup(Manager *m) {
         if (r < 0)
                 return r;
 
-        (void) setsockopt_int(m->server_socket, IPPROTO_IP, IP_TOS, IPTOS_LOWDELAY);
+        if (addr.sa.sa_family == AF_INET)
+                (void) setsockopt_int(m->server_socket, IPPROTO_IP, IP_TOS, IPTOS_LOWDELAY);
 
         return sd_event_add_io(m->event, &m->event_receive, m->server_socket, EPOLLIN, manager_receive_response, m);
 }
@@ -791,7 +786,8 @@ int manager_connect(Manager *m) {
         if (!ratelimit_below(&m->ratelimit)) {
                 log_debug("Delaying attempts to contact servers.");
 
-                r = sd_event_add_time(m->event, &m->event_retry, clock_boottime_or_monotonic(), now(clock_boottime_or_monotonic()) + RETRY_USEC, 0, manager_retry_connect, m);
+                r = sd_event_add_time_relative(m->event, &m->event_retry, clock_boottime_or_monotonic(), m->connection_retry_usec,
+                                               0, manager_retry_connect, m);
                 if (r < 0)
                         return log_error_errno(r, "Failed to create retry timer: %m");
 
@@ -845,7 +841,7 @@ int manager_connect(Manager *m) {
 
                         if (restart && !m->exhausted_servers && m->poll_interval_usec) {
                                 log_debug("Waiting after exhausting servers.");
-                                r = sd_event_add_time(m->event, &m->event_retry, clock_boottime_or_monotonic(), now(clock_boottime_or_monotonic()) + m->poll_interval_usec, 0, manager_retry_connect, m);
+                                r = sd_event_add_time_relative(m->event, &m->event_retry, clock_boottime_or_monotonic(), m->poll_interval_usec, 0, manager_retry_connect, m);
                                 if (r < 0)
                                         return log_error_errno(r, "Failed to create retry timer: %m");
 
@@ -1088,6 +1084,8 @@ int manager_new(Manager **ret) {
         m->max_root_distance_usec = NTP_MAX_ROOT_DISTANCE;
         m->poll_interval_min_usec = NTP_POLL_INTERVAL_MIN_USEC;
         m->poll_interval_max_usec = NTP_POLL_INTERVAL_MAX_USEC;
+
+        m->connection_retry_usec = DEFAULT_CONNECTION_RETRY_USEC;
 
         m->server_socket = m->clock_watch_fd = -1;
 

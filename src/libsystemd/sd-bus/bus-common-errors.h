@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 #include "bus-error.h"
@@ -29,6 +29,7 @@
 #define BUS_ERROR_DISK_FULL "org.freedesktop.systemd1.DiskFull"
 #define BUS_ERROR_NOTHING_TO_CLEAN "org.freedesktop.systemd1.NothingToClean"
 #define BUS_ERROR_UNIT_BUSY "org.freedesktop.systemd1.UnitBusy"
+#define BUS_ERROR_UNIT_INACTIVE "org.freedesktop.systemd1.UnitInactive"
 
 #define BUS_ERROR_NO_SUCH_MACHINE "org.freedesktop.machine1.NoSuchMachine"
 #define BUS_ERROR_NO_SUCH_IMAGE "org.freedesktop.machine1.NoSuchImage"
@@ -95,10 +96,13 @@
 #define BUS_ERROR_HOME_ABSENT "org.freedesktop.home1.HomeAbsent"
 #define BUS_ERROR_HOME_BUSY "org.freedesktop.home1.HomeBusy"
 #define BUS_ERROR_BAD_PASSWORD "org.freedesktop.home1.BadPassword"
+#define BUS_ERROR_BAD_RECOVERY_KEY "org.freedesktop.home1.BadRecoveryKey"
 #define BUS_ERROR_LOW_PASSWORD_QUALITY "org.freedesktop.home1.LowPasswordQuality"
 #define BUS_ERROR_BAD_PASSWORD_AND_NO_TOKEN "org.freedesktop.home1.BadPasswordAndNoToken"
 #define BUS_ERROR_TOKEN_PIN_NEEDED "org.freedesktop.home1.TokenPinNeeded"
 #define BUS_ERROR_TOKEN_PROTECTED_AUTHENTICATION_PATH_NEEDED "org.freedesktop.home1.TokenProtectedAuthenticationPathNeeded"
+#define BUS_ERROR_TOKEN_USER_PRESENCE_NEEDED "org.freedesktop.home1.TokenUserPresenceNeeded"
+#define BUS_ERROR_TOKEN_ACTION_TIMEOUT "org.freedesktop.home1.TokenActionTimeout"
 #define BUS_ERROR_TOKEN_PIN_LOCKED "org.freedesktop.home1.TokenPinLocked"
 #define BUS_ERROR_TOKEN_BAD_PIN "org.freedesktop.home1.BadPin"
 #define BUS_ERROR_TOKEN_BAD_PIN_FEW_TRIES_LEFT "org.freedesktop.home1.BadPinFewTriesLeft"
@@ -114,5 +118,6 @@
 #define BUS_ERROR_NO_DISK_SPACE "org.freedesktop.home1.NoDiskSpace"
 #define BUS_ERROR_TOO_MANY_OPERATIONS "org.freedesktop.home1.TooManyOperations"
 #define BUS_ERROR_AUTHENTICATION_LIMIT_HIT "org.freedesktop.home1.AuthenticationLimitHit"
+#define BUS_ERROR_HOME_CANT_AUTHENTICATE "org.freedesktop.home1.HomeCantAuthenticate"
 
 BUS_ERROR_MAP_ELF_USE(bus_common_errors);

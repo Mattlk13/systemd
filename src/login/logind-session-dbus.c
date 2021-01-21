@@ -1,9 +1,10 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
 
 #include "alloc-util.h"
 #include "bus-common-errors.h"
+#include "bus-get-properties.h"
 #include "bus-label.h"
 #include "bus-polkit.h"
 #include "bus-util.h"
@@ -177,7 +178,7 @@ int bus_session_method_terminate(sd_bus_message *message, void *userdata, sd_bus
         if (r == 0)
                 return 1; /* Will call us back */
 
-        r = session_stop(s, true);
+        r = session_stop(s, /* force = */ true);
         if (r < 0)
                 return r;
 
@@ -393,6 +394,32 @@ static int method_release_control(sd_bus_message *message, void *userdata, sd_bu
         return sd_bus_reply_method_return(message, NULL);
 }
 
+static int method_set_type(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+        Session *s = userdata;
+        const char *t;
+        SessionType type;
+        int r;
+
+        assert(message);
+        assert(s);
+
+        r = sd_bus_message_read(message, "s", &t);
+        if (r < 0)
+                return r;
+
+        type = session_type_from_string(t);
+        if (type < 0)
+                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS,
+                                         "Invalid session type '%s'", t);
+
+        if (!session_is_controller(s, sd_bus_message_get_sender(message)))
+                return sd_bus_error_setf(error, BUS_ERROR_NOT_IN_CONTROL, "You must be in control of this session to set type");
+
+        session_set_type(s, type);
+
+        return sd_bus_reply_method_return(message, NULL);
+}
+
 static int method_take_device(sd_bus_message *message, void *userdata, sd_bus_error *error) {
         Session *s = userdata;
         uint32_t major, minor;
@@ -555,57 +582,7 @@ static int method_set_brightness(sd_bus_message *message, void *userdata, sd_bus
         return 1;
 }
 
-const sd_bus_vtable session_vtable[] = {
-        SD_BUS_VTABLE_START(0),
-
-        SD_BUS_PROPERTY("Id", "s", NULL, offsetof(Session, id), SD_BUS_VTABLE_PROPERTY_CONST),
-        SD_BUS_PROPERTY("User", "(uo)", property_get_user, 0, SD_BUS_VTABLE_PROPERTY_CONST),
-        SD_BUS_PROPERTY("Name", "s", property_get_name, 0, SD_BUS_VTABLE_PROPERTY_CONST),
-        BUS_PROPERTY_DUAL_TIMESTAMP("Timestamp", offsetof(Session, timestamp), SD_BUS_VTABLE_PROPERTY_CONST),
-        SD_BUS_PROPERTY("VTNr", "u", NULL, offsetof(Session, vtnr), SD_BUS_VTABLE_PROPERTY_CONST),
-        SD_BUS_PROPERTY("Seat", "(so)", property_get_seat, 0, SD_BUS_VTABLE_PROPERTY_CONST),
-        SD_BUS_PROPERTY("TTY", "s", NULL, offsetof(Session, tty), SD_BUS_VTABLE_PROPERTY_CONST),
-        SD_BUS_PROPERTY("Display", "s", NULL, offsetof(Session, display), SD_BUS_VTABLE_PROPERTY_CONST),
-        SD_BUS_PROPERTY("Remote", "b", bus_property_get_bool, offsetof(Session, remote), SD_BUS_VTABLE_PROPERTY_CONST),
-        SD_BUS_PROPERTY("RemoteHost", "s", NULL, offsetof(Session, remote_host), SD_BUS_VTABLE_PROPERTY_CONST),
-        SD_BUS_PROPERTY("RemoteUser", "s", NULL, offsetof(Session, remote_user), SD_BUS_VTABLE_PROPERTY_CONST),
-        SD_BUS_PROPERTY("Service", "s", NULL, offsetof(Session, service), SD_BUS_VTABLE_PROPERTY_CONST),
-        SD_BUS_PROPERTY("Desktop", "s", NULL, offsetof(Session, desktop), SD_BUS_VTABLE_PROPERTY_CONST),
-        SD_BUS_PROPERTY("Scope", "s", NULL, offsetof(Session, scope), SD_BUS_VTABLE_PROPERTY_CONST),
-        SD_BUS_PROPERTY("Leader", "u", bus_property_get_pid, offsetof(Session, leader), SD_BUS_VTABLE_PROPERTY_CONST),
-        SD_BUS_PROPERTY("Audit", "u", NULL, offsetof(Session, audit_id), SD_BUS_VTABLE_PROPERTY_CONST),
-        SD_BUS_PROPERTY("Type", "s", property_get_type, offsetof(Session, type), SD_BUS_VTABLE_PROPERTY_CONST),
-        SD_BUS_PROPERTY("Class", "s", property_get_class, offsetof(Session, class), SD_BUS_VTABLE_PROPERTY_CONST),
-        SD_BUS_PROPERTY("Active", "b", property_get_active, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
-        SD_BUS_PROPERTY("State", "s", property_get_state, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
-        SD_BUS_PROPERTY("IdleHint", "b", property_get_idle_hint, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
-        SD_BUS_PROPERTY("IdleSinceHint", "t", property_get_idle_since_hint, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
-        SD_BUS_PROPERTY("IdleSinceHintMonotonic", "t", property_get_idle_since_hint, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
-        SD_BUS_PROPERTY("LockedHint", "b", property_get_locked_hint, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
-
-        SD_BUS_METHOD("Terminate", NULL, NULL, bus_session_method_terminate, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("Activate", NULL, NULL, bus_session_method_activate, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("Lock", NULL, NULL, bus_session_method_lock, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("Unlock", NULL, NULL, bus_session_method_lock, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("SetIdleHint", "b", NULL, method_set_idle_hint, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("SetLockedHint", "b", NULL, method_set_locked_hint, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("Kill", "si", NULL, bus_session_method_kill, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("TakeControl", "b", NULL, method_take_control, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("ReleaseControl", NULL, NULL, method_release_control, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("TakeDevice", "uu", "hb", method_take_device, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("ReleaseDevice", "uu", NULL, method_release_device, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("PauseDeviceComplete", "uu", NULL, method_pause_device_complete, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("SetBrightness", "ssu", NULL, method_set_brightness, SD_BUS_VTABLE_UNPRIVILEGED),
-
-        SD_BUS_SIGNAL("PauseDevice", "uus", 0),
-        SD_BUS_SIGNAL("ResumeDevice", "uuh", 0),
-        SD_BUS_SIGNAL("Lock", NULL, 0),
-        SD_BUS_SIGNAL("Unlock", NULL, 0),
-
-        SD_BUS_VTABLE_END
-};
-
-int session_object_find(sd_bus *bus, const char *path, const char *interface, void *userdata, void **found, sd_bus_error *error) {
+static int session_object_find(sd_bus *bus, const char *path, const char *interface, void *userdata, void **found, sd_bus_error *error) {
         _cleanup_free_ char *e = NULL;
         sd_bus_message *message;
         Manager *m = userdata;
@@ -653,19 +630,18 @@ char *session_bus_path(Session *s) {
         return strjoin("/org/freedesktop/login1/session/", t);
 }
 
-int session_node_enumerator(sd_bus *bus, const char *path, void *userdata, char ***nodes, sd_bus_error *error) {
+static int session_node_enumerator(sd_bus *bus, const char *path, void *userdata, char ***nodes, sd_bus_error *error) {
         _cleanup_strv_free_ char **l = NULL;
         sd_bus_message *message;
         Manager *m = userdata;
         Session *session;
-        Iterator i;
         int r;
 
         assert(bus);
         assert(path);
         assert(nodes);
 
-        HASHMAP_FOREACH(session, m->sessions, i) {
+        HASHMAP_FOREACH(session, m->sessions) {
                 char *p;
 
                 p = session_bus_path(session);
@@ -776,12 +752,11 @@ int session_send_lock(Session *s, bool lock) {
 
 int session_send_lock_all(Manager *m, bool lock) {
         Session *session;
-        Iterator i;
         int r = 0;
 
         assert(m);
 
-        HASHMAP_FOREACH(session, m->sessions, i) {
+        HASHMAP_FOREACH(session, m->sessions) {
                 int k;
 
                 k = session_send_lock(session, lock);
@@ -854,3 +829,144 @@ int session_send_create_reply(Session *s, sd_bus_error *error) {
                         (uint32_t) s->vtnr,
                         false);
 }
+
+static const sd_bus_vtable session_vtable[] = {
+        SD_BUS_VTABLE_START(0),
+
+        SD_BUS_PROPERTY("Id", "s", NULL, offsetof(Session, id), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("User", "(uo)", property_get_user, 0, SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("Name", "s", property_get_name, 0, SD_BUS_VTABLE_PROPERTY_CONST),
+        BUS_PROPERTY_DUAL_TIMESTAMP("Timestamp", offsetof(Session, timestamp), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("VTNr", "u", NULL, offsetof(Session, vtnr), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("Seat", "(so)", property_get_seat, 0, SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("TTY", "s", NULL, offsetof(Session, tty), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("Display", "s", NULL, offsetof(Session, display), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("Remote", "b", bus_property_get_bool, offsetof(Session, remote), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("RemoteHost", "s", NULL, offsetof(Session, remote_host), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("RemoteUser", "s", NULL, offsetof(Session, remote_user), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("Service", "s", NULL, offsetof(Session, service), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("Desktop", "s", NULL, offsetof(Session, desktop), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("Scope", "s", NULL, offsetof(Session, scope), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("Leader", "u", bus_property_get_pid, offsetof(Session, leader), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("Audit", "u", NULL, offsetof(Session, audit_id), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("Type", "s", property_get_type, offsetof(Session, type), SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
+        SD_BUS_PROPERTY("Class", "s", property_get_class, offsetof(Session, class), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("Active", "b", property_get_active, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
+        SD_BUS_PROPERTY("State", "s", property_get_state, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
+        SD_BUS_PROPERTY("IdleHint", "b", property_get_idle_hint, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
+        SD_BUS_PROPERTY("IdleSinceHint", "t", property_get_idle_since_hint, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
+        SD_BUS_PROPERTY("IdleSinceHintMonotonic", "t", property_get_idle_since_hint, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
+        SD_BUS_PROPERTY("LockedHint", "b", property_get_locked_hint, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
+
+        SD_BUS_METHOD("Terminate",
+                      NULL,
+                      NULL,
+                      bus_session_method_terminate,
+                      SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD("Activate",
+                      NULL,
+                      NULL,
+                      bus_session_method_activate,
+                      SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD("Lock",
+                      NULL,
+                      NULL,
+                      bus_session_method_lock,
+                      SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD("Unlock",
+                      NULL,
+                      NULL,
+                      bus_session_method_lock,
+                      SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("SetIdleHint",
+                                 "b",
+                                 SD_BUS_PARAM(idle),
+                                 NULL,,
+                                 method_set_idle_hint,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("SetLockedHint",
+                                 "b",
+                                 SD_BUS_PARAM(locked),
+                                 NULL,,
+                                 method_set_locked_hint,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("Kill",
+                                 "si",
+                                 SD_BUS_PARAM(who)
+                                 SD_BUS_PARAM(signal_number),
+                                 NULL,,
+                                 bus_session_method_kill,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("TakeControl",
+                                 "b",
+                                 SD_BUS_PARAM(force),
+                                 NULL,,
+                                 method_take_control,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD("ReleaseControl",
+                      NULL,
+                      NULL,
+                      method_release_control,
+                      SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("SetType",
+                                 "s",
+                                 SD_BUS_PARAM(type),
+                                 NULL,,
+                                 method_set_type,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("TakeDevice",
+                                 "uu",
+                                 SD_BUS_PARAM(major)
+                                 SD_BUS_PARAM(minor),
+                                 "hb",
+                                 SD_BUS_PARAM(fd)
+                                 SD_BUS_PARAM(inactive),
+                                 method_take_device,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("ReleaseDevice",
+                                 "uu",
+                                 SD_BUS_PARAM(major)
+                                 SD_BUS_PARAM(minor),
+                                 NULL,,
+                                 method_release_device,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("PauseDeviceComplete",
+                                 "uu",
+                                 SD_BUS_PARAM(major)
+                                 SD_BUS_PARAM(minor),
+                                 NULL,,
+                                 method_pause_device_complete,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("SetBrightness",
+                                 "ssu",
+                                 SD_BUS_PARAM(subsystem)
+                                 SD_BUS_PARAM(name)
+                                 SD_BUS_PARAM(brightness),
+                                 NULL,,
+                                 method_set_brightness,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+
+        SD_BUS_SIGNAL_WITH_NAMES("PauseDevice",
+                                 "uus",
+                                 SD_BUS_PARAM(major)
+                                 SD_BUS_PARAM(minor)
+                                 SD_BUS_PARAM(type),
+                                 0),
+        SD_BUS_SIGNAL_WITH_NAMES("ResumeDevice",
+                                 "uuh",
+                                 SD_BUS_PARAM(major)
+                                 SD_BUS_PARAM(minor)
+                                 SD_BUS_PARAM(fd),
+                                 0),
+        SD_BUS_SIGNAL("Lock", NULL, 0),
+        SD_BUS_SIGNAL("Unlock", NULL, 0),
+
+        SD_BUS_VTABLE_END
+};
+
+const BusObjectImplementation session_object = {
+        "/org/freedesktop/login1/session",
+        "org.freedesktop.login1.Session",
+        .fallback_vtables = BUS_FALLBACK_VTABLES({session_vtable, session_object_find}),
+        .node_enumerator = session_node_enumerator,
+};

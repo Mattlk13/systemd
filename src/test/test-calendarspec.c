@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "alloc-util.h"
 #include "calendarspec.h"
@@ -58,7 +58,7 @@ static void test_next(const char *input, const char *new_tz, usec_t after, usec_
 
         u = after;
         r = calendar_spec_next_usec(c, after, &u);
-        printf("At: %s\n", r < 0 ? strerror_safe(r) : format_timestamp_us(buf, sizeof buf, u));
+        printf("At: %s\n", r < 0 ? strerror_safe(r) : format_timestamp_style(buf, sizeof buf, u, TIMESTAMP_US));
         if (expect != (usec_t)-1)
                 assert_se(r >= 0 && u == expect);
         else
@@ -83,7 +83,7 @@ static void test_timestamp(void) {
 
         x = now(CLOCK_REALTIME);
 
-        assert_se(format_timestamp_us(buf, sizeof(buf), x));
+        assert_se(format_timestamp_style(buf, sizeof(buf), x, TIMESTAMP_US));
         printf("%s\n", buf);
         assert_se(calendar_spec_from_string(buf, &c) >= 0);
         assert_se(calendar_spec_to_string(c, &t) >= 0);
@@ -104,11 +104,11 @@ static void test_hourly_bug_4031(void) {
         n = now(CLOCK_REALTIME);
         assert_se((r = calendar_spec_next_usec(c, n, &u)) >= 0);
 
-        printf("Now: %s (%"PRIu64")\n", format_timestamp_us(buf, sizeof buf, n), n);
-        printf("Next hourly: %s (%"PRIu64")\n", r < 0 ? strerror_safe(r) : format_timestamp_us(buf, sizeof buf, u), u);
+        printf("Now: %s (%"PRIu64")\n", format_timestamp_style(buf, sizeof buf, n, TIMESTAMP_US), n);
+        printf("Next hourly: %s (%"PRIu64")\n", r < 0 ? strerror_safe(r) : format_timestamp_style(buf, sizeof buf, u, TIMESTAMP_US), u);
 
         assert_se((r = calendar_spec_next_usec(c, u, &w)) >= 0);
-        printf("Next hourly: %s (%"PRIu64")\n", r < 0 ? strerror_safe(r) : format_timestamp_us(zaf, sizeof zaf, w), w);
+        printf("Next hourly: %s (%"PRIu64")\n", r < 0 ? strerror_safe(r) : format_timestamp_style(zaf, sizeof zaf, w, TIMESTAMP_US), w);
 
         assert_se(n < u);
         assert_se(u <= n + USEC_PER_HOUR);
@@ -185,6 +185,8 @@ int main(int argc, char* argv[]) {
         test_one("@1493187147 UTC", "2017-04-26 06:12:27 UTC");
         test_one("@0", "1970-01-01 00:00:00 UTC");
         test_one("@0 UTC", "1970-01-01 00:00:00 UTC");
+        test_one("*:05..05", "*-*-* *:05:00");
+        test_one("*:05..10/6", "*-*-* *:05:00");
 
         test_next("2016-03-27 03:17:00", "", 12345, 1459048620000000);
         test_next("2016-03-27 03:17:00", "CET", 12345, 1459041420000000);
@@ -237,8 +239,6 @@ int main(int argc, char* argv[]) {
         assert_se(calendar_spec_from_string("*~29", &c) < 0);
         assert_se(calendar_spec_from_string("*~16..31", &c) < 0);
         assert_se(calendar_spec_from_string("12..1/2-*", &c) < 0);
-        assert_se(calendar_spec_from_string("*:05..05", &c) < 0);
-        assert_se(calendar_spec_from_string("*:05..10/6", &c) < 0);
         assert_se(calendar_spec_from_string("20/4:00", &c) < 0);
         assert_se(calendar_spec_from_string("00:00/60", &c) < 0);
         assert_se(calendar_spec_from_string("00:00:2300", &c) < 0);

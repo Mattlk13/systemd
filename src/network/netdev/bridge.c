@@ -1,10 +1,9 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <net/if.h>
 
 #include "bridge.h"
 #include "netlink-util.h"
-#include "network-internal.h"
 #include "networkd-manager.h"
 #include "string-table.h"
 #include "vlan-util.h"
@@ -126,6 +125,12 @@ static int netdev_bridge_post_create(NetDev *netdev, Link *link, sd_netlink_mess
                         return log_netdev_error_errno(netdev, r, "Could not append IFLA_BR_VLAN_FILTERING attribute: %m");
         }
 
+        if (b->vlan_protocol >= 0) {
+                r = sd_netlink_message_append_u16(req, IFLA_BR_VLAN_PROTOCOL, b->vlan_protocol);
+                if (r < 0)
+                        return log_netdev_error_errno(netdev, r, "Could not append IFLA_BR_VLAN_PROTOCOL attribute: %m");
+        }
+
         if (b->stp >= 0) {
                 r = sd_netlink_message_append_u32(req, IFLA_BR_STP_STATE, b->stp);
                 if (r < 0)
@@ -186,7 +191,7 @@ int link_set_bridge(Link *link) {
         if (r < 0)
                 return log_link_error_errno(link, r, "Could not allocate RTM_SETLINK message: %m");
 
-        r = sd_rtnl_message_link_set_family(req, PF_BRIDGE);
+        r = sd_rtnl_message_link_set_family(req, AF_BRIDGE);
         if (r < 0)
                 return log_link_error_errno(link, r, "Could not set message family: %m");
 
@@ -212,7 +217,7 @@ int link_set_bridge(Link *link) {
                         return log_link_error_errno(link, r, "Could not append IFLA_BRPORT_FAST_LEAVE attribute: %m");
         }
 
-        if (link->network->allow_port_to_be_root >=  0) {
+        if (link->network->allow_port_to_be_root >= 0) {
                 r = sd_netlink_message_append_u8(req, IFLA_BRPORT_PROTECT, link->network->allow_port_to_be_root);
                 if (r < 0)
                         return log_link_error_errno(link, r, "Could not append IFLA_BRPORT_PROTECT attribute: %m");
@@ -320,18 +325,59 @@ int config_parse_bridge_igmp_version(
 
         r = safe_atou8(rvalue, &u);
         if (r < 0) {
-                log_syntax(unit, LOG_ERR, filename, line, r,
+                log_syntax(unit, LOG_WARNING, filename, line, r,
                            "Failed to parse bridge's multicast IGMP version number '%s', ignoring assignment: %m",
                            rvalue);
                 return 0;
         }
         if (!IN_SET(u, 2, 3)) {
-                log_syntax(unit, LOG_ERR, filename, line, 0,
+                log_syntax(unit, LOG_WARNING, filename, line, 0,
                            "Invalid bridge's multicast IGMP version number '%s', ignoring assignment.", rvalue);
                 return 0;
         }
 
         b->igmp_version = u;
+
+        return 0;
+}
+
+int config_parse_bridge_port_priority(
+                const char *unit,
+                const char *filename,
+                unsigned line,
+                const char *section,
+                unsigned section_line,
+                const char *lvalue,
+                int ltype,
+                const char *rvalue,
+                void *data,
+                void *userdata) {
+
+        uint16_t i;
+        int r;
+
+        assert(filename);
+        assert(lvalue);
+        assert(rvalue);
+        assert(data);
+
+        /* This is used in networkd-network-gperf.gperf. */
+
+        r = safe_atou16(rvalue, &i);
+        if (r < 0) {
+                log_syntax(unit, LOG_WARNING, filename, line, r,
+                           "Failed to parse bridge port priority, ignoring: %s", rvalue);
+                return 0;
+        }
+
+        if (i > LINK_BRIDGE_PORT_PRIORITY_MAX) {
+                log_syntax(unit, LOG_WARNING, filename, line, 0,
+                           "Bridge port priority is larger than maximum %u, ignoring: %s",
+                           LINK_BRIDGE_PORT_PRIORITY_MAX, rvalue);
+                return 0;
+        }
+
+        *((uint16_t *)data) = i;
 
         return 0;
 }
@@ -346,6 +392,7 @@ static void bridge_init(NetDev *n) {
         b->mcast_querier = -1;
         b->mcast_snooping = -1;
         b->vlan_filtering = -1;
+        b->vlan_protocol = -1;
         b->stp = -1;
         b->default_pvid = VLANID_INVALID;
         b->forward_delay = USEC_INFINITY;

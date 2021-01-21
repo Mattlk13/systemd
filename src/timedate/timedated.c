@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
 #include <sys/stat.h>
@@ -12,6 +12,10 @@
 #include "alloc-util.h"
 #include "bus-common-errors.h"
 #include "bus-error.h"
+#include "bus-get-properties.h"
+#include "bus-locator.h"
+#include "bus-log-control-api.h"
+#include "bus-map-properties.h"
 #include "bus-polkit.h"
 #include "clock-util.h"
 #include "conf-files.h"
@@ -27,6 +31,7 @@
 #include "missing_capability.h"
 #include "path-util.h"
 #include "selinux-util.h"
+#include "service-util.h"
 #include "signal-util.h"
 #include "string-util.h"
 #include "strv.h"
@@ -374,7 +379,10 @@ static int context_write_data_local_rtc(Context *c) {
                 }
         }
 
-        mac_selinux_init();
+        r = mac_selinux_init();
+        if (r < 0)
+                return r;
+
         return write_string_file_atomic_label("/etc/adjtime", w);
 }
 
@@ -468,11 +476,9 @@ static int unit_start_or_stop(UnitStatusInfo *u, sd_bus *bus, sd_bus_error *erro
         assert(bus);
         assert(error);
 
-        r = sd_bus_call_method(
+        r = bus_call_method(
                 bus,
-                "org.freedesktop.systemd1",
-                "/org/freedesktop/systemd1",
-                "org.freedesktop.systemd1.Manager",
+                bus_systemd_mgr,
                 start ? "StartUnit" : "StopUnit",
                 error,
                 &reply,
@@ -512,11 +518,9 @@ static int unit_enable_or_disable(UnitStatusInfo *u, sd_bus *bus, sd_bus_error *
         log_unit_info(u, "%s unit.", enable ? "Enabling" : "Disabling");
 
         if (enable)
-                r = sd_bus_call_method(
+                r = bus_call_method(
                                 bus,
-                                "org.freedesktop.systemd1",
-                                "/org/freedesktop/systemd1",
-                                "org.freedesktop.systemd1.Manager",
+                                bus_systemd_mgr,
                                 "EnableUnitFiles",
                                 error,
                                 NULL,
@@ -524,11 +528,9 @@ static int unit_enable_or_disable(UnitStatusInfo *u, sd_bus *bus, sd_bus_error *
                                 u->name,
                                 false, true);
         else
-                r = sd_bus_call_method(
+                r = bus_call_method(
                                 bus,
-                                "org.freedesktop.systemd1",
-                                "/org/freedesktop/systemd1",
-                                "org.freedesktop.systemd1.Manager",
+                                bus_systemd_mgr,
                                 "DisableUnitFiles",
                                 error,
                                 NULL,
@@ -538,15 +540,7 @@ static int unit_enable_or_disable(UnitStatusInfo *u, sd_bus *bus, sd_bus_error *
         if (r < 0)
                 return r;
 
-        r = sd_bus_call_method(
-                        bus,
-                        "org.freedesktop.systemd1",
-                        "/org/freedesktop/systemd1",
-                        "org.freedesktop.systemd1.Manager",
-                        "Reload",
-                        error,
-                        NULL,
-                        NULL);
+        r = bus_call_method(bus, bus_systemd_mgr, "Reload", error, NULL, NULL);
         if (r < 0)
                 return r;
 
@@ -769,10 +763,7 @@ static int method_set_local_rtc(sd_bus_message *m, void *userdata, sd_bus_error 
                 struct tm tm;
 
                 /* Sync system clock from RTC; first, initialize the timezone fields of struct tm. */
-                if (c->local_rtc)
-                        localtime_r(&ts.tv_sec, &tm);
-                else
-                        gmtime_r(&ts.tv_sec, &tm);
+                localtime_or_gmtime_r(&ts.tv_sec, &tm, !c->local_rtc);
 
                 /* Override the main fields of struct tm, but not the timezone fields */
                 r = clock_get_hwclock(&tm);
@@ -780,10 +771,7 @@ static int method_set_local_rtc(sd_bus_message *m, void *userdata, sd_bus_error 
                         log_debug_errno(r, "Failed to get hardware clock, ignoring: %m");
                 else {
                         /* And set the system clock with this */
-                        if (c->local_rtc)
-                                ts.tv_sec = mktime(&tm);
-                        else
-                                ts.tv_sec = timegm(&tm);
+                        ts.tv_sec = mktime_or_timegm(&tm, !c->local_rtc);
 
                         if (clock_settime(CLOCK_REALTIME, &ts) < 0)
                                 log_debug_errno(errno, "Failed to update system clock, ignoring: %m");
@@ -793,10 +781,7 @@ static int method_set_local_rtc(sd_bus_message *m, void *userdata, sd_bus_error 
                 struct tm tm;
 
                 /* Sync RTC from system clock */
-                if (c->local_rtc)
-                        localtime_r(&ts.tv_sec, &tm);
-                else
-                        gmtime_r(&ts.tv_sec, &tm);
+                localtime_or_gmtime_r(&ts.tv_sec, &tm, !c->local_rtc);
 
                 r = clock_set_hwclock(&tm);
                 if (r < 0)
@@ -890,10 +875,7 @@ static int method_set_time(sd_bus_message *m, void *userdata, sd_bus_error *erro
         }
 
         /* Sync down to RTC */
-        if (c->local_rtc)
-                localtime_r(&ts.tv_sec, &tm);
-        else
-                gmtime_r(&ts.tv_sec, &tm);
+        localtime_or_gmtime_r(&ts.tv_sec, &tm, !c->local_rtc);
 
         r = clock_set_hwclock(&tm);
         if (r < 0)
@@ -949,12 +931,10 @@ static int method_set_ntp(sd_bus_message *m, void *userdata, sd_bus_error *error
                 u->path = mfree(u->path);
 
         if (!c->slot_job_removed) {
-                r = sd_bus_match_signal_async(
+                r = bus_match_signal_async(
                                 bus,
                                 &slot,
-                                "org.freedesktop.systemd1",
-                                "/org/freedesktop/systemd1",
-                                "org.freedesktop.systemd1.Manager",
+                                bus_systemd_mgr,
                                 "JobRemoved",
                                 match_job_removed, NULL, c);
                 if (r < 0)
@@ -1035,6 +1015,7 @@ static int method_list_timezones(sd_bus_message *m, void *userdata, sd_bus_error
 
 static const sd_bus_vtable timedate_vtable[] = {
         SD_BUS_VTABLE_START(0),
+
         SD_BUS_PROPERTY("Timezone", "s", NULL, offsetof(Context, zone), SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
         SD_BUS_PROPERTY("LocalRTC", "b", bus_property_get_bool, offsetof(Context, local_rtc), SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
         SD_BUS_PROPERTY("CanNTP", "b", property_get_can_ntp, 0, 0),
@@ -1042,12 +1023,51 @@ static const sd_bus_vtable timedate_vtable[] = {
         SD_BUS_PROPERTY("NTPSynchronized", "b", property_get_ntp_sync, 0, 0),
         SD_BUS_PROPERTY("TimeUSec", "t", property_get_time, 0, 0),
         SD_BUS_PROPERTY("RTCTimeUSec", "t", property_get_rtc_time, 0, 0),
-        SD_BUS_METHOD("SetTime", "xbb", NULL, method_set_time, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("SetTimezone", "sb", NULL, method_set_timezone, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("SetLocalRTC", "bbb", NULL, method_set_local_rtc, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("SetNTP", "bb", NULL, method_set_ntp, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("ListTimezones", NULL, "as", method_list_timezones, SD_BUS_VTABLE_UNPRIVILEGED),
+
+        SD_BUS_METHOD_WITH_NAMES("SetTime",
+                                 "xbb",
+                                 SD_BUS_PARAM(usec_utc)
+                                 SD_BUS_PARAM(relative)
+                                 SD_BUS_PARAM(interactive),
+                                 NULL,,
+                                 method_set_time,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("SetTimezone",
+                                 "sb",
+                                 SD_BUS_PARAM(timezone)
+                                 SD_BUS_PARAM(interactive),
+                                 NULL,,
+                                 method_set_timezone,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("SetLocalRTC",
+                                 "bbb",
+                                 SD_BUS_PARAM(local_rtc)
+                                 SD_BUS_PARAM(fix_system)
+                                 SD_BUS_PARAM(interactive),
+                                 NULL,,
+                                 method_set_local_rtc,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("SetNTP",
+                                 "bb",
+                                 SD_BUS_PARAM(use_ntp)
+                                 SD_BUS_PARAM(interactive),
+                                 NULL,,
+                                 method_set_ntp,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("ListTimezones",
+                                 NULL,,
+                                 "as",
+                                 SD_BUS_PARAM(timezones),
+                                 method_list_timezones,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+
         SD_BUS_VTABLE_END,
+};
+
+const BusObjectImplementation manager_object = {
+        "/org/freedesktop/timedate1",
+        "org.freedesktop.timedate1",
+        .vtables = BUS_VTABLES(timedate_vtable),
 };
 
 static int connect_bus(Context *c, sd_event *event, sd_bus **_bus) {
@@ -1062,9 +1082,13 @@ static int connect_bus(Context *c, sd_event *event, sd_bus **_bus) {
         if (r < 0)
                 return log_error_errno(r, "Failed to get system bus connection: %m");
 
-        r = sd_bus_add_object_vtable(bus, NULL, "/org/freedesktop/timedate1", "org.freedesktop.timedate1", timedate_vtable, c);
+        r = bus_add_implementation(bus, &manager_object, c);
         if (r < 0)
-                return log_error_errno(r, "Failed to register object: %m");
+                return r;
+
+        r = bus_log_control_api_register(bus);
+        if (r < 0)
+                return r;
 
         r = sd_bus_request_name_async(bus, NULL, "org.freedesktop.timedate1", 0, NULL, NULL);
         if (r < 0)
@@ -1087,10 +1111,15 @@ static int run(int argc, char *argv[]) {
 
         log_setup_service();
 
-        umask(0022);
+        r = service_parse_argv("systemd-timedated.service",
+                               "Manage the system clock and timezone and NTP enablement.",
+                               BUS_IMPLEMENTATIONS(&manager_object,
+                                                   &log_control_object),
+                               argc, argv);
+        if (r <= 0)
+                return r;
 
-        if (argc != 1)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "This program takes no arguments.");
+        umask(0022);
 
         assert_se(sigprocmask_many(SIG_BLOCK, NULL, SIGTERM, SIGINT, -1) >= 0);
 

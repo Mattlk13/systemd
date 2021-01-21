@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
 #include <fcntl.h>
@@ -25,7 +25,9 @@ static int run(int argc, char *argv[]) {
 
         umask(0022);
 
-        mac_selinux_init();
+        r = mac_selinux_init();
+        if (r < 0)
+                return r;
 
         if (streq(argv[1], "start")) {
                 r = unlink_or_warn("/run/nologin");

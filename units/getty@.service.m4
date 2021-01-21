@@ -1,4 +1,4 @@
-#  SPDX-License-Identifier: LGPL-2.1+
+#  SPDX-License-Identifier: LGPL-2.1-or-later
 #
 #  This file is part of systemd.
 #
@@ -47,7 +47,9 @@ TTYPath=/dev/%I
 TTYReset=yes
 TTYVHangup=yes
 TTYVTDisallocate=yes
+m4_ifdef(`ENABLE_LOGIND',,
 KillMode=process
+)m4_dnl
 IgnoreSIGPIPE=no
 SendSIGHUP=yes
 

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+
+/* SPDX-License-Identifier: LGPL-2.1-or-later
  * Copyright © 2019 VMware, Inc. */
 
 #include <linux/pkt_sched.h>
@@ -20,13 +20,16 @@ const QDiscVTable * const qdisc_vtable[_QDISC_KIND_MAX] = {
         [QDISC_KIND_CAKE] = &cake_vtable,
         [QDISC_KIND_CODEL] = &codel_vtable,
         [QDISC_KIND_DRR] = &drr_vtable,
+        [QDISC_KIND_ETS] = &ets_vtable,
         [QDISC_KIND_FQ] = &fq_vtable,
         [QDISC_KIND_FQ_CODEL] = &fq_codel_vtable,
+        [QDISC_KIND_FQ_PIE] = &fq_pie_vtable,
         [QDISC_KIND_GRED] = &gred_vtable,
         [QDISC_KIND_HHF] = &hhf_vtable,
         [QDISC_KIND_HTB] = &htb_vtable,
         [QDISC_KIND_NETEM] = &netem_vtable,
         [QDISC_KIND_PIE] = &pie_vtable,
+        [QDISC_KIND_QFQ] = &qfq_vtable,
         [QDISC_KIND_PFIFO] = &pfifo_vtable,
         [QDISC_KIND_PFIFO_FAST] = &pfifo_fast_vtable,
         [QDISC_KIND_PFIFO_HEAD_DROP] = &pfifo_head_drop_vtable,
@@ -37,7 +40,7 @@ const QDiscVTable * const qdisc_vtable[_QDISC_KIND_MAX] = {
 };
 
 static int qdisc_new(QDiscKind kind, QDisc **ret) {
-        QDisc *qdisc;
+        _cleanup_(qdisc_freep) QDisc *qdisc = NULL;
         int r;
 
         if (kind == _QDISC_KIND_INVALID) {
@@ -123,11 +126,7 @@ int qdisc_new_static(QDiscKind kind, Network *network, const char *filename, uns
         qdisc->network = network;
         qdisc->section = TAKE_PTR(n);
 
-        r = ordered_hashmap_ensure_allocated(&network->tc_by_section, &network_config_hash_ops);
-        if (r < 0)
-                return r;
-
-        r = ordered_hashmap_put(network->tc_by_section, qdisc->section, TC(qdisc));
+        r = ordered_hashmap_ensure_put(&network->tc_by_section, &network_config_hash_ops, qdisc->section, TC(qdisc));
         if (r < 0)
                 return r;
 
@@ -286,8 +285,13 @@ int config_parse_qdisc_parent(
         assert(data);
 
         r = qdisc_new_static(ltype, network, filename, section_line, &qdisc);
-        if (r < 0)
-                return r;
+        if (r == -ENOMEM)
+                return log_oom();
+        if (r < 0) {
+                log_syntax(unit, LOG_WARNING, filename, line, r,
+                           "More than one kind of queueing discipline, ignoring assignment: %m");
+                return 0;
+        }
 
         if (streq(rvalue, "root")) {
                 qdisc->parent = TC_H_ROOT;
@@ -302,7 +306,7 @@ int config_parse_qdisc_parent(
         } else {
                 r = parse_handle(rvalue, &qdisc->parent);
                 if (r < 0) {
-                        log_syntax(unit, LOG_ERR, filename, line, r,
+                        log_syntax(unit, LOG_WARNING, filename, line, r,
                                    "Failed to parse 'Parent=', ignoring assignment: %s",
                                    rvalue);
                         return 0;
@@ -316,7 +320,7 @@ int config_parse_qdisc_parent(
         } else
                 qdisc->tca_kind = mfree(qdisc->tca_kind);
 
-        qdisc = NULL;
+        TAKE_PTR(qdisc);
 
         return 0;
 }
@@ -344,25 +348,30 @@ int config_parse_qdisc_handle(
         assert(data);
 
         r = qdisc_new_static(ltype, network, filename, section_line, &qdisc);
-        if (r < 0)
-                return r;
+        if (r == -ENOMEM)
+                return log_oom();
+        if (r < 0) {
+                log_syntax(unit, LOG_WARNING, filename, line, r,
+                           "More than one kind of queueing discipline, ignoring assignment: %m");
+                return 0;
+        }
 
         if (isempty(rvalue)) {
                 qdisc->handle = TC_H_UNSPEC;
-                qdisc = NULL;
+                TAKE_PTR(qdisc);
                 return 0;
         }
 
         r = safe_atou16_full(rvalue, 16, &n);
         if (r < 0) {
-                log_syntax(unit, LOG_ERR, filename, line, r,
+                log_syntax(unit, LOG_WARNING, filename, line, r,
                            "Failed to parse 'Handle=', ignoring assignment: %s",
                            rvalue);
                 return 0;
         }
 
         qdisc->handle = (uint32_t) n << 16;
-        qdisc = NULL;
+        TAKE_PTR(qdisc);
 
         return 0;
 }

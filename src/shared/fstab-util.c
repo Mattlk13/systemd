@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
 #include <stdio.h>
@@ -35,6 +35,30 @@ int fstab_has_fstype(const char *fstype) {
         return false;
 }
 
+bool fstab_is_extrinsic(const char *mount, const char *opts) {
+
+        /* Don't bother with the OS data itself */
+        if (PATH_IN_SET(mount,
+                        "/",
+                        "/usr",
+                        "/etc"))
+                return true;
+
+        if (PATH_STARTSWITH_SET(mount,
+                                "/run/initramfs",    /* This should stay around from before we boot until after we shutdown */
+                                "/proc",             /* All of this is API VFS */
+                                "/sys",              /* … dito … */
+                                "/dev"))             /* … dito … */
+                return true;
+
+        /* If this is an initrd mount, and we are not in the initrd, then leave
+         * this around forever, too. */
+        if (opts && fstab_test_option(opts, "x-initrd.mount\0") && !in_initrd())
+                return true;
+
+        return false;
+}
+
 int fstab_is_mount_point(const char *mount) {
         _cleanup_endmntent_ FILE *f = NULL;
         struct mntent *m;
@@ -56,59 +80,76 @@ int fstab_is_mount_point(const char *mount) {
 }
 
 int fstab_filter_options(const char *opts, const char *names,
-                         const char **namefound, char **value, char **filtered) {
-        const char *name, *n = NULL, *x;
+                         const char **ret_namefound, char **ret_value, char **ret_filtered) {
+        const char *name, *namefound = NULL, *x;
         _cleanup_strv_free_ char **stor = NULL;
         _cleanup_free_ char *v = NULL, **strv = NULL;
+        int r;
 
         assert(names && *names);
 
         if (!opts)
                 goto answer;
 
-        /* If !value and !filtered, this function is not allowed to fail. */
+        /* If !ret_value and !ret_filtered, this function is not allowed to fail. */
 
-        if (!filtered) {
-                const char *word, *state;
-                size_t l;
+        if (!ret_filtered) {
+                for (const char *word = opts;;) {
+                        const char *end = word;
 
-                FOREACH_WORD_SEPARATOR(word, l, opts, ",", state)
+                        /* Look for an *non-escaped* comma separator. Only commas can be escaped, so "\," is
+                         * the only valid escape sequence, so we can do a very simple test here. */
+                        for (;;) {
+                                size_t n = strcspn(end, ",");
+
+                                end += n;
+                                if (n > 0 && end[-1] == '\\')
+                                        end++;
+                                else
+                                        break;
+                        }
+
                         NULSTR_FOREACH(name, names) {
-                                if (l < strlen(name))
+                                if (end < word + strlen(name))
                                         continue;
                                 if (!strneq(word, name, strlen(name)))
                                         continue;
 
-                                /* we know that the string is NUL
-                                 * terminated, so *x is valid */
+                                /* We know that the string is NUL terminated, so *x is valid */
                                 x = word + strlen(name);
                                 if (IN_SET(*x, '\0', '=', ',')) {
-                                        n = name;
-                                        if (value) {
-                                                free(v);
-                                                if (IN_SET(*x, '\0', ','))
-                                                        v = NULL;
-                                                else {
-                                                        assert(*x == '=');
-                                                        x++;
-                                                        v = strndup(x, l - strlen(name) - 1);
-                                                        if (!v)
-                                                                return -ENOMEM;
-                                                }
+                                        namefound = name;
+                                        if (ret_value) {
+                                                bool eq = *x == '=';
+                                                assert(eq || IN_SET(*x, ',', '\0'));
+
+                                                r = free_and_strndup(&v,
+                                                                     eq ? x + 1 : NULL,
+                                                                     eq ? end - x - 1 : 0);
+                                                if (r < 0)
+                                                        return r;
                                         }
+
+                                        break;
                                 }
                         }
-        } else {
-                char **t, **s;
 
-                stor = strv_split(opts, ",");
-                if (!stor)
-                        return -ENOMEM;
+                        if (*end)
+                                word = end + 1;
+                        else
+                                break;
+                }
+        } else {
+                r = strv_split_full(&stor, opts, ",", EXTRACT_DONT_COALESCE_SEPARATORS | EXTRACT_UNESCAPE_SEPARATORS);
+                if (r < 0)
+                        return r;
+
                 strv = memdup(stor, sizeof(char*) * (strv_length(stor) + 1));
                 if (!strv)
                         return -ENOMEM;
 
-                for (s = t = strv; *s; s++) {
+                char **t = strv;
+                for (char **s = strv; *s; s++) {
                         NULSTR_FOREACH(name, names) {
                                 x = startswith(*s, name);
                                 if (x && IN_SET(*x, '\0', '='))
@@ -120,39 +161,33 @@ int fstab_filter_options(const char *opts, const char *names,
                         continue;
                 found:
                         /* Keep the last occurrence found */
-                        n = name;
-                        if (value) {
-                                free(v);
-                                if (*x == '\0')
-                                        v = NULL;
-                                else {
-                                        assert(*x == '=');
-                                        x++;
-                                        v = strdup(x);
-                                        if (!v)
-                                                return -ENOMEM;
-                                }
+                        namefound = name;
+                        if (ret_value) {
+                                assert(IN_SET(*x, '=', '\0'));
+                                r = free_and_strdup(&v, *x == '=' ? x + 1 : NULL);
+                                if (r < 0)
+                                        return r;
                         }
                 }
                 *t = NULL;
         }
 
 answer:
-        if (namefound)
-                *namefound = n;
-        if (filtered) {
+        if (ret_namefound)
+                *ret_namefound = namefound;
+        if (ret_filtered) {
                 char *f;
 
-                f = strv_join(strv, ",");
+                f = strv_join_full(strv, ",", NULL, true);
                 if (!f)
                         return -ENOMEM;
 
-                *filtered = f;
+                *ret_filtered = f;
         }
-        if (value)
-                *value = TAKE_PTR(v);
+        if (ret_value)
+                *ret_value = TAKE_PTR(v);
 
-        return !!n;
+        return !!namefound;
 }
 
 int fstab_extract_values(const char *opts, const char *name, char ***values) {

@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: LGPL-2.1+
+# SPDX-License-Identifier: LGPL-2.1-or-later
 
 systemd_logind_sources = files('''
         logind.c
@@ -12,7 +12,6 @@ logind_gperf_c = custom_target(
         command : [gperf, '@INPUT@', '--output-file', '@OUTPUT@'])
 
 liblogind_core_sources = files('''
-        logind-acl.h
         logind-action.c
         logind-action.h
         logind-brightness.c
@@ -45,11 +44,6 @@ liblogind_core_sources = files('''
 
 liblogind_core_sources += [logind_gperf_c]
 
-logind_acl_c = files('logind-acl.c')
-if conf.get('HAVE_ACL') == 1
-        liblogind_core_sources += logind_acl_c
-endif
-
 liblogind_core = static_library(
         'logind-core',
         liblogind_core_sources,
@@ -74,8 +68,10 @@ if conf.get('ENABLE_LOGIND') == 1
                 input : 'logind.conf.in',
                 output : 'logind.conf',
                 configuration : substs)
-        install_data(logind_conf,
-                     install_dir : pkgsysconfdir)
+        if install_sysconfdir_samples
+                install_data(logind_conf,
+                             install_dir : pkgsysconfdir)
+        endif
 
         install_data('org.freedesktop.login1.conf',
                      install_dir : dbuspolicydir)
@@ -120,3 +116,17 @@ if conf.get('ENABLE_LOGIND') == 1
                 install : pamconfdir != 'no',
                 install_dir : pamconfdir)
 endif
+
+############################################################
+
+tests += [
+        [['src/login/test-login-shared.c']],
+
+        [['src/login/test-inhibit.c'],
+         [], [], [], '', 'manual'],
+
+        [['src/login/test-login-tables.c'],
+         [liblogind_core,
+          libshared],
+         [threads]],
+]

@@ -4,7 +4,7 @@
 <!ENTITY % entities SYSTEM "custom-entities.ent" >
 %entities;
 ]>
-<!-- SPDX-License-Identifier: LGPL-2.1+ -->
+<!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="systemd.syntax">
 
@@ -98,10 +98,10 @@ KeyTwo=value 2 \
        value 2 continued
 
 [Section C]
-KeyThree=value 2\
+KeyThree=value 3\
 # this line is ignored
 ; this line is ignored too
-       value 2 continued
+       value 3 continued
 </programlisting></example>
 
     <para>Boolean arguments used in configuration files can be written in

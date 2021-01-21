@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -8,10 +8,6 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#if HAVE_LIBIDN2
-#include <idn2.h>
-#endif
-
 #include "af-list.h"
 #include "alloc-util.h"
 #include "bus-polkit.h"
@@ -20,10 +16,10 @@
 #include "fd-util.h"
 #include "fileio.h"
 #include "hostname-util.h"
+#include "idn-util.h"
 #include "io-util.h"
 #include "missing_network.h"
 #include "netlink-util.h"
-#include "network-internal.h"
 #include "ordered-set.h"
 #include "parse-util.h"
 #include "random-util.h"
@@ -36,6 +32,7 @@
 #include "resolved-manager.h"
 #include "resolved-mdns.h"
 #include "resolved-resolv-conf.h"
+#include "resolved-varlink.h"
 #include "socket-util.h"
 #include "string-table.h"
 #include "string-util.h"
@@ -267,7 +264,6 @@ static int manager_rtnl_listen(Manager *m) {
 
 static int on_network_event(sd_event_source *s, int fd, uint32_t revents, void *userdata) {
         Manager *m = userdata;
-        Iterator i;
         Link *l;
         int r;
 
@@ -275,7 +271,7 @@ static int on_network_event(sd_event_source *s, int fd, uint32_t revents, void *
 
         sd_network_monitor_flush(m->network_monitor);
 
-        HASHMAP_FOREACH(l, m->links, i) {
+        HASHMAP_FOREACH(l, m->links) {
                 r = link_update(l);
                 if (r < 0)
                         log_warning_errno(r, "Failed to update monitor information for %i: %m", l->ifindex);
@@ -317,6 +313,54 @@ static int manager_network_monitor_listen(Manager *m) {
         return 0;
 }
 
+static int manager_clock_change_listen(Manager *m);
+
+static int on_clock_change(sd_event_source *source, int fd, uint32_t revents, void *userdata) {
+        Manager *m = userdata;
+
+        assert(m);
+
+        /* The clock has changed, let's flush all caches. Why that? That's because DNSSEC validation takes
+         * the system clock into consideration, and if the clock changes the old validations might have been
+         * wrong. Let's redo all validation with the new, correct time.
+         *
+         * (Also, this is triggered after system suspend, which is also a good reason to drop caches, since
+         * we might be connected to a different network now without this being visible in a dropped link
+         * carrier or so.) */
+
+        log_info("Clock change detected. Flushing caches.");
+        manager_flush_caches(m, LOG_DEBUG /* downgrade the functions own log message, since we already logged here at LOG_INFO level */);
+
+        /* The clock change timerfd is unusable after it triggered once, create a new one. */
+        return manager_clock_change_listen(m);
+}
+
+static int manager_clock_change_listen(Manager *m) {
+        _cleanup_close_ int fd = -1;
+        int r;
+
+        assert(m);
+
+        m->clock_change_event_source = sd_event_source_unref(m->clock_change_event_source);
+
+        fd = time_change_fd();
+        if (fd < 0)
+                return log_error_errno(fd, "Failed to allocate clock change timer fd: %m");
+
+        r = sd_event_add_io(m->event, &m->clock_change_event_source, fd, EPOLLIN, on_clock_change, m);
+        if (r < 0)
+                return log_error_errno(r, "Failed to create clock change event source: %m");
+
+        r = sd_event_source_set_io_fd_own(m->clock_change_event_source, true);
+        if (r < 0)
+                return log_error_errno(r, "Failed to pass ownership of clock fd to event source: %m");
+        TAKE_FD(fd);
+
+        (void) sd_event_source_set_description(m->clock_change_event_source, "clock-change");
+
+        return 0;
+}
+
 static int determine_hostname(char **full_hostname, char **llmnr_hostname, char **mdns_hostname) {
         _cleanup_free_ char *h = NULL, *n = NULL;
 #if HAVE_LIBIDN2
@@ -341,37 +385,47 @@ static int determine_hostname(char **full_hostname, char **llmnr_hostname, char 
         p = h;
         r = dns_label_unescape(&p, label, sizeof label, 0);
         if (r < 0)
-                return log_error_errno(r, "Failed to unescape host name: %m");
+                return log_error_errno(r, "Failed to unescape hostname: %m");
         if (r == 0)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "Couldn't find a single label in hostname.");
 
-#if HAVE_LIBIDN2
-        r = idn2_to_unicode_8z8z(label, &utf8, 0);
-        if (r != IDN2_OK)
-                return log_error("Failed to undo IDNA: %s", idn2_strerror(r));
-        assert(utf8_is_valid(utf8));
-
-        r = strlen(utf8);
-        decoded = utf8;
-#elif HAVE_LIBIDN
-        k = dns_label_undo_idna(label, r, label, sizeof label);
-        if (k < 0)
-                return log_error_errno(k, "Failed to undo IDNA: %m");
-        if (k > 0)
-                r = k;
-
-        if (!utf8_is_valid(label))
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                       "System hostname is not UTF-8 clean.");
-        decoded = label;
-#else
-        decoded = label; /* no decoding */
+#if HAVE_LIBIDN || HAVE_LIBIDN2
+        r = dlopen_idn();
+        if (r < 0) {
+                log_debug_errno(r, "Failed to initialize IDN support, ignoring: %m");
+                decoded = label; /* no decoding */
+        } else
 #endif
+        {
+#if HAVE_LIBIDN2
+                r = sym_idn2_to_unicode_8z8z(label, &utf8, 0);
+                if (r != IDN2_OK)
+                        return log_error_errno(SYNTHETIC_ERRNO(EUCLEAN),
+                                               "Failed to undo IDNA: %s", sym_idn2_strerror(r));
+                assert(utf8_is_valid(utf8));
+
+                r = strlen(utf8);
+                decoded = utf8;
+#elif HAVE_LIBIDN
+                k = dns_label_undo_idna(label, r, label, sizeof label);
+                if (k < 0)
+                        return log_error_errno(k, "Failed to undo IDNA: %m");
+                if (k > 0)
+                        r = k;
+
+                if (!utf8_is_valid(label))
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                               "System hostname is not UTF-8 clean.");
+                decoded = label;
+#else
+                decoded = label; /* no decoding */
+#endif
+        }
 
         r = dns_label_escape_new(decoded, r, &n);
         if (r < 0)
-                return log_error_errno(r, "Failed to escape host name: %m");
+                return log_error_errno(r, "Failed to escape hostname: %m");
 
         if (is_localhost(n))
                 return log_debug_errno(SYNTHETIC_ERRNO(EINVAL),
@@ -411,7 +465,7 @@ static int make_fallback_hostnames(char **full_hostname, char **llmnr_hostname, 
         p = fallback_hostname();
         r = dns_label_unescape(&p, label, sizeof label, 0);
         if (r < 0)
-                return log_error_errno(r, "Failed to unescape fallback host name: %m");
+                return log_error_errno(r, "Failed to unescape fallback hostname: %m");
 
         assert(r > 0); /* The fallback hostname must have at least one label */
 
@@ -508,7 +562,6 @@ static int manager_sigusr1(sd_event_source *s, const struct signalfd_siginfo *si
         DnsServer *server;
         size_t size = 0;
         DnsScope *scope;
-        Iterator i;
         Link *l;
 
         assert(s);
@@ -526,7 +579,7 @@ static int manager_sigusr1(sd_event_source *s, const struct signalfd_siginfo *si
                 dns_server_dump(server, f);
         LIST_FOREACH(servers, server, m->fallback_dns_servers)
                 dns_server_dump(server, f);
-        HASHMAP_FOREACH(l, m->links, i)
+        HASHMAP_FOREACH(l, m->links)
                 LIST_FOREACH(servers, server, l->dns_servers)
                         dns_server_dump(server, f);
 
@@ -544,7 +597,7 @@ static int manager_sigusr2(sd_event_source *s, const struct signalfd_siginfo *si
         assert(si);
         assert(m);
 
-        manager_flush_caches(m);
+        manager_flush_caches(m, LOG_INFO);
 
         return 0;
 }
@@ -577,12 +630,10 @@ int manager_new(Manager **ret) {
                 .llmnr_ipv6_tcp_fd = -1,
                 .mdns_ipv4_fd = -1,
                 .mdns_ipv6_fd = -1,
-                .dns_stub_udp_fd = -1,
-                .dns_stub_tcp_fd = -1,
                 .hostname_fd = -1,
 
-                .llmnr_support = RESOLVE_SUPPORT_YES,
-                .mdns_support = RESOLVE_SUPPORT_YES,
+                .llmnr_support = DEFAULT_LLMNR_MODE,
+                .mdns_support = DEFAULT_MDNS_MODE,
                 .dnssec_mode = DEFAULT_DNSSEC_MODE,
                 .dns_over_tls_mode = DEFAULT_DNS_OVER_TLS_MODE,
                 .enable_cache = DNS_CACHE_MODE_YES,
@@ -590,7 +641,6 @@ int manager_new(Manager **ret) {
                 .read_resolv_conf = true,
                 .need_builtin_fallbacks = true,
                 .etc_hosts_last = USEC_INFINITY,
-                .etc_hosts_mtime = USEC_INFINITY,
                 .read_etc_hosts = true,
         };
 
@@ -637,6 +687,10 @@ int manager_new(Manager **ret) {
         if (r < 0)
                 return r;
 
+        r = manager_clock_change_listen(m);
+        if (r < 0)
+                return r;
+
         r = manager_connect_bus(m);
         if (r < 0)
                 return r;
@@ -658,6 +712,10 @@ int manager_start(Manager *m) {
         assert(m);
 
         r = manager_dns_stub_start(m);
+        if (r < 0)
+                return r;
+
+        r = manager_varlink_init(m);
         if (r < 0)
                 return r;
 
@@ -700,10 +758,14 @@ Manager *manager_free(Manager *m) {
 
         sd_netlink_unref(m->rtnl);
         sd_event_source_unref(m->rtnl_event_source);
+        sd_event_source_unref(m->clock_change_event_source);
 
         manager_llmnr_stop(m);
         manager_mdns_stop(m);
         manager_dns_stub_stop(m);
+        manager_varlink_done(m);
+
+        ordered_set_free(m->dns_extra_stub_listeners);
 
         bus_verify_polkit_async_registry_free(m->polkit_registry);
 
@@ -739,12 +801,9 @@ Manager *manager_free(Manager *m) {
 
 int manager_recv(Manager *m, int fd, DnsProtocol protocol, DnsPacket **ret) {
         _cleanup_(dns_packet_unrefp) DnsPacket *p = NULL;
-        union {
-                struct cmsghdr header; /* For alignment */
-                uint8_t buffer[CMSG_SPACE(MAXSIZE(struct in_pktinfo, struct in6_pktinfo))
-                               + CMSG_SPACE(int) /* ttl/hoplimit */
-                               + EXTRA_CMSG_SPACE /* kernel appears to require extra buffer space */];
-        } control;
+        CMSG_BUFFER_TYPE(CMSG_SPACE(MAXSIZE(struct in_pktinfo, struct in6_pktinfo))
+                         + CMSG_SPACE(int) /* ttl/hoplimit */
+                         + EXTRA_CMSG_SPACE /* kernel appears to require extra buffer space */) control;
         union sockaddr_union sa;
         struct iovec iov;
         struct msghdr mh = {
@@ -773,17 +832,12 @@ int manager_recv(Manager *m, int fd, DnsProtocol protocol, DnsPacket **ret) {
 
         iov = IOVEC_MAKE(DNS_PACKET_DATA(p), p->allocated);
 
-        l = recvmsg(fd, &mh, 0);
-        if (l < 0) {
-                if (IN_SET(errno, EAGAIN, EINTR))
-                        return 0;
-
-                return -errno;
-        }
-        if (l == 0)
+        l = recvmsg_safe(fd, &mh, 0);
+        if (IN_SET(l, -EAGAIN, -EINTR))
                 return 0;
+        if (l <= 0)
+                return l;
 
-        assert(!(mh.msg_flags & MSG_CTRUNC));
         assert(!(mh.msg_flags & MSG_TRUNC));
 
         p->size = (size_t) l;
@@ -799,6 +853,8 @@ int manager_recv(Manager *m, int fd, DnsProtocol protocol, DnsPacket **ret) {
                 p->ifindex = sa.in6.sin6_scope_id;
         } else
                 return -EAFNOSUPPORT;
+
+        p->timestamp = now(clock_boottime_or_monotonic());
 
         CMSG_FOREACH(cmsg, &mh) {
 
@@ -914,7 +970,11 @@ static int write_loop(int fd, void *message, size_t length) {
 int manager_write(Manager *m, int fd, DnsPacket *p) {
         int r;
 
-        log_debug("Sending %s packet with id %" PRIu16 ".", DNS_PACKET_QR(p) ? "response" : "query", DNS_PACKET_ID(p));
+        log_debug("Sending %s%s packet with id %" PRIu16 " of size %zu.",
+                  DNS_PACKET_TC(p) ? "truncated (!) " : "",
+                  DNS_PACKET_QR(p) ? "response" : "query",
+                  DNS_PACKET_ID(p),
+                  p->size);
 
         r = write_loop(fd, DNS_PACKET_DATA(p), p->size);
         if (r < 0)
@@ -931,10 +991,8 @@ static int manager_ipv4_send(
                 uint16_t port,
                 const struct in_addr *source,
                 DnsPacket *p) {
-        union {
-                struct cmsghdr header; /* For alignment */
-                uint8_t buffer[CMSG_SPACE(sizeof(struct in_pktinfo))];
-        } control = {};
+
+        CMSG_BUFFER_TYPE(CMSG_SPACE(sizeof(struct in_pktinfo))) control = {};
         union sockaddr_union sa;
         struct iovec iov;
         struct msghdr mh = {
@@ -963,10 +1021,10 @@ static int manager_ipv4_send(
                 struct in_pktinfo *pi;
 
                 mh.msg_control = &control;
-                mh.msg_controllen = CMSG_LEN(sizeof(struct in_pktinfo));
+                mh.msg_controllen = sizeof(control);
 
                 cmsg = CMSG_FIRSTHDR(&mh);
-                cmsg->cmsg_len = mh.msg_controllen;
+                cmsg->cmsg_len = CMSG_LEN(sizeof(struct in_pktinfo));
                 cmsg->cmsg_level = IPPROTO_IP;
                 cmsg->cmsg_type = IP_PKTINFO;
 
@@ -989,10 +1047,7 @@ static int manager_ipv6_send(
                 const struct in6_addr *source,
                 DnsPacket *p) {
 
-        union {
-                struct cmsghdr header; /* For alignment */
-                uint8_t buffer[CMSG_SPACE(sizeof(struct in6_pktinfo))];
-        } control = {};
+        CMSG_BUFFER_TYPE(CMSG_SPACE(sizeof(struct in6_pktinfo))) control = {};
         union sockaddr_union sa;
         struct iovec iov;
         struct msghdr mh = {
@@ -1022,10 +1077,10 @@ static int manager_ipv6_send(
                 struct in6_pktinfo *pi;
 
                 mh.msg_control = &control;
-                mh.msg_controllen = CMSG_LEN(sizeof(struct in6_pktinfo));
+                mh.msg_controllen = sizeof(control);
 
                 cmsg = CMSG_FIRSTHDR(&mh);
-                cmsg->cmsg_len = mh.msg_controllen;
+                cmsg->cmsg_len = CMSG_LEN(sizeof(struct in6_pktinfo));
                 cmsg->cmsg_level = IPPROTO_IPV6;
                 cmsg->cmsg_type = IPV6_PKTINFO;
 
@@ -1055,7 +1110,12 @@ int manager_send(
         assert(port > 0);
         assert(p);
 
-        log_debug("Sending %s packet with id %" PRIu16 " on interface %i/%s.", DNS_PACKET_QR(p) ? "response" : "query", DNS_PACKET_ID(p), ifindex, af_to_name(family));
+        log_debug("Sending %s%s packet with id %" PRIu16 " on interface %i/%s of size %zu.",
+                  DNS_PACKET_TC(p) ? "truncated (!) " : "",
+                  DNS_PACKET_QR(p) ? "response" : "query",
+                  DNS_PACKET_ID(p),
+                  ifindex, af_to_name(family),
+                  p->size);
 
         if (family == AF_INET)
                 return manager_ipv4_send(m, fd, ifindex, &destination->in, port, source ? &source->in : NULL, p);
@@ -1068,13 +1128,12 @@ int manager_send(
 uint32_t manager_find_mtu(Manager *m) {
         uint32_t mtu = 0;
         Link *l;
-        Iterator i;
 
         /* If we don't know on which link a DNS packet would be
          * delivered, let's find the largest MTU that works on all
          * interfaces we know of */
 
-        HASHMAP_FOREACH(l, m->links, i) {
+        HASHMAP_FOREACH(l, m->links) {
                 if (l->mtu <= 0)
                         continue;
 
@@ -1098,7 +1157,6 @@ int manager_find_ifindex(Manager *m, int family, const union in_addr_union *in_a
 }
 
 void manager_refresh_rrs(Manager *m) {
-        Iterator i;
         Link *l;
         DnssdService *s;
 
@@ -1110,11 +1168,11 @@ void manager_refresh_rrs(Manager *m) {
         m->mdns_host_ipv6_key = dns_resource_key_unref(m->mdns_host_ipv6_key);
 
         if (m->mdns_support == RESOLVE_SUPPORT_YES)
-                HASHMAP_FOREACH(s, m->dnssd_services, i)
+                HASHMAP_FOREACH(s, m->dnssd_services)
                         if (dnssd_update_rrs(s) < 0)
                                 log_warning("Failed to refresh DNS-SD service '%s'", s->name);
 
-        HASHMAP_FOREACH(l, m->links, i) {
+        HASHMAP_FOREACH(l, m->links) {
                 link_add_rrs(l, true);
                 link_add_rrs(l, false);
         }
@@ -1182,12 +1240,11 @@ int manager_next_hostname(Manager *m) {
 }
 
 LinkAddress* manager_find_link_address(Manager *m, int family, const union in_addr_union *in_addr) {
-        Iterator i;
         Link *l;
 
         assert(m);
 
-        HASHMAP_FOREACH(l, m->links, i) {
+        HASHMAP_FOREACH(l, m->links) {
                 LinkAddress *a;
 
                 a = link_find_address(l, family, in_addr);
@@ -1274,7 +1331,6 @@ int manager_is_own_hostname(Manager *m, const char *name) {
 
 int manager_compile_dns_servers(Manager *m, OrderedSet **dns) {
         DnsServer *s;
-        Iterator i;
         Link *l;
         int r;
 
@@ -1295,7 +1351,7 @@ int manager_compile_dns_servers(Manager *m, OrderedSet **dns) {
         }
 
         /* Then, add the per-link servers */
-        HASHMAP_FOREACH(l, m->links, i) {
+        HASHMAP_FOREACH(l, m->links) {
                 LIST_FOREACH(servers, s, l->dns_servers) {
                         r = ordered_set_put(*dns, s);
                         if (r == -EEXIST)
@@ -1326,7 +1382,6 @@ int manager_compile_dns_servers(Manager *m, OrderedSet **dns) {
  */
 int manager_compile_search_domains(Manager *m, OrderedSet **domains, int filter_route) {
         DnsSearchDomain *d;
-        Iterator i;
         Link *l;
         int r;
 
@@ -1350,7 +1405,7 @@ int manager_compile_search_domains(Manager *m, OrderedSet **domains, int filter_
                         return r;
         }
 
-        HASHMAP_FOREACH(l, m->links, i) {
+        HASHMAP_FOREACH(l, m->links) {
 
                 LIST_FOREACH(domains, d, l->search_domains) {
 
@@ -1380,7 +1435,6 @@ DnssecMode manager_get_dnssec_mode(Manager *m) {
 
 bool manager_dnssec_supported(Manager *m) {
         DnsServer *server;
-        Iterator i;
         Link *l;
 
         assert(m);
@@ -1392,7 +1446,7 @@ bool manager_dnssec_supported(Manager *m) {
         if (server && !dns_server_dnssec_supported(server))
                 return false;
 
-        HASHMAP_FOREACH(l, m->links, i)
+        HASHMAP_FOREACH(l, m->links)
                 if (!link_dnssec_supported(l))
                         return false;
 
@@ -1424,22 +1478,21 @@ void manager_dnssec_verdict(Manager *m, DnssecVerdict verdict, const DnsResource
         m->n_dnssec_verdict[verdict]++;
 }
 
-bool manager_routable(Manager *m, int family) {
-        Iterator i;
+bool manager_routable(Manager *m) {
         Link *l;
 
         assert(m);
 
-        /* Returns true if the host has at least one interface with a routable address of the specified type */
+        /* Returns true if the host has at least one interface with a routable address (regardless if IPv4 or IPv6) */
 
-        HASHMAP_FOREACH(l, m->links, i)
-                if (link_relevant(l, family, false))
+        HASHMAP_FOREACH(l, m->links)
+                if (link_relevant(l, AF_UNSPEC, false))
                         return true;
 
         return false;
 }
 
-void manager_flush_caches(Manager *m) {
+void manager_flush_caches(Manager *m, int log_level) {
         DnsScope *scope;
 
         assert(m);
@@ -1447,17 +1500,16 @@ void manager_flush_caches(Manager *m) {
         LIST_FOREACH(scopes, scope, m->dns_scopes)
                 dns_cache_flush(&scope->cache);
 
-        log_info("Flushed all caches.");
+        log_full(log_level, "Flushed all caches.");
 }
 
 void manager_reset_server_features(Manager *m) {
-        Iterator i;
         Link *l;
 
         dns_server_reset_features_all(m->dns_servers);
         dns_server_reset_features_all(m->fallback_dns_servers);
 
-        HASHMAP_FOREACH(l, m->links, i)
+        HASHMAP_FOREACH(l, m->links)
                 dns_server_reset_features_all(l->dns_servers);
 
         log_info("Resetting learnt feature levels on all servers.");
@@ -1518,14 +1570,13 @@ void manager_cleanup_saved_user(Manager *m) {
 }
 
 bool manager_next_dnssd_names(Manager *m) {
-        Iterator i;
         DnssdService *s;
         bool tried = false;
         int r;
 
         assert(m);
 
-        HASHMAP_FOREACH(s, m->dnssd_services, i) {
+        HASHMAP_FOREACH(s, m->dnssd_services) {
                 _cleanup_free_ char * new_name = NULL;
 
                 if (!s->withdrawn)

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 #include "sd-id128.h"
@@ -7,6 +7,8 @@
 #include "sparse-endian.h"
 #include "time-util.h"
 #include "unaligned.h"
+
+#define SYSTEMD_PEN    43793
 
 typedef enum DUIDType {
         DUID_TYPE_LLT       = 1,

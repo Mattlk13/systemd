@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "sd-path.h"
 
@@ -20,7 +20,7 @@ static int environment_dirs(char ***ret) {
                 return -ENOMEM;
 
         /* ~/.config/systemd/environment.d */
-        r = sd_path_home(SD_PATH_USER_CONFIGURATION, "environment.d", &c);
+        r = sd_path_lookup(SD_PATH_USER_CONFIGURATION, "environment.d", &c);
         if (r < 0)
                 return r;
 

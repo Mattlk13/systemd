@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 #include <stdbool.h>
@@ -45,3 +45,5 @@ extern const gather_stdout_callback_t gather_environment[_STDOUT_CONSUME_MAX];
 
 const char* exec_command_flags_to_string(ExecCommandFlags i);
 ExecCommandFlags exec_command_flags_from_string(const char *s);
+
+int fexecve_or_execve(int executable_fd, const char *executable, char *const argv[], char *const envp[]);

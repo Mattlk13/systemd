@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
 #include <fcntl.h>
@@ -47,7 +47,7 @@ static volatile unsigned cached_columns = 0;
 static volatile unsigned cached_lines = 0;
 
 static volatile int cached_on_tty = -1;
-static volatile int cached_colors_enabled = -1;
+static volatile int cached_color_mode = _COLOR_INVALID;
 static volatile int cached_underline_enabled = -1;
 
 int chvt(int vt) {
@@ -81,31 +81,34 @@ int chvt(int vt) {
 int read_one_char(FILE *f, char *ret, usec_t t, bool *need_nl) {
         _cleanup_free_ char *line = NULL;
         struct termios old_termios;
-        int r;
+        int r, fd;
 
         assert(f);
         assert(ret);
 
-        /* If this is a terminal, then switch canonical mode off, so that we can read a single character */
-        if (tcgetattr(fileno(f), &old_termios) >= 0) {
+        /* If this is a terminal, then switch canonical mode off, so that we can read a single
+         * character. (Note that fmemopen() streams do not have an fd associated with them, let's handle that
+         * nicely.) */
+        fd = fileno(f);
+        if (fd >= 0 && tcgetattr(fd, &old_termios) >= 0) {
                 struct termios new_termios = old_termios;
 
                 new_termios.c_lflag &= ~ICANON;
                 new_termios.c_cc[VMIN] = 1;
                 new_termios.c_cc[VTIME] = 0;
 
-                if (tcsetattr(fileno(f), TCSADRAIN, &new_termios) >= 0) {
+                if (tcsetattr(fd, TCSADRAIN, &new_termios) >= 0) {
                         char c;
 
                         if (t != USEC_INFINITY) {
-                                if (fd_wait_for_event(fileno(f), POLLIN, t) <= 0) {
-                                        (void) tcsetattr(fileno(f), TCSADRAIN, &old_termios);
+                                if (fd_wait_for_event(fd, POLLIN, t) <= 0) {
+                                        (void) tcsetattr(fd, TCSADRAIN, &old_termios);
                                         return -ETIMEDOUT;
                                 }
                         }
 
                         r = safe_fgetc(f, &c);
-                        (void) tcsetattr(fileno(f), TCSADRAIN, &old_termios);
+                        (void) tcsetattr(fd, TCSADRAIN, &old_termios);
                         if (r < 0)
                                 return r;
                         if (r == 0)
@@ -119,8 +122,13 @@ int read_one_char(FILE *f, char *ret, usec_t t, bool *need_nl) {
                 }
         }
 
-        if (t != USEC_INFINITY) {
-                if (fd_wait_for_event(fileno(f), POLLIN, t) <= 0)
+        if (t != USEC_INFINITY && fd > 0) {
+                /* Let's wait the specified amount of time for input. When we have no fd we skip this, under
+                 * the assumption that this is an fmemopen() stream or so where waiting doesn't make sense
+                 * anyway, as the data is either already in the stream or cannot possible be placed there
+                 * while we access the stream */
+
+                if (fd_wait_for_event(fd, POLLIN, t) <= 0)
                         return -ETIMEDOUT;
         }
 
@@ -156,8 +164,7 @@ int ask_char(char *ret, const char *replies, const char *fmt, ...) {
                 char c;
                 bool need_nl = true;
 
-                if (colors_enabled())
-                        fputs(ANSI_HIGHLIGHT, stdout);
+                fputs(ansi_highlight(), stdout);
 
                 putchar('\r');
 
@@ -165,8 +172,7 @@ int ask_char(char *ret, const char *replies, const char *fmt, ...) {
                 vprintf(fmt, ap);
                 va_end(ap);
 
-                if (colors_enabled())
-                        fputs(ANSI_NORMAL, stdout);
+                fputs(ansi_normal(), stdout);
 
                 fflush(stdout);
 
@@ -205,15 +211,13 @@ int ask_string(char **ret, const char *text, ...) {
         assert(ret);
         assert(text);
 
-        if (colors_enabled())
-                fputs(ANSI_HIGHLIGHT, stdout);
+        fputs(ansi_highlight(), stdout);
 
         va_start(ap, text);
         vprintf(text, ap);
         va_end(ap);
 
-        if (colors_enabled())
-                fputs(ANSI_NORMAL, stdout);
+        fputs(ansi_normal(), stdout);
 
         fflush(stdout);
 
@@ -778,6 +782,9 @@ const char *default_term_for_tty(const char *tty) {
 int fd_columns(int fd) {
         struct winsize ws = {};
 
+        if (fd < 0)
+                return -EBADF;
+
         if (ioctl(fd, TIOCGWINSZ, &ws) < 0)
                 return -errno;
 
@@ -811,6 +818,9 @@ unsigned columns(void) {
 
 int fd_lines(int fd) {
         struct winsize ws = {};
+
+        if (fd < 0)
+                return -EBADF;
 
         if (ioctl(fd, TIOCGWINSZ, &ws) < 0)
                 return -errno;
@@ -853,7 +863,7 @@ void reset_terminal_feature_caches(void) {
         cached_columns = 0;
         cached_lines = 0;
 
-        cached_colors_enabled = -1;
+        cached_color_mode = _COLOR_INVALID;
         cached_underline_enabled = -1;
         cached_on_tty = -1;
 }
@@ -1192,38 +1202,62 @@ bool terminal_is_dumb(void) {
         return getenv_terminal_is_dumb();
 }
 
-bool colors_enabled(void) {
+static ColorMode parse_systemd_colors(void) {
+        const char *e;
+        int r;
 
-        /* Returns true if colors are considered supported on our stdout. For that we check $SYSTEMD_COLORS first
-         * (which is the explicit way to turn colors on/off). If that didn't work we turn colors off unless we are on a
-         * TTY. And if we are on a TTY we turn it off if $TERM is set to "dumb". There's one special tweak though: if
-         * we are PID 1 then we do not check whether we are connected to a TTY, because we don't keep /dev/console open
-         * continuously due to fear of SAK, and hence things are a bit weird. */
+        e = getenv("SYSTEMD_COLORS");
+        if (!e)
+                return _COLOR_INVALID;
+        if (streq(e, "16"))
+                return COLOR_16;
+        if (streq(e, "256"))
+                return COLOR_256;
+        r = parse_boolean(e);
+        if (r >= 0)
+                return r > 0 ? COLOR_ON : COLOR_OFF;
+        return _COLOR_INVALID;
+}
 
-        if (cached_colors_enabled < 0) {
-                int val;
+ColorMode get_color_mode(void) {
 
-                val = getenv_bool("SYSTEMD_COLORS");
-                if (val >= 0)
-                        cached_colors_enabled = val;
+        /* Returns the mode used to choose output colors. The possible modes are COLOR_OFF for no colors,
+         * COLOR_16 for only the base 16 ANSI colors, COLOR_256 for more colors and COLOR_ON for unrestricted
+         * color output. For that we check $SYSTEMD_COLORS first (which is the explicit way to
+         * change the mode). If that didn't work we turn colors off unless we are on a TTY. And if we are on a TTY
+         * we turn it off if $TERM is set to "dumb". There's one special tweak though: if we are PID 1 then we do not
+         * check whether we are connected to a TTY, because we don't keep /dev/console open continuously due to fear
+         * of SAK, and hence things are a bit weird. */
+        ColorMode m;
 
+        if (cached_color_mode < 0) {
+                m = parse_systemd_colors();
+                if (m >= 0)
+                        cached_color_mode = m;
                 else if (getenv("NO_COLOR"))
                         /* We only check for the presence of the variable; value is ignored. */
-                        cached_colors_enabled = false;
+                        cached_color_mode = COLOR_OFF;
 
                 else if (getpid_cached() == 1)
-                        /* PID1 outputs to the console without holding it open all the time */
-                        cached_colors_enabled = !getenv_terminal_is_dumb();
+                        /* PID1 outputs to the console without holding it open all the time.
+                         *
+                         * Note that the Linux console can only display 16 colors. We still enable 256 color
+                         * mode even for PID1 output though (which typically goes to the Linux console),
+                         * since the Linux console is able to parse the 256 color sequences and automatically
+                         * map them to the closest color in the 16 color palette (since kernel 3.16). Doing
+                         * 256 colors is nice for people who invoke systemd in a container or via a serial
+                         * link or such, and use a true 256 color terminal to do so. */
+                        cached_color_mode = getenv_terminal_is_dumb() ? COLOR_OFF : COLOR_256;
                 else
-                        cached_colors_enabled = !terminal_is_dumb();
+                        cached_color_mode = terminal_is_dumb() ? COLOR_OFF : COLOR_256;
         }
 
-        return cached_colors_enabled;
+        return cached_color_mode;
 }
 
 bool dev_console_colors_enabled(void) {
         _cleanup_free_ char *s = NULL;
-        int b;
+        ColorMode m;
 
         /* Returns true if we assume that color is supported on /dev/console.
          *
@@ -1232,9 +1266,9 @@ bool dev_console_colors_enabled(void) {
          * line. If we find $TERM set we assume color if it's not set to "dumb", similarly to how regular
          * colors_enabled() operates. */
 
-        b = getenv_bool("SYSTEMD_COLORS");
-        if (b >= 0)
-                return b;
+        m = parse_systemd_colors();
+        if (m >= 0)
+                return m;
 
         if (getenv("NO_COLOR"))
                 return false;
@@ -1335,11 +1369,11 @@ int vt_release(int fd, bool restore) {
 
 void get_log_colors(int priority, const char **on, const char **off, const char **highlight) {
         /* Note that this will initialize output variables only when there's something to output.
-         * The caller must pre-initalize to "" or NULL as appropriate. */
+         * The caller must pre-initialize to "" or NULL as appropriate. */
 
         if (priority <= LOG_ERR) {
                 if (on)
-                        *on = ANSI_HIGHLIGHT_RED;
+                        *on = ansi_highlight_red();
                 if (off)
                         *off = ANSI_NORMAL;
                 if (highlight)
@@ -1347,7 +1381,7 @@ void get_log_colors(int priority, const char **on, const char **off, const char 
 
         } else if (priority <= LOG_WARNING) {
                 if (on)
-                        *on = ANSI_HIGHLIGHT_YELLOW;
+                        *on = ansi_highlight_yellow();
                 if (off)
                         *off = ANSI_NORMAL;
                 if (highlight)
@@ -1359,14 +1393,14 @@ void get_log_colors(int priority, const char **on, const char **off, const char 
                 if (off)
                         *off = ANSI_NORMAL;
                 if (highlight)
-                        *highlight = ANSI_HIGHLIGHT_RED;
+                        *highlight = ansi_highlight_red();
 
         } else if (priority >= LOG_DEBUG) {
                 if (on)
-                        *on = ANSI_GREY;
+                        *on = ansi_grey();
                 if (off)
                         *off = ANSI_NORMAL;
                 if (highlight)
-                        *highlight = ANSI_HIGHLIGHT_RED;
+                        *highlight = ansi_highlight_red();
         }
 }

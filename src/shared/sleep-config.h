@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 #include <linux/fiemap.h>
@@ -20,7 +20,7 @@ typedef struct SleepConfig {
         usec_t hibernate_delay_sec; /* HibernateDelaySec */
 } SleepConfig;
 
-void free_sleep_config(SleepConfig *sc);
+SleepConfig* free_sleep_config(SleepConfig *sc);
 DEFINE_TRIVIAL_CLEANUP_FUNC(SleepConfig*, free_sleep_config);
 
 /* entry in /proc/swaps */

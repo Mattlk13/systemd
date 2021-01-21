@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #if defined(__i386__) || defined(__x86_64__)
 #include <cpuid.h>
@@ -92,6 +92,11 @@ static int detect_vm_device_tree(void) {
         if (r == -ENOENT) {
                 _cleanup_closedir_ DIR *dir = NULL;
                 struct dirent *dent;
+
+                if (access("/proc/device-tree/ibm,partition-name", F_OK) == 0 &&
+                    access("/proc/device-tree/hmc-managed?", F_OK) == 0 &&
+                    access("/proc/device-tree/chosen/qemu,graphic-width", F_OK) != 0)
+                        return VIRTUALIZATION_POWERVM;
 
                 dir = opendir("/proc/device-tree");
                 if (!dir) {
@@ -340,7 +345,7 @@ int detect_vm(void) {
         /* We have to use the correct order here:
          *
          * → First, try to detect Oracle Virtualbox, even if it uses KVM, as well as Xen even if it cloaks as Microsoft
-         *   Hyper-V.
+         *   Hyper-V. Attempt to detect uml at this stage also since it runs as a user-process nested inside other VMs.
          *
          * → Second, try to detect from CPUID, this will report KVM for whatever software is used even if info in DMI is
          *   overwritten.
@@ -353,6 +358,16 @@ int detect_vm(void) {
                 goto finish;
         }
 
+        /* Detect UML */
+        r = detect_vm_uml();
+        if (r < 0)
+                return r;
+        if (r == VIRTUALIZATION_VM_OTHER)
+                other = true;
+        else if (r != VIRTUALIZATION_NONE)
+                goto finish;
+
+        /* Detect from CPUID */
         r = detect_vm_cpuid();
         if (r < 0)
                 return r;
@@ -401,14 +416,6 @@ int detect_vm(void) {
         else if (r != VIRTUALIZATION_NONE)
                 goto finish;
 
-        r = detect_vm_uml();
-        if (r < 0)
-                return r;
-        if (r == VIRTUALIZATION_VM_OTHER)
-                other = true;
-        else if (r != VIRTUALIZATION_NONE)
-                goto finish;
-
         r = detect_vm_zvm();
         if (r < 0)
                 return r;
@@ -441,14 +448,15 @@ static const char *const container_table[_VIRTUALIZATION_MAX] = {
         [VIRTUALIZATION_PODMAN]         = "podman",
         [VIRTUALIZATION_RKT]            = "rkt",
         [VIRTUALIZATION_WSL]            = "wsl",
+        [VIRTUALIZATION_PROOT]          = "proot",
+        [VIRTUALIZATION_POUCH]          = "pouch",
 };
 
 DEFINE_PRIVATE_STRING_TABLE_LOOKUP_FROM_STRING(container, int);
 
 int detect_container(void) {
         static thread_local int cached_found = _VIRTUALIZATION_INVALID;
-        _cleanup_free_ char *m = NULL;
-        _cleanup_free_ char *o = NULL;
+        _cleanup_free_ char *m = NULL, *o = NULL, *p = NULL;
         const char *e = NULL;
         int r;
 
@@ -456,20 +464,63 @@ int detect_container(void) {
                 return cached_found;
 
         /* /proc/vz exists in container and outside of the container, /proc/bc only outside of the container. */
-        if (access("/proc/vz", F_OK) >= 0 &&
-            access("/proc/bc", F_OK) < 0) {
-                r = VIRTUALIZATION_OPENVZ;
-                goto finish;
+        if (access("/proc/vz", F_OK) < 0) {
+                if (errno != ENOENT)
+                        log_debug_errno(errno, "Failed to check if /proc/vz exists, ignoring: %m");
+        } else if (access("/proc/bc", F_OK) < 0) {
+                if (errno == ENOENT) {
+                        r = VIRTUALIZATION_OPENVZ;
+                        goto finish;
+                }
+
+                log_debug_errno(errno, "Failed to check if /proc/bc exists, ignoring: %m");
         }
 
         /* "Official" way of detecting WSL https://github.com/Microsoft/WSL/issues/423#issuecomment-221627364 */
         r = read_one_line_file("/proc/sys/kernel/osrelease", &o);
-        if (r >= 0) {
-                if (strstr(o, "Microsoft") || strstr(o, "WSL")) {
-                        r = VIRTUALIZATION_WSL;
-                        goto finish;
+        if (r < 0)
+                log_debug_errno(r, "Failed to read /proc/sys/kernel/osrelease, ignoring: %m");
+        else if (strstr(o, "Microsoft") || strstr(o, "WSL")) {
+                r = VIRTUALIZATION_WSL;
+                goto finish;
+        }
+
+        /* proot doesn't use PID namespacing, so we can just check if we have a matching tracer for this
+         * invocation without worrying about it being elsewhere.
+         */
+        r = get_proc_field("/proc/self/status", "TracerPid", WHITESPACE, &p);
+        if (r < 0)
+                log_debug_errno(r, "Failed to read our own trace PID, ignoring: %m");
+        else if (!streq(p, "0")) {
+                pid_t ptrace_pid;
+
+                r = parse_pid(p, &ptrace_pid);
+                if (r < 0)
+                        log_debug_errno(r, "Failed to parse our own tracer PID, ignoring: %m");
+                else {
+                        _cleanup_free_ char *ptrace_comm = NULL;
+                        const char *pf;
+
+                        pf = procfs_file_alloca(ptrace_pid, "comm");
+                        r = read_one_line_file(pf, &ptrace_comm);
+                        if (r < 0)
+                                log_debug_errno(r, "Failed to read %s, ignoring: %m", pf);
+                        else if (startswith(ptrace_comm, "proot")) {
+                                r = VIRTUALIZATION_PROOT;
+                                goto finish;
+                        }
                 }
         }
+
+        /* The container manager might have placed this in the /run/host/ hierarchy for us, which is best
+         * because we can be consumed just like that, without special privileges. */
+        r = read_one_line_file("/run/host/container-manager", &m);
+        if (r > 0) {
+                e = m;
+                goto translate_name;
+        }
+        if (!IN_SET(r, -ENOENT, 0))
+                return log_debug_errno(r, "Failed to read /run/host/container-manager: %m");
 
         if (getpid_cached() == 1) {
                 /* If we are PID 1 we can just check our own environment variable, and that's authoritative.
@@ -480,7 +531,7 @@ int detect_container(void) {
                  */
                 e = getenv("container");
                 if (!e)
-                        goto check_sched;
+                        goto none;
                 if (isempty(e)) {
                         r = VIRTUALIZATION_NONE;
                         goto finish;
@@ -508,24 +559,7 @@ int detect_container(void) {
         if (r < 0) /* This only works if we have CAP_SYS_PTRACE, hence let's better ignore failures here */
                 log_debug_errno(r, "Failed to read $container of PID 1, ignoring: %m");
 
-        /* Interestingly /proc/1/sched actually shows the host's PID for what we see as PID 1. If the PID
-         * shown there is not 1, we know we are in a PID namespace and hence a container. */
- check_sched:
-        r = read_one_line_file("/proc/1/sched", &m);
-        if (r >= 0) {
-                const char *t;
-
-                t = strrchr(m, '(');
-                if (!t)
-                        return -EIO;
-
-                if (!startswith(t, "(1,")) {
-                        r = VIRTUALIZATION_CONTAINER_OTHER;
-                        goto finish;
-                }
-        } else if (r != -ENOENT)
-                return r;
-
+none:
         /* If that didn't work, give up, assume no container manager. */
         r = VIRTUALIZATION_NONE;
         goto finish;
@@ -649,6 +683,7 @@ static const char *const virtualization_table[_VIRTUALIZATION_MAX] = {
         [VIRTUALIZATION_BHYVE] = "bhyve",
         [VIRTUALIZATION_QNX] = "qnx",
         [VIRTUALIZATION_ACRN] = "acrn",
+        [VIRTUALIZATION_POWERVM] = "powervm",
         [VIRTUALIZATION_VM_OTHER] = "vm-other",
 
         [VIRTUALIZATION_SYSTEMD_NSPAWN] = "systemd-nspawn",
@@ -659,6 +694,8 @@ static const char *const virtualization_table[_VIRTUALIZATION_MAX] = {
         [VIRTUALIZATION_PODMAN] = "podman",
         [VIRTUALIZATION_RKT] = "rkt",
         [VIRTUALIZATION_WSL] = "wsl",
+        [VIRTUALIZATION_PROOT] = "proot",
+        [VIRTUALIZATION_POUCH] = "pouch",
         [VIRTUALIZATION_CONTAINER_OTHER] = "container-other",
 };
 

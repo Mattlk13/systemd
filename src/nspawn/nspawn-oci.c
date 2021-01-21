@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <linux/oom.h>
 #if HAVE_SECCOMP
@@ -51,13 +51,13 @@
  * cgrouspv1 crap: kernel, kernelTCP, swapiness, disableOOMKiller, swap, devices, leafWeight
  * general: it shouldn't leak lower level abstractions this obviously
  * unmanagable cgroups stuff: realtimeRuntime/realtimePeriod
- * needs to say what happense when some option is not specified, i.e. which defautls apply
+ * needs to say what happense when some option is not specified, i.e. which defaults apply
  * no architecture? no personality?
  * seccomp example and logic is simply broken: there's no constant "SCMP_ACT_ERRNO".
  * spec should say what to do with unknown props
  * /bin/mount regarding NFS and FUSE required?
  * what does terminal=false mean?
- * sysctl inside or outside? whitelisting?
+ * sysctl inside or outside? allow-listing?
  * swapiness typo -> swappiness
  *
  * Unsupported:
@@ -444,6 +444,8 @@ static int oci_process(const char *name, JsonVariant *v, JsonDispatchFlags flags
 }
 
 static int oci_root(const char *name, JsonVariant *v, JsonDispatchFlags flags, void *userdata) {
+        Settings *s = userdata;
+        int r;
 
         static const JsonDispatch table[] = {
                 { "path",     JSON_VARIANT_STRING,  json_dispatch_string,  offsetof(Settings, root)      },
@@ -451,7 +453,21 @@ static int oci_root(const char *name, JsonVariant *v, JsonDispatchFlags flags, v
                 {}
         };
 
-        return json_dispatch(v, table, oci_unexpected, flags, userdata);
+        r = json_dispatch(v, table, oci_unexpected, flags, s);
+        if (r < 0)
+                return r;
+
+        if (s->root && !path_is_absolute(s->root)) {
+                char *joined;
+
+                joined = path_join(s->bundle, s->root);
+                if (!joined)
+                        return log_oom();
+
+                free_and_replace(s->root, joined);
+        }
+
+        return 0;
 }
 
 static int oci_hostname(const char *name, JsonVariant *v, JsonDispatchFlags flags, void *userdata) {
@@ -462,7 +478,7 @@ static int oci_hostname(const char *name, JsonVariant *v, JsonDispatchFlags flag
 
         assert_se(n = json_variant_string(v));
 
-        if (!hostname_is_valid(n, false))
+        if (!hostname_is_valid(n, 0))
                 return json_log(v, flags, SYNTHETIC_ERRNO(EINVAL),
                                 "Hostname string is not a valid hostname: %s", n);
 
@@ -660,10 +676,9 @@ static int oci_namespaces(const char *name, JsonVariant *v, JsonDispatchFlags fl
                         s->network_namespace_path = data.path;
                 }
 
-                if (FLAGS_SET(n, data.type)) {
+                if (FLAGS_SET(n, data.type))
                         return json_log(e, flags, SYNTHETIC_ERRNO(EINVAL),
                                         "Duplicate namespace specification, refusing.");
-                }
 
                 n |= data.type;
         }
@@ -1029,39 +1044,40 @@ static int oci_cgroup_devices(const char *name, JsonVariant *v, JsonDispatchFlag
                         return r;
 
                 if (!data.allow) {
-                        /* The fact that OCI allows 'deny' entries makes really no sense, as 'allow' vs. 'deny' for the
-                         * devices cgroup controller is really not about whitelisting and blacklisting but about adding
-                         * and removing entries from the whitelist. Since we always start out with an empty whitelist
-                         * we hence ignore the whole thing, as removing entries which don't exist make no sense. We'll
-                         * log about this, since this is really borked in the spec, with one exception: the entry
-                         * that's supposed to drop the kernel's default we ignore silently */
+                        /* The fact that OCI allows 'deny' entries makes really no sense, as 'allow'
+                         * vs. 'deny' for the devices cgroup controller is really not about allow-listing and
+                         * deny-listing but about adding and removing entries from the allow list. Since we
+                         * always start out with an empty allow list we hence ignore the whole thing, as
+                         * removing entries which don't exist make no sense. We'll log about this, since this
+                         * is really borked in the spec, with one exception: the entry that's supposed to
+                         * drop the kernel's default we ignore silently */
 
                         if (!data.r || !data.w || !data.m || data.type != 0 || data.major != (unsigned) -1 || data.minor != (unsigned) -1)
-                                json_log(v, flags|JSON_WARNING, 0, "Devices cgroup whitelist with arbitrary 'allow' entries not supported, ignoring.");
+                                json_log(v, flags|JSON_WARNING, 0, "Devices cgroup allow list with arbitrary 'allow' entries not supported, ignoring.");
 
                         /* We ignore the 'deny' entry as for us that's implied */
                         continue;
                 }
 
                 if (!data.r && !data.w && !data.m) {
-                        json_log(v, flags|LOG_WARNING, 0, "Device cgroup whitelist entry with no effect found, ignoring.");
+                        json_log(v, flags|LOG_WARNING, 0, "Device cgroup allow list entry with no effect found, ignoring.");
                         continue;
                 }
 
                 if (data.minor != (unsigned) -1 && data.major == (unsigned) -1)
                         return json_log(v, flags, SYNTHETIC_ERRNO(EOPNOTSUPP),
-                                        "Device cgroup whitelist entries with minors but no majors not supported.");
+                                        "Device cgroup allow list entries with minors but no majors not supported.");
 
                 if (data.major != (unsigned) -1 && data.type == 0)
                         return json_log(v, flags, SYNTHETIC_ERRNO(EOPNOTSUPP),
-                                        "Device cgroup whitelist entries with majors but no device node type not supported.");
+                                        "Device cgroup allow list entries with majors but no device node type not supported.");
 
                 if (data.type == 0) {
-                        if (data.r && data.w && data.m) /* a catchall whitelist entry means we are looking at a noop */
+                        if (data.r && data.w && data.m) /* a catchall allow list entry means we are looking at a noop */
                                 noop = true;
                         else
                                 return json_log(v, flags, SYNTHETIC_ERRNO(EOPNOTSUPP),
-                                                "Device cgroup whitelist entries with no type not supported.");
+                                                "Device cgroup allow list entries with no type not supported.");
                 }
 
                 a = reallocarray(list, n_list + 1, sizeof(struct device_data));
@@ -1694,6 +1710,9 @@ static int oci_seccomp_arch_from_string(const char *name, uint32_t *ret) {
                 { "SCMP_ARCH_PPC",         SCMP_ARCH_PPC         },
                 { "SCMP_ARCH_PPC64",       SCMP_ARCH_PPC64       },
                 { "SCMP_ARCH_PPC64LE",     SCMP_ARCH_PPC64LE     },
+#ifdef SCMP_ARCH_RISCV64
+                { "SCMP_ARCH_RISCV64",     SCMP_ARCH_RISCV64     },
+#endif
                 { "SCMP_ARCH_S390",        SCMP_ARCH_S390        },
                 { "SCMP_ARCH_S390X",       SCMP_ARCH_S390X       },
                 { "SCMP_ARCH_X32",         SCMP_ARCH_X32         },
@@ -2212,14 +2231,14 @@ int oci_load(FILE *f, const char *bundle, Settings **ret) {
         }
 
         v = json_variant_by_key(oci, "ociVersion");
-        if (!v) {
-                log_error("JSON file '%s' is not an OCI bundle configuration file. Refusing.", path);
-                return -EINVAL;
-        }
-        if (!streq_ptr(json_variant_string(v), "1.0.0")) {
-                log_error("OCI bundle version not supported: %s", strna(json_variant_string(v)));
-                return -EINVAL;
-        }
+        if (!v)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "JSON file '%s' is not an OCI bundle configuration file. Refusing.",
+                                       path);
+        if (!streq_ptr(json_variant_string(v), "1.0.0"))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "OCI bundle version not supported: %s",
+                                       strna(json_variant_string(v)));
 
         // {
         //         _cleanup_free_ char *formatted = NULL;

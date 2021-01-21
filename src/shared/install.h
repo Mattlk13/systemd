@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 typedef enum UnitFilePresetMode UnitFilePresetMode;
@@ -35,9 +35,11 @@ enum UnitFileChangeType {
 };
 
 enum UnitFileFlags {
-        UNIT_FILE_RUNTIME = 1 << 0,
-        UNIT_FILE_FORCE   = 1 << 1,
-        UNIT_FILE_DRY_RUN = 1 << 2,
+        UNIT_FILE_RUNTIME  = 1 << 0, /* Public API via DBUS, do not change */
+        UNIT_FILE_FORCE    = 1 << 1, /* Public API via DBUS, do not change */
+        UNIT_FILE_PORTABLE = 1 << 2, /* Public API via DBUS, do not change */
+        UNIT_FILE_DRY_RUN  = 1 << 3,
+        _UNIT_FILE_FLAGS_MASK_PUBLIC = UNIT_FILE_RUNTIME|UNIT_FILE_PORTABLE|UNIT_FILE_FORCE,
 };
 
 /* type can either one of the UnitFileChangeTypes listed above, or a negative error.
@@ -183,13 +185,22 @@ int unit_file_exists(UnitFileScope scope, const LookupPaths *paths, const char *
 int unit_file_get_list(UnitFileScope scope, const char *root_dir, Hashmap *h, char **states, char **patterns);
 Hashmap* unit_file_list_free(Hashmap *h);
 
-int unit_file_changes_add(UnitFileChange **changes, size_t *n_changes, UnitFileChangeType type, const char *path, const char *source);
+int unit_file_changes_add(UnitFileChange **changes, size_t *n_changes, int type, const char *path, const char *source);
 void unit_file_changes_free(UnitFileChange *changes, size_t n_changes);
 void unit_file_dump_changes(int r, const char *verb, const UnitFileChange *changes, size_t n_changes, bool quiet);
 
 int unit_file_verify_alias(const UnitFileInstallInfo *i, const char *dst, char **ret_dst);
 
-int unit_file_query_preset(UnitFileScope scope, const char *root_dir, const char *name);
+typedef struct UnitFilePresetRule UnitFilePresetRule;
+
+typedef struct {
+        UnitFilePresetRule *rules;
+        size_t n_rules;
+        bool initialized;
+} UnitFilePresets;
+
+void unit_file_presets_freep(UnitFilePresets *p);
+int unit_file_query_preset(UnitFileScope scope, const char *root_dir, const char *name, UnitFilePresets *cached);
 
 const char *unit_file_state_to_string(UnitFileState s) _const_;
 UnitFileState unit_file_state_from_string(const char *s) _pure_;

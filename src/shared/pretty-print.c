@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <sys/utsname.h>
 #include <errno.h>
@@ -18,12 +18,8 @@
 #include "terminal-util.h"
 #include "util.h"
 
-static bool urlify_enabled(void) {
+bool urlify_enabled(void) {
         static int cached_urlify_enabled = -1;
-
-        /* Unfortunately 'less' doesn't support links like this yet 😭, hence let's disable this as long as there's a
-         * pager in effect. Let's drop this check as soon as less got fixed a and enough time passed so that it's safe
-         * to assume that a link-enabled 'less' version has hit most installations. */
 
         if (cached_urlify_enabled < 0) {
                 int val;
@@ -32,7 +28,7 @@ static bool urlify_enabled(void) {
                 if (val >= 0)
                         cached_urlify_enabled = val;
                 else
-                        cached_urlify_enabled = colors_enabled() && !pager_have();
+                        cached_urlify_enabled = colors_enabled();
         }
 
         return cached_urlify_enabled;
@@ -174,7 +170,7 @@ int cat_files(const char *file, char **dropins, CatFlags flags) {
         if (file) {
                 r = cat_file(file, false);
                 if (r == -ENOENT && (flags & CAT_FLAGS_MAIN_FILE_OPTIONAL))
-                        printf("%s# config file %s not found%s\n",
+                        printf("%s# Configuration file %s not found%s\n",
                                ansi_highlight_magenta(),
                                file,
                                ansi_normal());
@@ -233,6 +229,12 @@ static int guess_type(const char **name, char ***prefixes, bool *is_collection, 
         n = strdup(*name);
         if (!n)
                 return log_oom();
+
+        /* All systemd-style config files should support the /usr-/etc-/run split and
+         * dropins. Let's add a blanket rule that allows us to support them without keeping
+         * an explicit list. */
+        if (path_startswith(n, "systemd") && endswith(n, ".conf"))
+                usr = true;
 
         delete_trailing_chars(n, "/");
 

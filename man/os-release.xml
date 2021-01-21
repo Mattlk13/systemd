@@ -1,7 +1,7 @@
 <?xml version='1.0'?> <!--*-nxml-*-->
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
   "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
-<!-- SPDX-License-Identifier: LGPL-2.1+ -->
+<!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="os-release">
   <refentryinfo>
@@ -59,7 +59,7 @@
     <filename>/etc/os-release</filename> should be a relative symlink
     to <filename>/usr/lib/os-release</filename>, to provide
     compatibility with applications only looking at
-    <filename>/etc</filename>. A relative symlink instead of an
+    <filename>/etc/</filename>. A relative symlink instead of an
     absolute symlink is necessary to avoid breaking the link in a
     chroot or initrd environment such as dracut.</para>
 
@@ -192,13 +192,11 @@
       <varlistentry>
         <term><varname>ANSI_COLOR=</varname></term>
 
-        <listitem><para>A suggested presentation color when showing
-        the OS name on the console. This should be specified as string
-        suitable for inclusion in the ESC [ m ANSI/ECMA-48 escape code
-        for setting graphical rendition. This field is optional.
-        Example: <literal>ANSI_COLOR="0;31"</literal> for red, or
-        <literal>ANSI_COLOR="1;34"</literal> for light
-        blue.</para></listitem>
+        <listitem><para>A suggested presentation color when showing the OS name on the console. This should
+        be specified as string suitable for inclusion in the ESC [ m ANSI/ECMA-48 escape code for setting
+        graphical rendition. This field is optional.  Example: <literal>ANSI_COLOR="0;31"</literal> for red,
+        <literal>ANSI_COLOR="1;34"</literal> for light blue, or
+        <literal>ANSI_COLOR="0;38;2;60;110;180"</literal> for Fedora blue.</para></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -220,7 +218,7 @@
         <term><varname>BUG_REPORT_URL=</varname></term>
         <term><varname>PRIVACY_POLICY_URL=</varname></term>
 
-        <listitem><para>Links to resources on the Internet related to 
+        <listitem><para>Links to resources on the Internet related to
         the operating system.
         <varname>HOME_URL=</varname> should refer to the homepage of
         the operating system, or alternatively some homepage of the
@@ -319,6 +317,17 @@
         </para></listitem>
       </varlistentry>
 
+      <varlistentry>
+        <term><varname>SYSEXT_LEVEL=</varname></term>
+
+        <listitem><para>A lower-case string (mostly numeric, no spaces or other characters outside of 0–9,
+        a–z, ".", "_" and "-") identifying the operating system extensions support level, to indicate which
+        extension images are supported (See:
+        <citerefentry><refentrytitle>systemd-sysext</refentrytitle><manvolnum>8</manvolnum></citerefentry>).
+        Example: <literal>SYSEXT_LEVEL=2</literal> or
+        <literal>SYSEXT_LEVEL=15.14</literal>.</para></listitem>
+      </varlistentry>
+
     </variablelist>
 
     <para>If you are reading this file from C code or a shell script
@@ -341,20 +350,36 @@
     name in order to avoid name clashes. Applications
     reading this file must ignore unknown fields. Example:
     <literal>DEBIAN_BTS="debbugs://bugs.debian.org/"</literal></para>
+
+    <para>Container and sandbox runtime managers may make the host's
+    identification data available to applications by providing the host's
+    <filename>/etc/os-release</filename> (if available, otherwise
+    <filename>/usr/lib/os-release</filename> as a fallback) as
+    <filename>/run/host/os-release</filename>.</para>
   </refsect1>
 
   <refsect1>
     <title>Example</title>
 
     <programlisting>NAME=Fedora
-VERSION="17 (Beefy Miracle)"
+VERSION="32 (Workstation Edition)"
 ID=fedora
-VERSION_ID=17
-PRETTY_NAME="Fedora 17 (Beefy Miracle)"
-ANSI_COLOR="0;34"
-CPE_NAME="cpe:/o:fedoraproject:fedora:17"
+VERSION_ID=32
+PRETTY_NAME="Fedora 32 (Workstation Edition)"
+ANSI_COLOR="0;38;2;60;110;180"
+LOGO=fedora-logo-icon
+CPE_NAME="cpe:/o:fedoraproject:fedora:32"
 HOME_URL="https://fedoraproject.org/"
-BUG_REPORT_URL="https://bugzilla.redhat.com/"</programlisting>
+DOCUMENTATION_URL="https://docs.fedoraproject.org/en-US/fedora/f32/system-administrators-guide/"
+SUPPORT_URL="https://fedoraproject.org/wiki/Communicating_and_getting_help"
+BUG_REPORT_URL="https://bugzilla.redhat.com/"
+REDHAT_BUGZILLA_PRODUCT="Fedora"
+REDHAT_BUGZILLA_PRODUCT_VERSION=32
+REDHAT_SUPPORT_PRODUCT="Fedora"
+REDHAT_SUPPORT_PRODUCT_VERSION=32
+PRIVACY_POLICY_URL="https://fedoraproject.org/wiki/Legal:PrivacyPolicy"
+VARIANT="Workstation Edition"
+VARIANT_ID=workstation</programlisting>
   </refsect1>
 
   <refsect1>

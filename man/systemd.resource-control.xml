@@ -1,7 +1,7 @@
 <?xml version='1.0'?>
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
   "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
-<!-- SPDX-License-Identifier: LGPL-2.1+ -->
+<!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="systemd.resource-control" xmlns:xi="http://www.w3.org/2001/XInclude">
   <refentryinfo>
@@ -261,53 +261,42 @@
       </varlistentry>
 
       <varlistentry>
-        <term><varname>MemoryMin=<replaceable>bytes</replaceable></varname></term>
+        <term><varname>MemoryMin=<replaceable>bytes</replaceable></varname>, <varname>MemoryLow=<replaceable>bytes</replaceable></varname></term>
 
         <listitem>
-          <para>Specify the memory usage protection of the executed processes in this unit. If the memory usages of
-          this unit and all its ancestors are below their minimum boundaries, this unit's memory won't be reclaimed.</para>
+          <para>Specify the memory usage protection of the executed processes in this unit.
+          When reclaiming memory, the unit is treated as if it was using less memory resulting in memory
+          to be preferentially reclaimed from unprotected units.
+          Using <varname>MemoryLow=</varname> results in a weaker protection where memory may still
+          be reclaimed to avoid invoking the OOM killer in case there is no other reclaimable memory.</para>
+          <para>
+          For a protection to be effective, it is generally required to set a corresponding
+          allocation on all ancestors, which is then distributed between children
+          (with the exception of the root slice).
+          Any <varname>MemoryMin=</varname> or <varname>MemoryLow=</varname> allocation that is not
+          explicitly distributed to specific children is used to create a shared protection for all children.
+          As this is a shared protection, the children will freely compete for the memory.</para>
 
           <para>Takes a memory size in bytes. If the value is suffixed with K, M, G or T, the specified memory size is
           parsed as Kilobytes, Megabytes, Gigabytes, or Terabytes (with the base 1024), respectively. Alternatively, a
           percentage value may be specified, which is taken relative to the installed physical memory on the
           system. If assigned the special value <literal>infinity</literal>, all available memory is protected, which may be
           useful in order to always inherit all of the protection afforded by ancestors.
-          This controls the <literal>memory.min</literal> control group attribute. For details about this
-          control group attribute, see <ulink
+          This controls the <literal>memory.min</literal> or <literal>memory.low</literal> control group attribute.
+          For details about this control group attribute, see <ulink
           url="https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html#memory-interface-files">Memory Interface Files</ulink>.</para>
 
           <para>This setting is supported only if the unified control group hierarchy is used and disables
           <varname>MemoryLimit=</varname>.</para>
 
-          <para>Units may have their children use a default <literal>memory.min</literal> value by specifying
-          <varname>DefaultMemoryMin=</varname>, which has the same semantics as <varname>MemoryMin=</varname>. This setting
-          does not affect <literal>memory.min</literal> in the unit itself.</para>
-        </listitem>
-      </varlistentry>
-
-      <varlistentry>
-        <term><varname>MemoryLow=<replaceable>bytes</replaceable></varname></term>
-
-        <listitem>
-          <para>Specify the best-effort memory usage protection of the executed processes in this unit. If the memory
-          usages of this unit and all its ancestors are below their low boundaries, this unit's memory won't be
-          reclaimed as long as memory can be reclaimed from unprotected units.</para>
-
-          <para>Takes a memory size in bytes. If the value is suffixed with K, M, G or T, the specified memory size is
-          parsed as Kilobytes, Megabytes, Gigabytes, or Terabytes (with the base 1024), respectively. Alternatively, a
-          percentage value may be specified, which is taken relative to the installed physical memory on the
-          system. If assigned the special value <literal>infinity</literal>, all available memory is protected, which may be
-          useful in order to always inherit all of the protection afforded by ancestors.
-          This controls the <literal>memory.low</literal> control group attribute. For details about this
-          control group attribute, see <ulink
-          url="https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html#memory-interface-files">Memory Interface Files</ulink>.</para>
-
-          <para>This setting is supported only if the unified control group hierarchy is used and disables
-          <varname>MemoryLimit=</varname>.</para>
-
-          <para>Units may have their children use a default <literal>memory.low</literal> value by specifying
-          <varname>DefaultMemoryLow=</varname>, which has the same semantics as <varname>MemoryLow=</varname>. This setting
-          does not affect <literal>memory.low</literal> in the unit itself.</para>
+          <para>Units may have their children use a default <literal>memory.min</literal> or
+          <literal>memory.low</literal> value by specifying <varname>DefaultMemoryMin=</varname> or
+          <varname>DefaultMemoryLow=</varname>, which has the same semantics as
+          <varname>MemoryMin=</varname> and <varname>MemoryLow=</varname>.
+          This setting does not affect <literal>memory.min</literal> or <literal>memory.low</literal>
+          in the unit itself.
+          Using it to set a default child allocation is only useful on kernels older than 5.7,
+          which do not support the <literal>memory_recursiveprot</literal> cgroup2 mount option.</para>
         </listitem>
       </varlistentry>
 
@@ -571,45 +560,46 @@
         <term><varname>IPAddressDeny=<replaceable>ADDRESS[/PREFIXLENGTH]…</replaceable></varname></term>
 
         <listitem>
-          <para>Turn on address range network traffic filtering for IP packets sent and received over
-          <constant>AF_INET</constant> and <constant>AF_INET6</constant> sockets.  Both directives take a
+          <para>Turn on network traffic filtering for IP packets sent and received over
+          <constant>AF_INET</constant> and <constant>AF_INET6</constant> sockets. Both directives take a
           space separated list of IPv4 or IPv6 addresses, each optionally suffixed with an address prefix
-          length in bits (separated by a <literal>/</literal> character). If the latter is omitted, the
-          address is considered a host address, i.e. the prefix covers the whole address (32 for IPv4, 128
-          for IPv6).</para>
+          length in bits after a <literal>/</literal> character. If the suffix is omitted, the address is
+          considered a host address, i.e. the filter covers the whole address (32 bits for IPv4, 128 bits for
+          IPv6).</para>
 
           <para>The access lists configured with this option are applied to all sockets created by processes
           of this unit (or in the case of socket units, associated with it). The lists are implicitly
           combined with any lists configured for any of the parent slice units this unit might be a member
-          of. By default all access lists are empty. Both ingress and egress traffic is filtered by these
+          of. By default both access lists are empty. Both ingress and egress traffic is filtered by these
           settings. In case of ingress traffic the source IP address is checked against these access lists,
-          in case of egress traffic the destination IP address is checked. When configured the lists are
-          enforced as follows:</para>
+          in case of egress traffic the destination IP address is checked. The following rules are applied in
+          turn:</para>
 
           <itemizedlist>
-            <listitem><para>Access will be granted in case an IP packet's destination/source address matches
-            any entry in the <varname>IPAddressAllow=</varname> setting.</para></listitem>
+            <listitem><para>Access is granted when the checked IP address matches an entry in the
+            <varname>IPAddressAllow=</varname> list.</para></listitem>
 
-            <listitem><para>Otherwise, access will be denied in case its destination/source address matches
-            any entry in the <varname>IPAddressDeny=</varname> setting.</para></listitem>
+            <listitem><para>Otherwise, access is denied when the checked IP address matches an entry in the
+            <varname>IPAddressDeny=</varname> list.</para></listitem>
 
-            <listitem><para>Otherwise, access will be granted.</para></listitem>
+            <listitem><para>Otherwise, access is granted.</para></listitem>
           </itemizedlist>
 
-          <para>In order to implement a whitelisting IP firewall, it is recommended to use a
-          <varname>IPAddressDeny=</varname><constant>any</constant> setting on an upper-level slice unit (such as the
-          root slice <filename>-.slice</filename> or the slice containing all system services
+          <para>In order to implement an allow-listing IP firewall, it is recommended to use a
+          <varname>IPAddressDeny=</varname><constant>any</constant> setting on an upper-level slice unit
+          (such as the root slice <filename>-.slice</filename> or the slice containing all system services
           <filename>system.slice</filename> – see
-          <citerefentry><refentrytitle>systemd.special</refentrytitle><manvolnum>7</manvolnum></citerefentry> for
-          details on these slice units), plus individual per-service <varname>IPAddressAllow=</varname> lines
-          permitting network access to relevant services, and only them.</para>
+          <citerefentry><refentrytitle>systemd.special</refentrytitle><manvolnum>7</manvolnum></citerefentry>
+          for details on these slice units), plus individual per-service <varname>IPAddressAllow=</varname>
+          lines permitting network access to relevant services, and only them.</para>
 
-          <para>Note that for socket-activated services, the IP access list configured on the socket unit applies to
-          all sockets associated with it directly, but not to any sockets created by the ultimately activated services
-          for it. Conversely, the IP access list configured for the service is not applied to any sockets passed into
-          the service via socket activation. Thus, it is usually a good idea, to replicate the IP access lists on both
-          the socket and the service unit, however it often makes sense to maintain one list more open and the other
-          one more restricted, depending on the usecase.</para>
+          <para>Note that for socket-activated services, the IP access list configured on the socket unit
+          applies to all sockets associated with it directly, but not to any sockets created by the
+          ultimately activated services for it. Conversely, the IP access list configured for the service is
+          not applied to any sockets passed into the service via socket activation. Thus, it is usually a
+          good idea to replicate the IP access lists on both the socket and the service unit. Nevertheless,
+          it may make sense to maintain one list more open and the other one more restricted, depending on
+          the usecase.</para>
 
           <para>If these settings are used multiple times in the same unit the specified lists are combined. If an
           empty string is assigned to these settings the specific access list is reset and all previous settings undone.</para>
@@ -669,8 +659,8 @@
       </varlistentry>
 
       <varlistentry>
-        <term><varname>IPIngressFilterPath=<replaceable>BPF_FS_PROGRAMM_PATH</replaceable></varname></term>
-        <term><varname>IPEgressFilterPath=<replaceable>BPF_FS_PROGRAMM_PATH</replaceable></varname></term>
+        <term><varname>IPIngressFilterPath=<replaceable>BPF_FS_PROGRAM_PATH</replaceable></varname></term>
+        <term><varname>IPEgressFilterPath=<replaceable>BPF_FS_PROGRAM_PATH</replaceable></varname></term>
 
         <listitem>
           <para>Add custom network traffic filters implemented as BPF programs, applying to all IP packets
@@ -718,7 +708,7 @@
           <para>The device node specifier is either a path to a device node in the file system, starting with
           <filename>/dev/</filename>, or a string starting with either <literal>char-</literal> or
           <literal>block-</literal> followed by a device group name, as listed in
-          <filename>/proc/devices</filename>. The latter is useful to whitelist all current and future
+          <filename>/proc/devices</filename>. The latter is useful to allow-list all current and future
           devices belonging to a specific device group at once. The device group is matched according to
           filename globbing rules, you may hence use the <literal>*</literal> and <literal>?</literal>
           wildcards. (Note that such globbing wildcards are not available for device node path
@@ -732,9 +722,9 @@
           all pseudo TTYs and all ALSA sound devices, respectively. <literal>char-cpu/*</literal> is a
           specifier matching all CPU related device groups.</para>
 
-          <para>Note that whitelists defined this way should only reference device groups which are
+          <para>Note that allow lists defined this way should only reference device groups which are
           resolvable at the time the unit is started. Any device groups not resolvable then are not added to
-          the device whitelist. In order to work around this limitation, consider extending service units
+          the device allow list. In order to work around this limitation, consider extending service units
           with a pair of <command>After=modprobe@xyz.service</command> and
           <command>Wants=modprobe@xyz.service</command> lines that load the necessary kernel module
           implementing the device group if missing.
@@ -877,6 +867,49 @@ DeviceAllow=/dev/loop-control
           the disabled controller list.</para>
 
           <xi:include href="supported-controllers.xml"  xpointer="controllers-text" />
+        </listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>ManagedOOMSwap=auto|kill</varname></term>
+        <term><varname>ManagedOOMMemoryPressure=auto|kill</varname></term>
+
+        <listitem>
+          <para>Specifies how
+          <citerefentry><refentrytitle>systemd-oomd.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>
+          will act on this unit's cgroups. Defaults to <option>auto</option>.</para>
+
+          <para>When set to <option>kill</option>, <command>systemd-oomd</command> will actively monitor this unit's
+          cgroup metrics to decide whether it needs to act. If the cgroup passes the limits set by
+          <citerefentry><refentrytitle>oomd.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry> or its
+          overrides, <command>systemd-oomd</command> will send a <constant>SIGKILL</constant> to all of the processes
+          under the chosen candidate cgroup. Note that only descendant cgroups can be eligible candidates for killing;
+          the unit that set its property to <option>kill</option> is not a candidate (unless one of its ancestors set
+          their property to <option>kill</option>). You can find more details on candidates and kill behavior at
+          <citerefentry><refentrytitle>systemd-oomd.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>
+          and <citerefentry><refentrytitle>oomd.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry>. Setting
+          either of these properties to <option>kill</option> will also automatically acquire
+          <varname>After=</varname> and <varname>Wants=</varname> dependencies on
+          <filename>systemd-oomd.service</filename> unless <varname>DefaultDependencies=no</varname>.
+        </para>
+
+          <para>When set to <option>auto</option>, <command>systemd-oomd</command> will not actively use this cgroup's
+          data for monitoring and detection. However, if an ancestor cgroup has one of these properties set to
+          <option>kill</option>, a unit with <option>auto</option> can still be an eligible candidate for
+          <command>systemd-oomd</command> to act on.</para>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>ManagedOOMMemoryPressureLimitPercent=</varname></term>
+
+        <listitem>
+          <para>Overrides the default memory pressure limit set by
+          <citerefentry><refentrytitle>oomd.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry> for this unit
+          (cgroup). Takes a percentage value between 0% and 100%, inclusive. This property is ignored unless
+          <varname>ManagedOOMMemoryPressure=</varname><option>kill</option>. Defaults to 0%, which means use the
+          default set by <citerefentry><refentrytitle>oomd.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry>.
+          </para>
         </listitem>
       </varlistentry>
     </variablelist>
@@ -1040,6 +1073,7 @@ DeviceAllow=/dev/loop-control
       <citerefentry><refentrytitle>systemd.exec</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
       <citerefentry><refentrytitle>systemd.directives</refentrytitle><manvolnum>7</manvolnum></citerefentry>,
       <citerefentry><refentrytitle>systemd.special</refentrytitle><manvolnum>7</manvolnum></citerefentry>,
+      <citerefentry><refentrytitle>systemd-oomd.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
       The documentation for control groups and specific controllers in the Linux kernel:
       <ulink url="https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html">Control Groups v2</ulink>.
     </para>

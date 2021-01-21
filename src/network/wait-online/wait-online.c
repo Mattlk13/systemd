@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <getopt.h>
 #include <sys/stat.h>
@@ -83,11 +83,9 @@ static int parse_interface_with_operstate_range(const char *str) {
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "Invalid interface name '%s'", ifname);
 
-        r = hashmap_ensure_allocated(&arg_interfaces, &string_hash_ops);
-        if (r < 0)
+        r = hashmap_ensure_put(&arg_interfaces, &string_hash_ops, ifname, TAKE_PTR(range));
+        if (r == -ENOMEM)
                 return log_oom();
-
-        r = hashmap_put(arg_interfaces, ifname, TAKE_PTR(range));
         if (r < 0)
                 return log_error_errno(r, "Failed to store interface name: %m");
         if (r == 0)
@@ -183,8 +181,8 @@ static int parse_argv(int argc, char *argv[]) {
 }
 
 static int run(int argc, char *argv[]) {
-        _cleanup_(notify_on_cleanup) const char *notify_message = NULL;
         _cleanup_(manager_freep) Manager *m = NULL;
+        _cleanup_(notify_on_cleanup) const char *notify_message = NULL;
         int r;
 
         log_setup_service();

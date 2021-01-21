@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -7,6 +7,7 @@
 
 #include "alloc-util.h"
 #include "bus-common-errors.h"
+#include "bus-get-properties.h"
 #include "bus-label.h"
 #include "bus-polkit.h"
 #include "bus-util.h"
@@ -79,11 +80,9 @@ static int append_fd(sd_bus_message *m, PortableMetadata *d) {
         assert(d);
         assert(d->fd >= 0);
 
-        f = fdopen(d->fd, "r");
+        f = take_fdopen(&d->fd, "r");
         if (!f)
                 return -errno;
-
-        d->fd = -1;
 
         r = read_full_stream(f, &buf, &n);
         if (r < 0)
@@ -607,7 +606,7 @@ int bus_image_acquire(
         if (image_name_is_valid(name_or_path)) {
 
                 /* If it's a short name, let's search for it */
-                r = image_find(IMAGE_PORTABLE, name_or_path, &loaded);
+                r = image_find(IMAGE_PORTABLE, name_or_path, NULL, &loaded);
                 if (r == -ENOENT)
                         return sd_bus_error_setf(error, BUS_ERROR_NO_SUCH_PORTABLE_IMAGE, "No image '%s' found.", name_or_path);
 
@@ -705,7 +704,6 @@ int bus_image_node_enumerator(sd_bus *bus, const char *path, void *userdata, cha
         size_t n_allocated = 0, n = 0;
         Manager *m = userdata;
         Image *image;
-        Iterator i;
         int r;
 
         assert(bus);
@@ -720,7 +718,7 @@ int bus_image_node_enumerator(sd_bus *bus, const char *path, void *userdata, cha
         if (r < 0)
                 return r;
 
-        HASHMAP_FOREACH(image, images, i) {
+        HASHMAP_FOREACH(image, images) {
                 char *p;
 
                 r = bus_image_path(image, &p);

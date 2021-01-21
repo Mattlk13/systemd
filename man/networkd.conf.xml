@@ -3,7 +3,7 @@
   "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
 
 <!--
-  SPDX-License-Identifier: LGPL-2.1+
+  SPDX-License-Identifier: LGPL-2.1-or-later
 
   Copyright © 2014 Vinay Kulkarni
 -->
@@ -45,15 +45,15 @@
   <refsect1>
     <title>[Network] Section Options</title>
 
-    <para>The following options are available in the <literal>[Network]</literal> section:</para>
+    <para>The following options are available in the [Network] section:</para>
 
     <variablelist class='network-directives'>
       <varlistentry>
         <term><varname>SpeedMeter=</varname></term>
         <listitem><para>Takes a boolean. If set to yes, then <command>systemd-networkd</command>
         measures the traffic of each interface, and
-        <command>networkctl status <replaceable>INTERFACE</replaceable> shows the measured speed.
-        </command>Defaults to no.</para></listitem>
+        <command>networkctl status <replaceable>INTERFACE</replaceable></command> shows the measured speed.
+        Defaults to no.</para></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -68,6 +68,14 @@
         configured by other tools in its memory. When false, <command>systemd-networkd</command> will
         not manage the foreign routes, thus they are kept even if <varname>KeepConfiguration=</varname>
         is false. Defaults to yes.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>RouteTable=</varname></term>
+        <listitem><para>Specifies the route table name. Takes a route name and table number separated with a colon.
+        (<literal><replaceable>name</replaceable>:<replaceable>integer</replaceable></literal>. The route table number
+        must be an integer in the range 1..4294967295. This setting can be specified multiple times. If an empty string
+        is specified, then all options specified earlier are cleared. Defaults to unset.</para></listitem>
       </varlistentry>
 
     </variablelist>

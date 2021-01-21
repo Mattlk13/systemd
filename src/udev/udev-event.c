@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0+ */
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 
 #include <ctype.h>
 #include <errno.h>
@@ -17,7 +17,6 @@
 #include "fd-util.h"
 #include "fs-util.h"
 #include "format-util.h"
-#include "libudev-util.h"
 #include "netlink-util.h"
 #include "parse-util.h"
 #include "path-util.h"
@@ -41,6 +40,7 @@ typedef struct Spawn {
         pid_t pid;
         usec_t timeout_warn_usec;
         usec_t timeout_usec;
+        int timeout_signal;
         usec_t event_birth_usec;
         bool accept_failure;
         int fd_stdout;
@@ -50,7 +50,7 @@ typedef struct Spawn {
         size_t result_len;
 } Spawn;
 
-UdevEvent *udev_event_new(sd_device *dev, usec_t exec_delay_usec, sd_netlink *rtnl) {
+UdevEvent *udev_event_new(sd_device *dev, usec_t exec_delay_usec, sd_netlink *rtnl, int log_level) {
         UdevEvent *event;
 
         assert(dev);
@@ -67,6 +67,8 @@ UdevEvent *udev_event_new(sd_device *dev, usec_t exec_delay_usec, sd_netlink *rt
                 .uid = UID_INVALID,
                 .gid = GID_INVALID,
                 .mode = MODE_INVALID,
+                .log_level_was_debug = log_level == LOG_DEBUG,
+                .default_log_level = log_level,
         };
 
         return event;
@@ -149,7 +151,7 @@ static char format_type_to_char(FormatSubstitutionType t) {
         return '\0';
 }
 
-static int get_subst_type(const char **str, bool strict, FormatSubstitutionType *ret_type, char ret_attr[static UTIL_PATH_SIZE]) {
+static int get_subst_type(const char **str, bool strict, FormatSubstitutionType *ret_type, char ret_attr[static UDEV_PATH_SIZE]) {
         const char *p = *str, *q = NULL;
         size_t i;
 
@@ -195,10 +197,10 @@ static int get_subst_type(const char **str, bool strict, FormatSubstitutionType 
                         return -EINVAL;
 
                 len = end - start;
-                if (len == 0 || len >= UTIL_PATH_SIZE)
+                if (len == 0 || len >= UDEV_PATH_SIZE)
                         return -EINVAL;
 
-                strnscpy(ret_attr, UTIL_PATH_SIZE, start, len);
+                strnscpy(ret_attr, UDEV_PATH_SIZE, start, len);
                 q = end + 1;
         } else
                 *ret_attr = '\0';
@@ -336,14 +338,14 @@ static ssize_t udev_event_subst_format(
                 break;
         }
         case FORMAT_SUBST_ATTR: {
-                char vbuf[UTIL_NAME_SIZE];
+                char vbuf[UDEV_NAME_SIZE];
                 int count;
 
                 if (isempty(attr))
                         return -EINVAL;
 
                 /* try to read the value specified by "[dmi/id]product_name" */
-                if (util_resolve_subsys_kernel(attr, vbuf, sizeof(vbuf), true) == 0)
+                if (udev_resolve_subsys_kernel(attr, vbuf, sizeof(vbuf), true) == 0)
                         val = vbuf;
 
                 /* try to read the attribute the device */
@@ -361,7 +363,7 @@ static ssize_t udev_event_subst_format(
                 if (val != vbuf)
                         strscpy(vbuf, sizeof(vbuf), val);
                 delete_trailing_chars(vbuf, NULL);
-                count = util_replace_chars(vbuf, UDEV_ALLOWED_CHARS_INPUT);
+                count = udev_replace_chars(vbuf, UDEV_ALLOWED_CHARS_INPUT);
                 if (count > 0)
                         log_device_debug(dev, "%i character(s) replaced", count);
                 l = strpcpy(&s, l, vbuf);
@@ -369,7 +371,7 @@ static ssize_t udev_event_subst_format(
         }
         case FORMAT_SUBST_PARENT:
                 r = sd_device_get_parent(dev, &parent);
-                if (r == -ENODEV)
+                if (r == -ENOENT)
                         goto null_terminate;
                 if (r < 0)
                         return r;
@@ -436,9 +438,9 @@ null_terminate:
         return 0;
 }
 
-ssize_t udev_event_apply_format(UdevEvent *event,
-                                const char *src, char *dest, size_t size,
-                                bool replace_whitespace) {
+size_t udev_event_apply_format(UdevEvent *event,
+                               const char *src, char *dest, size_t size,
+                               bool replace_whitespace) {
         const char *s = src;
         int r;
 
@@ -450,13 +452,14 @@ ssize_t udev_event_apply_format(UdevEvent *event,
 
         while (*s) {
                 FormatSubstitutionType type;
-                char attr[UTIL_PATH_SIZE];
+                char attr[UDEV_PATH_SIZE];
                 ssize_t subst_len;
 
                 r = get_subst_type(&s, false, &type, attr);
-                if (r < 0)
-                        return log_device_warning_errno(event->dev, r, "Invalid format string, ignoring: %s", src);
-                if (r == 0) {
+                if (r < 0) {
+                        log_device_warning_errno(event->dev, r, "Invalid format string, ignoring: %s", src);
+                        break;
+                } else if (r == 0) {
                         if (size < 2) /* need space for this char and the terminating NUL */
                                 break;
                         *dest++ = *s++;
@@ -465,16 +468,18 @@ ssize_t udev_event_apply_format(UdevEvent *event,
                 }
 
                 subst_len = udev_event_subst_format(event, type, attr, dest, size);
-                if (subst_len < 0)
-                        return log_device_warning_errno(event->dev, subst_len,
-                                                        "Failed to substitute variable '$%s' or apply format '%%%c', ignoring: %m",
-                                                        format_type_to_string(type), format_type_to_char(type));
+                if (subst_len < 0) {
+                        log_device_warning_errno(event->dev, subst_len,
+                                                 "Failed to substitute variable '$%s' or apply format '%%%c', ignoring: %m",
+                                                 format_type_to_string(type), format_type_to_char(type));
+                        break;
+                }
 
                 /* FORMAT_SUBST_RESULT handles spaces itself */
                 if (replace_whitespace && type != FORMAT_SUBST_RESULT)
-                        /* util_replace_whitespace can replace in-place,
+                        /* udev_replace_whitespace can replace in-place,
                          * and does nothing if subst_len == 0 */
-                        subst_len = util_replace_whitespace(dest, dest, subst_len);
+                        subst_len = udev_replace_whitespace(dest, dest, subst_len);
 
                 dest += subst_len;
                 size -= subst_len;
@@ -488,7 +493,7 @@ ssize_t udev_event_apply_format(UdevEvent *event,
 int udev_check_format(const char *value, size_t *offset, const char **hint) {
         FormatSubstitutionType type;
         const char *s = value;
-        char attr[UTIL_PATH_SIZE];
+        char attr[UDEV_PATH_SIZE];
         int r;
 
         while (*s) {
@@ -596,7 +601,7 @@ static int on_spawn_timeout(sd_event_source *s, uint64_t usec, void *userdata) {
 
         assert(spawn);
 
-        kill_and_sigcont(spawn->pid, SIGKILL);
+        kill_and_sigcont(spawn->pid, spawn->timeout_signal);
 
         log_device_error(spawn->device, "Spawned process '%s' ["PID_FMT"] timed out after %s, killing",
                          spawn->cmd, spawn->pid,
@@ -629,7 +634,7 @@ static int on_spawn_sigchld(sd_event_source *s, const siginfo_t *si, void *userd
                 if (si->si_status == 0)
                         log_device_debug(spawn->device, "Process '%s' succeeded.", spawn->cmd);
                 else
-                        log_device_full(spawn->device, spawn->accept_failure ? LOG_DEBUG : LOG_WARNING, 0,
+                        log_device_full(spawn->device, spawn->accept_failure ? LOG_DEBUG : LOG_WARNING,
                                         "Process '%s' failed with exit code %i.", spawn->cmd, si->si_status);
                 ret = si->si_status;
                 break;
@@ -711,12 +716,12 @@ static int spawn_wait(Spawn *spawn) {
         if (r < 0)
                 return r;
 
-
         return sd_event_loop(e);
 }
 
 int udev_event_spawn(UdevEvent *event,
                      usec_t timeout_usec,
+                     int timeout_signal,
                      bool accept_failure,
                      const char *cmd,
                      char *result, size_t ressize) {
@@ -742,9 +747,9 @@ int udev_event_spawn(UdevEvent *event,
                         return log_device_error_errno(event->dev, errno,
                                                       "Failed to create pipe for command '%s': %m", cmd);
 
-        argv = strv_split_full(cmd, NULL, SPLIT_QUOTES|SPLIT_RELAX);
-        if (!argv)
-                return log_oom();
+        r = strv_split_full(&argv, cmd, NULL, EXTRACT_UNQUOTE | EXTRACT_RELAX | EXTRACT_RETAIN_ESCAPE);
+        if (r < 0)
+                return log_device_error_errno(event->dev, r, "Failed to split command: %m");
 
         if (isempty(argv[0]))
                 return log_device_error_errno(event->dev, SYNTHETIC_ERRNO(EINVAL),
@@ -793,6 +798,7 @@ int udev_event_spawn(UdevEvent *event,
                 .accept_failure = accept_failure,
                 .timeout_warn_usec = udev_warn_timeout(timeout_usec),
                 .timeout_usec = timeout_usec,
+                .timeout_signal = timeout_signal,
                 .event_birth_usec = event->birth_usec,
                 .fd_stdout = outpipe[READ_END],
                 .fd_stderr = errpipe[READ_END],
@@ -834,11 +840,6 @@ static int rename_netif(UdevEvent *event) {
         if (r < 0)
                 return log_device_error_errno(dev, r, "Failed to get ifindex: %m");
 
-        r = rtnl_set_link_name(&event->rtnl, ifindex, event->name);
-        if (r < 0)
-                return log_device_error_errno(dev, r, "Failed to rename network interface %i from '%s' to '%s': %m",
-                                              ifindex, oldname, event->name);
-
         /* Set ID_RENAMING boolean property here, and drop it in the corresponding move uevent later. */
         r = device_add_property(dev, "ID_RENAMING", "1");
         if (r < 0)
@@ -847,6 +848,22 @@ static int rename_netif(UdevEvent *event) {
         r = device_rename(dev, event->name);
         if (r < 0)
                 return log_device_warning_errno(dev, r, "Failed to update properties with new name '%s': %m", event->name);
+
+        /* Also set ID_RENAMING boolean property to cloned sd_device object and save it to database
+         * before calling rtnl_set_link_name(). Otherwise, clients (e.g., systemd-networkd) may receive
+         * RTM_NEWLINK netlink message before the database is updated. */
+        r = device_add_property(event->dev_db_clone, "ID_RENAMING", "1");
+        if (r < 0)
+                return log_device_warning_errno(event->dev_db_clone, r, "Failed to add 'ID_RENAMING' property: %m");
+
+        r = device_update_db(event->dev_db_clone);
+        if (r < 0)
+                return log_device_debug_errno(event->dev_db_clone, r, "Failed to update database under /run/udev/data/: %m");
+
+        r = rtnl_set_link_name(&event->rtnl, ifindex, event->name);
+        if (r < 0)
+                return log_device_error_errno(dev, r, "Failed to rename network interface %i from '%s' to '%s': %m",
+                                              ifindex, oldname, event->name);
 
         log_device_debug(dev, "Network interface %i is renamed from '%s' to '%s'", ifindex, oldname, event->name);
 
@@ -864,8 +881,7 @@ static int update_devnode(UdevEvent *event) {
                 return log_device_error_errno(dev, r, "Failed to get devnum: %m");
 
         /* remove/update possible left-over symlinks from old database entry */
-        if (event->dev_db_clone)
-                (void) udev_node_update_old_links(dev, event->dev_db_clone);
+        (void) udev_node_update_old_links(dev, event->dev_db_clone);
 
         if (!uid_is_valid(event->uid)) {
                 r = device_get_devnode_uid(dev, &event->uid);
@@ -896,6 +912,7 @@ static int update_devnode(UdevEvent *event) {
 static void event_execute_rules_on_remove(
                 UdevEvent *event,
                 usec_t timeout_usec,
+                int timeout_signal,
                 Hashmap *properties_list,
                 UdevRules *rules) {
 
@@ -917,22 +934,14 @@ static void event_execute_rules_on_remove(
         if (sd_device_get_devnum(dev, NULL) >= 0)
                 (void) udev_watch_end(dev);
 
-        (void) udev_rules_apply_to_event(rules, event, timeout_usec, properties_list);
+        (void) udev_rules_apply_to_event(rules, event, timeout_usec, timeout_signal, properties_list);
 
         if (sd_device_get_devnum(dev, NULL) >= 0)
                 (void) udev_node_remove(dev);
 }
 
-static int udev_event_on_move(UdevEvent *event) {
-        sd_device *dev = event->dev;
+static int udev_event_on_move(sd_device *dev) {
         int r;
-
-        if (event->dev_db_clone &&
-            sd_device_get_devnum(dev, NULL) < 0) {
-                r = device_copy_properties(dev, event->dev_db_clone);
-                if (r < 0)
-                        log_device_debug_errno(dev, r, "Failed to copy properties from cloned sd_device object, ignoring: %m");
-        }
 
         /* Drop previously added property */
         r = device_add_property(dev, "ID_RENAMING", NULL);
@@ -942,8 +951,27 @@ static int udev_event_on_move(UdevEvent *event) {
         return 0;
 }
 
+static int copy_all_tags(sd_device *d, sd_device *s) {
+        const char *tag;
+        int r;
+
+        assert(d);
+
+        if (!s)
+                return 0;
+
+        FOREACH_DEVICE_TAG(s, tag) {
+                r = device_add_tag(d, tag, false);
+                if (r < 0)
+                        return r;
+        }
+
+        return 0;
+}
+
 int udev_event_execute_rules(UdevEvent *event,
                              usec_t timeout_usec,
+                             int timeout_signal,
                              Hashmap *properties_list,
                              UdevRules *rules) {
         const char *subsystem;
@@ -965,7 +993,7 @@ int udev_event_execute_rules(UdevEvent *event,
                 return log_device_error_errno(dev, r, "Failed to get ACTION: %m");
 
         if (action == DEVICE_ACTION_REMOVE) {
-                event_execute_rules_on_remove(event, timeout_usec, properties_list, rules);
+                event_execute_rules_on_remove(event, timeout_usec, timeout_signal, properties_list, rules);
                 return 0;
         }
 
@@ -973,17 +1001,21 @@ int udev_event_execute_rules(UdevEvent *event,
         if (r < 0)
                 return log_device_debug_errno(dev, r, "Failed to clone sd_device object: %m");
 
-        if (event->dev_db_clone && sd_device_get_devnum(dev, NULL) >= 0)
+        r = copy_all_tags(dev, event->dev_db_clone);
+        if (r < 0)
+                log_device_warning_errno(dev, r, "Failed to copy all tags from old database entry, ignoring: %m");
+
+        if (sd_device_get_devnum(dev, NULL) >= 0)
                 /* Disable watch during event processing. */
                 (void) udev_watch_end(event->dev_db_clone);
 
         if (action == DEVICE_ACTION_MOVE) {
-                r = udev_event_on_move(event);
+                r = udev_event_on_move(event->dev);
                 if (r < 0)
                         return r;
         }
 
-        r = udev_rules_apply_to_event(rules, event, timeout_usec, properties_list);
+        r = udev_rules_apply_to_event(rules, event, timeout_usec, timeout_signal, properties_list);
         if (r < 0)
                 return log_device_debug_errno(dev, r, "Failed to apply udev rules: %m");
 
@@ -1009,20 +1041,24 @@ int udev_event_execute_rules(UdevEvent *event,
         if (r < 0)
                 return log_device_debug_errno(dev, r, "Failed to update database under /run/udev/data/: %m");
 
-        device_set_is_initialized(dev);
+        /* Yes, we run update_devnode() twice, because in the first invocation, that is before update of udev database,
+         * it could happen that two contenders are replacing each other's symlink. Hence we run it again to make sure
+         * symlinks point to devices that claim them with the highest priority. */
+        r = update_devnode(event);
+        if (r < 0)
+                return r;
 
-        event->dev_db_clone = sd_device_unref(event->dev_db_clone);
+        device_set_is_initialized(dev);
 
         return 0;
 }
 
-void udev_event_execute_run(UdevEvent *event, usec_t timeout_usec) {
+void udev_event_execute_run(UdevEvent *event, usec_t timeout_usec, int timeout_signal) {
         const char *command;
         void *val;
-        Iterator i;
         int r;
 
-        ORDERED_HASHMAP_FOREACH_KEY(val, command, event->run_list, i) {
+        ORDERED_HASHMAP_FOREACH_KEY(val, command, event->run_list) {
                 UdevBuiltinCommand builtin_cmd = PTR_TO_UDEV_BUILTIN_CMD(val);
 
                 if (builtin_cmd != _UDEV_BUILTIN_INVALID) {
@@ -1040,7 +1076,8 @@ void udev_event_execute_run(UdevEvent *event, usec_t timeout_usec) {
                         }
 
                         log_device_debug(event->dev, "Running command \"%s\"", command);
-                        r = udev_event_spawn(event, timeout_usec, false, command, NULL, 0);
+
+                        r = udev_event_spawn(event, timeout_usec, timeout_signal, false, command, NULL, 0);
                         if (r < 0)
                                 log_device_warning_errno(event->dev, r, "Failed to execute '%s', ignoring: %m", command);
                         else if (r > 0) /* returned value is positive when program fails */

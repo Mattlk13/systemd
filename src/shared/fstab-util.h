@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 #include <stdbool.h>
@@ -6,6 +6,7 @@
 
 #include "macro.h"
 
+bool fstab_is_extrinsic(const char *mount, const char *opts);
 int fstab_is_mount_point(const char *mount);
 int fstab_has_fstype(const char *fstype);
 

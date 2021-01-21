@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 /***
   Copyright © 2013 Intel Corporation
   Authors:
@@ -384,8 +384,7 @@ int mac_smack_setup(bool *loaded_policy) {
                 log_info("Successfully wrote Smack onlycap list.");
                 break;
         default:
-                log_emergency_errno(r, "Failed to write Smack onlycap list: %m");
-                return r;
+                return log_emergency_errno(r, "Failed to write Smack onlycap list: %m");
         }
 
         *loaded_policy = true;

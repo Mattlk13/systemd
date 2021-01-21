@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <fcntl.h>
 #include <getopt.h>
@@ -22,6 +22,7 @@
 #include "log.h"
 #include "logs-show.h"
 #include "main-func.h"
+#include "memory-util.h"
 #include "microhttpd-util.h"
 #include "os-util.h"
 #include "parse-util.h"
@@ -37,7 +38,7 @@ static char *arg_cert_pem = NULL;
 static char *arg_trust_pem = NULL;
 static const char *arg_directory = NULL;
 
-STATIC_DESTRUCTOR_REGISTER(arg_key_pem, freep);
+STATIC_DESTRUCTOR_REGISTER(arg_key_pem, erase_and_freep);
 STATIC_DESTRUCTOR_REGISTER(arg_cert_pem, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_trust_pem, freep);
 
@@ -58,9 +59,6 @@ typedef struct RequestMeta {
 
         bool follow;
         bool discrete;
-
-        uint64_t n_fields;
-        bool n_fields_set;
 } RequestMeta;
 
 static const char* const mime_types[_OUTPUT_MODE_MAX] = {
@@ -123,17 +121,15 @@ static int request_meta_ensure_tmp(RequestMeta *m) {
         if (m->tmp)
                 rewind(m->tmp);
         else {
-                int fd;
+                _cleanup_close_ int fd = -1;
 
                 fd = open_tmpfile_unlinkable("/tmp", O_RDWR|O_CLOEXEC);
                 if (fd < 0)
                         return fd;
 
-                m->tmp = fdopen(fd, "w+");
-                if (!m->tmp) {
-                        safe_close(fd);
+                m->tmp = take_fdopen(&fd, "w+");
+                if (!m->tmp)
                         return -errno;
-                }
         }
 
         return 0;
@@ -351,7 +347,7 @@ static int request_parse_range(
         return 0;
 }
 
-static int request_parse_arguments_iterator(
+static mhd_result request_parse_arguments_iterator(
                 void *cls,
                 enum MHD_ValueKind kind,
                 const char *key,
@@ -556,10 +552,6 @@ static ssize_t request_reader_fields(
                 /* End of this field, so let's serialize the next
                  * one */
 
-                if (m->n_fields_set &&
-                    m->n_fields <= 0)
-                        return MHD_CONTENT_READER_END_OF_STREAM;
-
                 r = sd_journal_enumerate_unique(m->journal, &d, &l);
                 if (r < 0) {
                         log_error_errno(r, "Failed to advance field index: %m");
@@ -569,9 +561,6 @@ static ssize_t request_reader_fields(
 
                 pos -= m->size;
                 m->delta += m->size;
-
-                if (m->n_fields_set)
-                        m->n_fields -= 1;
 
                 r = request_meta_ensure_tmp(m);
                 if (r < 0) {
@@ -798,7 +787,7 @@ static int request_handler_machine(
         return MHD_queue_response(connection, MHD_HTTP_OK, response);
 }
 
-static int request_handler(
+static mhd_result request_handler(
                 void *cls,
                 struct MHD_Connection *connection,
                 const char *url,
@@ -908,7 +897,11 @@ static int parse_argv(int argc, char *argv[]) {
                         if (arg_key_pem)
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                        "Key file specified twice");
-                        r = read_full_file(optarg, &arg_key_pem, NULL);
+                        r = read_full_file_full(
+                                        AT_FDCWD, optarg, UINT64_MAX, SIZE_MAX,
+                                        READ_FULL_FILE_SECURE|READ_FULL_FILE_WARN_WORLD_READABLE|READ_FULL_FILE_CONNECT_SOCKET,
+                                        NULL,
+                                        &arg_key_pem, NULL);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to read key file: %m");
                         assert(arg_key_pem);
@@ -918,7 +911,11 @@ static int parse_argv(int argc, char *argv[]) {
                         if (arg_cert_pem)
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                        "Certificate file specified twice");
-                        r = read_full_file(optarg, &arg_cert_pem, NULL);
+                        r = read_full_file_full(
+                                        AT_FDCWD, optarg, UINT64_MAX, SIZE_MAX,
+                                        READ_FULL_FILE_CONNECT_SOCKET,
+                                        NULL,
+                                        &arg_cert_pem, NULL);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to read certificate file: %m");
                         assert(arg_cert_pem);
@@ -929,14 +926,18 @@ static int parse_argv(int argc, char *argv[]) {
                         if (arg_trust_pem)
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                        "CA certificate file specified twice");
-                        r = read_full_file(optarg, &arg_trust_pem, NULL);
+                        r = read_full_file_full(
+                                        AT_FDCWD, optarg, UINT64_MAX, SIZE_MAX,
+                                        READ_FULL_FILE_CONNECT_SOCKET,
+                                        NULL,
+                                        &arg_trust_pem, NULL);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to read CA certificate file: %m");
                         assert(arg_trust_pem);
                         break;
 #else
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                               "Option --trust is not available.");
+                                               "Option --trust= is not available.");
 #endif
                 case 'D':
                         arg_directory = optarg;

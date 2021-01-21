@@ -1,8 +1,10 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
 #include <linux/filter.h>
 #include <linux/netlink.h>
+#include <linux/sockios.h>
+#include <sys/ioctl.h>
 #include <unistd.h>
 
 #include "sd-device.h"
@@ -13,10 +15,12 @@
 #include "device-monitor-private.h"
 #include "device-private.h"
 #include "device-util.h"
+#include "errno-util.h"
 #include "fd-util.h"
 #include "format-util.h"
 #include "hashmap.h"
 #include "io-util.h"
+#include "missing_socket.h"
 #include "mountpoint-util.h"
 #include "set.h"
 #include "socket-util.h"
@@ -87,18 +91,9 @@ int device_monitor_allow_unicast_sender(sd_device_monitor *m, sd_device_monitor 
 }
 
 _public_ int sd_device_monitor_set_receive_buffer_size(sd_device_monitor *m, size_t size) {
-        int r, n = (int) size;
-
         assert_return(m, -EINVAL);
-        assert_return((size_t) n == size, -EINVAL);
 
-        if (setsockopt_int(m->sock, SOL_SOCKET, SO_RCVBUFFORCE, n) < 0) {
-                r = setsockopt_int(m->sock, SOL_SOCKET, SO_RCVBUF, n);
-                if (r < 0)
-                        return r;
-        }
-
-        return 0;
+        return fd_set_rcvbuf(m->sock, size, false);
 }
 
 int device_monitor_disconnect(sd_device_monitor *m) {
@@ -163,12 +158,54 @@ int device_monitor_new_full(sd_device_monitor **ret, MonitorNetlinkGroup group, 
 
         if (fd >= 0) {
                 r = monitor_set_nl_address(m);
-                if (r < 0)
-                        return log_debug_errno(r, "sd-device-monitor: Failed to set netlink address: %m");
+                if (r < 0) {
+                        log_debug_errno(r, "sd-device-monitor: Failed to set netlink address: %m");
+                        goto fail;
+                }
+        }
+
+        if (DEBUG_LOGGING) {
+                _cleanup_close_ int netns = -1;
+
+                /* So here's the thing: only AF_NETLINK sockets from the main network namespace will get
+                 * hardware events. Let's check if ours is from there, and if not generate a debug message,
+                 * since we cannot possibly work correctly otherwise. This is just a safety check to make
+                 * things easier to debug. */
+
+                netns = ioctl(m->sock, SIOCGSKNS);
+                if (netns < 0)
+                        log_debug_errno(errno, "sd-device-monitor: Unable to get network namespace of udev netlink socket, unable to determine if we are in host netns: %m");
+                else {
+                        struct stat a, b;
+
+                        if (fstat(netns, &a) < 0) {
+                                r = log_debug_errno(errno, "sd-device-monitor: Failed to stat netns of udev netlink socket: %m");
+                                goto fail;
+                        }
+
+                        if (stat("/proc/1/ns/net", &b) < 0) {
+                                if (ERRNO_IS_PRIVILEGE(errno))
+                                        /* If we can't access PID1's netns info due to permissions, it's fine, this is a
+                                         * safety check only after all. */
+                                        log_debug_errno(errno, "sd-device-monitor: No permission to stat PID1's netns, unable to determine if we are in host netns: %m");
+                                else
+                                        log_debug_errno(errno, "sd-device-monitor: Failed to stat PID1's netns: %m");
+
+                        } else if (a.st_dev != b.st_dev || a.st_ino != b.st_ino)
+                                log_debug("sd-device-monitor: Netlink socket we listen on is not from host netns, we won't see device events.");
+                }
         }
 
         *ret = TAKE_PTR(m);
         return 0;
+
+fail:
+        /* Let's unset the socket fd in the monitor object before we destroy it so that the fd passed in is
+         * not closed on failure. */
+        if (fd >= 0)
+                m->sock = -1;
+
+        return r;
 }
 
 _public_ int sd_device_monitor_new(sd_device_monitor **ret) {
@@ -307,7 +344,6 @@ DEFINE_PUBLIC_TRIVIAL_REF_UNREF_FUNC(sd_device_monitor, sd_device_monitor, devic
 
 static int passes_filter(sd_device_monitor *m, sd_device *device) {
         const char *tag, *subsystem, *devtype, *s, *d = NULL;
-        Iterator i;
         int r;
 
         assert_return(m, -EINVAL);
@@ -324,7 +360,7 @@ static int passes_filter(sd_device_monitor *m, sd_device *device) {
         if (r < 0 && r != -ENOENT)
                 return r;
 
-        HASHMAP_FOREACH_KEY(devtype, subsystem, m->subsystem_filter, i) {
+        HASHMAP_FOREACH_KEY(devtype, subsystem, m->subsystem_filter) {
                 if (!streq(s, subsystem))
                         continue;
 
@@ -344,7 +380,7 @@ tag:
         if (set_isempty(m->tag_filter))
                 return 1;
 
-        SET_FOREACH(tag, m->tag_filter, i)
+        SET_FOREACH(tag, m->tag_filter)
                 if (sd_device_has_tag(device, tag) > 0)
                         return 1;
 
@@ -361,13 +397,13 @@ int device_monitor_receive_device(sd_device_monitor *m, sd_device **ret) {
                 .iov_base = &buf,
                 .iov_len = sizeof(buf)
         };
-        char cred_msg[CMSG_SPACE(sizeof(struct ucred))];
+        CMSG_BUFFER_TYPE(CMSG_SPACE(sizeof(struct ucred))) control;
         union sockaddr_union snl;
         struct msghdr smsg = {
                 .msg_iov = &iov,
                 .msg_iovlen = 1,
-                .msg_control = cred_msg,
-                .msg_controllen = sizeof(cred_msg),
+                .msg_control = &control,
+                .msg_controllen = sizeof(control),
                 .msg_name = &snl,
                 .msg_namelen = sizeof(snl),
         };
@@ -512,10 +548,9 @@ int device_monitor_send_device(
         r = device_get_properties_nulstr(device, (const uint8_t **) &buf, &blen);
         if (r < 0)
                 return log_device_debug_errno(device, r, "sd-device-monitor: Failed to get device properties: %m");
-        if (blen < 32) {
-                log_device_debug(device, "sd-device-monitor: Length of device property nulstr is too small to contain valid device information");
-                return -EINVAL;
-        }
+        if (blen < 32)
+                log_device_debug_errno(device, SYNTHETIC_ERRNO(EINVAL),
+                                       "sd-device-monitor: Length of device property nulstr is too small to contain valid device information");
 
         /* fill in versioned header */
         r = sd_device_get_subsystem(device, &val);
@@ -586,7 +621,6 @@ _public_ int sd_device_monitor_filter_update(sd_device_monitor *m) {
         struct sock_fprog filter;
         const char *subsystem, *devtype, *tag;
         unsigned i = 0;
-        Iterator it;
 
         assert_return(m, -EINVAL);
 
@@ -610,7 +644,7 @@ _public_ int sd_device_monitor_filter_update(sd_device_monitor *m) {
                 int tag_matches = set_size(m->tag_filter);
 
                 /* add all tags matches */
-                SET_FOREACH(tag, m->tag_filter, it) {
+                SET_FOREACH(tag, m->tag_filter) {
                         uint64_t tag_bloom_bits = string_bloom64(tag);
                         uint32_t tag_bloom_hi = tag_bloom_bits >> 32;
                         uint32_t tag_bloom_lo = tag_bloom_bits & 0xffffffff;
@@ -637,7 +671,7 @@ _public_ int sd_device_monitor_filter_update(sd_device_monitor *m) {
 
         /* add all subsystem matches */
         if (!hashmap_isempty(m->subsystem_filter)) {
-                HASHMAP_FOREACH_KEY(devtype, subsystem, m->subsystem_filter, it) {
+                HASHMAP_FOREACH_KEY(devtype, subsystem, m->subsystem_filter) {
                         uint32_t hash = string_hash32(subsystem);
 
                         /* load device subsystem value in A */
@@ -698,45 +732,26 @@ _public_ int sd_device_monitor_filter_add_match_subsystem_devtype(sd_device_moni
                         return -ENOMEM;
         }
 
-        r = hashmap_ensure_allocated(&m->subsystem_filter, NULL);
+        r = hashmap_ensure_put(&m->subsystem_filter, NULL, s, d);
         if (r < 0)
                 return r;
 
-        r = hashmap_put(m->subsystem_filter, s, d);
-        if (r < 0)
-                return r;
+        TAKE_PTR(s);
+        TAKE_PTR(d);
 
-        s = d = NULL;
         m->filter_uptodate = false;
 
         return 0;
 }
 
 _public_ int sd_device_monitor_filter_add_match_tag(sd_device_monitor *m, const char *tag) {
-        _cleanup_free_ char *t = NULL;
-        int r;
-
         assert_return(m, -EINVAL);
         assert_return(tag, -EINVAL);
 
-        t = strdup(tag);
-        if (!t)
-                return -ENOMEM;
-
-        r = set_ensure_allocated(&m->tag_filter, &string_hash_ops);
-        if (r < 0)
-                return r;
-
-        r = set_put(m->tag_filter, t);
-        if (r == -EEXIST)
-                return 0;
-        if (r < 0)
-                return r;
-
-        TAKE_PTR(t);
-        m->filter_uptodate = false;
-
-        return 0;
+        int r = set_put_strdup(&m->tag_filter, tag);
+        if (r > 0)
+                m->filter_uptodate = false;
+        return r;
 }
 
 _public_ int sd_device_monitor_filter_remove(sd_device_monitor *m) {

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <netinet/in.h>
 #include <sys/stat.h>
@@ -9,6 +9,7 @@
 
 #include "capability-util.h"
 #include "daemon-util.h"
+#include "firewall-util.h"
 #include "main-func.h"
 #include "mkdir.h"
 #include "networkd-conf.h"
@@ -17,8 +18,8 @@
 #include "user-util.h"
 
 static int run(int argc, char *argv[]) {
-        _cleanup_(notify_on_cleanup) const char *notify_message = NULL;
         _cleanup_(manager_freep) Manager *m = NULL;
+        _cleanup_(notify_on_cleanup) const char *notify_message = NULL;
         int r;
 
         log_setup_service();
@@ -88,29 +89,13 @@ static int run(int argc, char *argv[]) {
         if (r < 0)
                 return log_error_errno(r, "Could not load configuration files: %m");
 
-        r = manager_rtnl_enumerate_links(m);
+        r = manager_enumerate(m);
         if (r < 0)
-                return log_error_errno(r, "Could not enumerate links: %m");
+                return r;
 
-        r = manager_rtnl_enumerate_addresses(m);
+        r = fw_ctx_new(&m->fw_ctx);
         if (r < 0)
-                return log_error_errno(r, "Could not enumerate addresses: %m");
-
-        r = manager_rtnl_enumerate_neighbors(m);
-        if (r < 0)
-                return log_error_errno(r, "Could not enumerate neighbors: %m");
-
-        r = manager_rtnl_enumerate_routes(m);
-        if (r < 0)
-                return log_error_errno(r, "Could not enumerate routes: %m");
-
-        r = manager_rtnl_enumerate_rules(m);
-        if (r < 0)
-                return log_error_errno(r, "Could not enumerate rules: %m");
-
-        r = manager_rtnl_enumerate_nexthop(m);
-        if (r < 0)
-                return log_error_errno(r, "Could not enumerate nexthop: %m");
+                log_warning_errno(r, "Could not initialize firewall, IPMasquerade= option not available: %m");
 
         r = manager_start(m);
         if (r < 0)

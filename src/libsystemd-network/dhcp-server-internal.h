@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 /***
@@ -9,7 +9,7 @@
 #include "sd-event.h"
 
 #include "dhcp-internal.h"
-#include "hashmap.h"
+#include "ordered-set.h"
 #include "log.h"
 #include "time-util.h"
 
@@ -19,6 +19,7 @@ typedef enum DHCPRawOption {
         DHCP_RAW_OPTION_DATA_UINT32,
         DHCP_RAW_OPTION_DATA_STRING,
         DHCP_RAW_OPTION_DATA_IPV4ADDRESS,
+        DHCP_RAW_OPTION_DATA_IPV6ADDRESS,
         _DHCP_RAW_OPTION_DATA_MAX,
         _DHCP_RAW_OPTION_DATA_INVALID,
 } DHCPRawOption;
@@ -55,11 +56,10 @@ struct sd_dhcp_server {
 
         char *timezone;
 
-        struct in_addr *ntp, *dns, *sip;
-        unsigned n_ntp, n_dns, n_sip;
+        DHCPServerData servers[_SD_DHCP_LEASE_SERVER_TYPE_MAX];
 
-        OrderedHashmap *extra_options;
-        OrderedHashmap *vendor_options;
+        OrderedSet *extra_options;
+        OrderedSet *vendor_options;
 
         bool emit_router;
 
@@ -68,6 +68,9 @@ struct sd_dhcp_server {
         DHCPLease invalid_lease;
 
         uint32_t max_lease_time, default_lease_time;
+
+        sd_dhcp_server_callback_t callback;
+        void *callback_userdata;
 };
 
 typedef struct DHCPRequest {

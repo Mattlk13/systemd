@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <fcntl.h>
 #include <limits.h>
@@ -15,6 +15,9 @@
 #include "io-util.h"
 #include "parse-util.h"
 #include "process-util.h"
+#include "random-util.h"
+#include "rm-rf.h"
+#include "socket-util.h"
 #include "string-util.h"
 #include "strv.h"
 #include "tests.h"
@@ -149,6 +152,18 @@ static void test_parse_env_file(void) {
         assert_se(r >= 0);
 }
 
+static void test_one_shell_var(const char *file, const char *variable, const char *value) {
+        _cleanup_free_ char *cmd = NULL, *from_shell = NULL;
+        _cleanup_pclose_ FILE *f = NULL;
+        size_t sz;
+
+        assert_se(cmd = strjoin(". ", file, " && /bin/echo -n \"$", variable, "\""));
+        assert_se(f = popen(cmd, "re"));
+        assert_se(read_full_stream(f, &from_shell, &sz) >= 0);
+        assert_se(sz == strlen(value));
+        assert_se(streq(from_shell, value));
+}
+
 static void test_parse_multiline_env_file(void) {
         _cleanup_(unlink_tempfilep) char
                 t[] = "/tmp/test-fileio-in-XXXXXX",
@@ -160,8 +175,8 @@ static void test_parse_multiline_env_file(void) {
 
         assert_se(fmkostemp_safe(t, "w", &f) == 0);
         fputs("one=BAR\\\n"
-              "    VAR\\\n"
-              "\tGAR\n"
+              "\\ \\ \\ \\ VAR\\\n"
+              "\\\tGAR\n"
               "#comment\n"
               "two=\"bar\\\n"
               "    var\\\n"
@@ -171,8 +186,12 @@ static void test_parse_multiline_env_file(void) {
               "    var \\\n"
               "\tgar \"\n", f);
 
-        fflush(f);
+        assert_se(fflush_and_check(f) >= 0);
         fclose(f);
+
+        test_one_shell_var(t, "one", "BAR    VAR\tGAR");
+        test_one_shell_var(t, "two", "bar    var\tgar");
+        test_one_shell_var(t, "tri", "bar     var \tgar ");
 
         r = load_env_file(NULL, t, &a);
         assert_se(r >= 0);
@@ -444,20 +463,23 @@ static void test_write_string_file_verify(void) {
         _cleanup_free_ char *buf = NULL, *buf2 = NULL;
         int r;
 
-        assert_se(read_one_line_file("/proc/cmdline", &buf) >= 0);
+        r = read_one_line_file("/proc/version", &buf);
+        if (ERRNO_IS_PRIVILEGE(r))
+                return;
+        assert_se(r >= 0);
         assert_se(buf2 = strjoin(buf, "\n"));
 
-        r = write_string_file("/proc/cmdline", buf, 0);
+        r = write_string_file("/proc/version", buf, 0);
         assert_se(IN_SET(r, -EACCES, -EIO));
-        r = write_string_file("/proc/cmdline", buf2, 0);
+        r = write_string_file("/proc/version", buf2, 0);
         assert_se(IN_SET(r, -EACCES, -EIO));
 
-        assert_se(write_string_file("/proc/cmdline", buf, WRITE_STRING_FILE_VERIFY_ON_FAILURE) == 0);
-        assert_se(write_string_file("/proc/cmdline", buf2, WRITE_STRING_FILE_VERIFY_ON_FAILURE) == 0);
+        assert_se(write_string_file("/proc/version", buf, WRITE_STRING_FILE_VERIFY_ON_FAILURE) == 0);
+        assert_se(write_string_file("/proc/version", buf2, WRITE_STRING_FILE_VERIFY_ON_FAILURE) == 0);
 
-        r = write_string_file("/proc/cmdline", buf, WRITE_STRING_FILE_VERIFY_ON_FAILURE|WRITE_STRING_FILE_AVOID_NEWLINE);
+        r = write_string_file("/proc/version", buf, WRITE_STRING_FILE_VERIFY_ON_FAILURE|WRITE_STRING_FILE_AVOID_NEWLINE);
         assert_se(IN_SET(r, -EACCES, -EIO));
-        assert_se(write_string_file("/proc/cmdline", buf2, WRITE_STRING_FILE_VERIFY_ON_FAILURE|WRITE_STRING_FILE_AVOID_NEWLINE) == 0);
+        assert_se(write_string_file("/proc/version", buf2, WRITE_STRING_FILE_VERIFY_ON_FAILURE|WRITE_STRING_FILE_AVOID_NEWLINE) == 0);
 }
 
 static void test_load_env_file_pairs(void) {
@@ -630,8 +652,7 @@ static void test_tempfn(void) {
 static const char chars[] =
         "Aąę„”\n루\377";
 
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wtype-limits"
+DISABLE_WARNING_TYPE_LIMITS;
 
 static void test_fgetc(void) {
         _cleanup_fclose_ FILE *f = NULL;
@@ -662,7 +683,7 @@ static void test_fgetc(void) {
         assert_se(safe_fgetc(f, &c) == 0);
 }
 
-#pragma GCC diagnostic pop
+REENABLE_WARNING;
 
 static const char buffer[] =
         "Some test data\n"
@@ -757,7 +778,7 @@ static void test_read_line3(void) {
         _cleanup_free_ char *line = NULL;
         int r;
 
-        f = fopen("/proc/cmdline", "re");
+        f = fopen("/proc/uptime", "re");
         if (!f && IN_SET(errno, ENOENT, EPERM))
                 return;
         assert_se(f);
@@ -840,6 +861,109 @@ static void test_read_nul_string(void) {
         assert_se(read_nul_string(f, LONG_LINE_MAX, &s) == 0 && streq_ptr(s, ""));
 }
 
+static void test_read_full_file_socket(void) {
+        _cleanup_(rm_rf_physical_and_freep) char *z = NULL;
+        _cleanup_close_ int listener = -1;
+        _cleanup_free_ char *data = NULL, *clientname = NULL;
+        union sockaddr_union sa;
+        const char *j;
+        size_t size;
+        pid_t pid;
+        int r;
+
+        log_info("/* %s */", __func__);
+
+        listener = socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC, 0);
+        assert_se(listener >= 0);
+
+        assert_se(mkdtemp_malloc(NULL, &z) >= 0);
+        j = strjoina(z, "/socket");
+
+        assert_se(sockaddr_un_set_path(&sa.un, j) >= 0);
+
+        assert_se(bind(listener, &sa.sa, SOCKADDR_UN_LEN(sa.un)) >= 0);
+        assert_se(listen(listener, 1) >= 0);
+
+        /* Bind the *client* socket to some randomized name, to verify that this works correctly. */
+        assert_se(asprintf(&clientname, "@%" PRIx64 "/test-bindname", random_u64()) >= 0);
+
+        r = safe_fork("(server)", FORK_DEATHSIG|FORK_LOG, &pid);
+        assert_se(r >= 0);
+        if (r == 0) {
+                union sockaddr_union peer = {};
+                socklen_t peerlen = sizeof(peer);
+                _cleanup_close_ int rfd = -1;
+                /* child */
+
+                rfd = accept4(listener, NULL, 0, SOCK_CLOEXEC);
+                assert_se(rfd >= 0);
+
+                assert_se(getpeername(rfd, &peer.sa, &peerlen) >= 0);
+
+                assert_se(peer.un.sun_family == AF_UNIX);
+                assert_se(peerlen > offsetof(struct sockaddr_un, sun_path));
+                assert_se(peer.un.sun_path[0] == 0);
+                assert_se(streq(peer.un.sun_path + 1, clientname + 1));
+
+#define TEST_STR "This is a test\nreally."
+
+                assert_se(write(rfd, TEST_STR, strlen(TEST_STR)) == strlen(TEST_STR));
+                _exit(EXIT_SUCCESS);
+        }
+
+        assert_se(read_full_file_full(AT_FDCWD, j, UINT64_MAX, SIZE_MAX, 0, NULL, &data, &size) == -ENXIO);
+        assert_se(read_full_file_full(AT_FDCWD, j, UINT64_MAX, SIZE_MAX, READ_FULL_FILE_CONNECT_SOCKET, clientname, &data, &size) >= 0);
+        assert_se(size == strlen(TEST_STR));
+        assert_se(streq(data, TEST_STR));
+
+        assert_se(wait_for_terminate_and_check("(server)", pid, WAIT_LOG) >= 0);
+#undef TEST_STR
+}
+
+static void test_read_full_file_offset_size(void) {
+        _cleanup_fclose_ FILE *f = NULL;
+        _cleanup_(unlink_and_freep) char *fn = NULL;
+        _cleanup_free_ char *rbuf = NULL;
+        size_t rbuf_size;
+        uint8_t buf[4711];
+
+        random_bytes(buf, sizeof(buf));
+
+        assert_se(tempfn_random_child(NULL, NULL, &fn) >= 0);
+        assert_se(f = fopen(fn, "we"));
+        assert_se(fwrite(buf, 1, sizeof(buf), f) == sizeof(buf));
+        assert_se(fflush_and_check(f) >= 0);
+
+        assert_se(read_full_file_full(AT_FDCWD, fn, UINT64_MAX, SIZE_MAX, 0, NULL, &rbuf, &rbuf_size) >= 0);
+        assert_se(rbuf_size == sizeof(buf));
+        assert_se(memcmp(buf, rbuf, rbuf_size) == 0);
+        rbuf = mfree(rbuf);
+
+        assert_se(read_full_file_full(AT_FDCWD, fn, UINT64_MAX, 128, 0, NULL, &rbuf, &rbuf_size) >= 0);
+        assert_se(rbuf_size == 128);
+        assert_se(memcmp(buf, rbuf, rbuf_size) == 0);
+        rbuf = mfree(rbuf);
+
+        assert_se(read_full_file_full(AT_FDCWD, fn, 1234, SIZE_MAX, 0, NULL, &rbuf, &rbuf_size) >= 0);
+        assert_se(rbuf_size == sizeof(buf) - 1234);
+        assert_se(memcmp(buf + 1234, rbuf, rbuf_size) == 0);
+        rbuf = mfree(rbuf);
+
+        assert_se(read_full_file_full(AT_FDCWD, fn, 2345, 777, 0, NULL, &rbuf, &rbuf_size) >= 0);
+        assert_se(rbuf_size == 777);
+        assert_se(memcmp(buf + 2345, rbuf, rbuf_size) == 0);
+        rbuf = mfree(rbuf);
+
+        assert_se(read_full_file_full(AT_FDCWD, fn, 4700, 20, 0, NULL, &rbuf, &rbuf_size) >= 0);
+        assert_se(rbuf_size == 11);
+        assert_se(memcmp(buf + 4700, rbuf, rbuf_size) == 0);
+        rbuf = mfree(rbuf);
+
+        assert_se(read_full_file_full(AT_FDCWD, fn, 10000, 99, 0, NULL, &rbuf, &rbuf_size) >= 0);
+        assert_se(rbuf_size == 0);
+        rbuf = mfree(rbuf);
+}
+
 int main(int argc, char *argv[]) {
         test_setup_logging(LOG_DEBUG);
 
@@ -865,6 +989,8 @@ int main(int argc, char *argv[]) {
         test_read_line3();
         test_read_line4();
         test_read_nul_string();
+        test_read_full_file_socket();
+        test_read_full_file_offset_size();
 
         return 0;
 }

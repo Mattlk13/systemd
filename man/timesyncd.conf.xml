@@ -1,7 +1,7 @@
 <?xml version='1.0'?> <!--*-nxml-*-->
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
   "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
-<!-- SPDX-License-Identifier: LGPL-2.1+ -->
+<!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="timesyncd.conf" conditional='ENABLE_TIMESYNCD'
     xmlns:xi="http://www.w3.org/2001/XInclude">
@@ -32,7 +32,7 @@
     <title>Description</title>
 
     <para>These configuration files control NTP network time synchronization. See
-    <citerefentry><refentrytitle>systemd.syntax</refentrytitle><manvolnum>5</manvolnum></citerefentry>
+    <citerefentry><refentrytitle>systemd.syntax</refentrytitle><manvolnum>7</manvolnum></citerefentry>
     for a general description of the syntax.</para>
   </refsect1>
 
@@ -41,7 +41,7 @@
   <refsect1>
     <title>Options</title>
 
-    <para>The following settings are configured in the <literal>[Time]</literal> section:</para>
+    <para>The following settings are configured in the [Time] section:</para>
 
     <variablelist class='network-directives'>
 
@@ -89,6 +89,12 @@
         <varname>PollIntervalMaxSec=</varname> must be larger than <varname>PollIntervalMinSec=</varname>.
         <varname>PollIntervalMinSec=</varname> defaults to 32 seconds, and
         <varname>PollIntervalMaxSec=</varname> defaults to 2048 seconds.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>ConnectionRetrySec=</varname></term>
+        <listitem><para>Specifies the delaying attempts to contact servers after network is online. Takes a time value (in seconds).
+        Defaults to 30 seconds and must not be smaller than 1 seconds.</para></listitem>
       </varlistentry>
 
     </variablelist>

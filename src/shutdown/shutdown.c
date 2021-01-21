@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 /***
   Copyright © 2010 ProFUSION embedded systems
 ***/
@@ -16,6 +16,7 @@
 
 #include "alloc-util.h"
 #include "async.h"
+#include "binfmt-util.h"
 #include "cgroup-setup.h"
 #include "cgroup-util.h"
 #include "def.h"
@@ -51,6 +52,7 @@ static int parse_argv(int argc, char *argv[]) {
                 ARG_LOG_TARGET,
                 ARG_LOG_COLOR,
                 ARG_LOG_LOCATION,
+                ARG_LOG_TIME,
                 ARG_EXIT_CODE,
                 ARG_TIMEOUT,
         };
@@ -60,6 +62,7 @@ static int parse_argv(int argc, char *argv[]) {
                 { "log-target",    required_argument, NULL, ARG_LOG_TARGET   },
                 { "log-color",     optional_argument, NULL, ARG_LOG_COLOR    },
                 { "log-location",  optional_argument, NULL, ARG_LOG_LOCATION },
+                { "log-time",      optional_argument, NULL, ARG_LOG_TIME     },
                 { "exit-code",     required_argument, NULL, ARG_EXIT_CODE    },
                 { "timeout",       required_argument, NULL, ARG_TIMEOUT      },
                 {}
@@ -107,6 +110,17 @@ static int parse_argv(int argc, char *argv[]) {
                                         log_error_errno(r, "Failed to parse log location setting %s, ignoring: %m", optarg);
                         } else
                                 log_show_location(true);
+
+                        break;
+
+                case ARG_LOG_TIME:
+
+                        if (optarg) {
+                                r = log_show_time_from_string(optarg);
+                                if (r < 0)
+                                        log_error_errno(r, "Failed to parse log time setting %s, ignoring: %m", optarg);
+                        } else
+                                log_show_time(true);
 
                         break;
 
@@ -218,8 +232,8 @@ static void sync_with_progress(void) {
 
         BLOCK_SIGNALS(SIGCHLD);
 
-        /* Due to the possibility of the sync operation hanging, we fork a child process and monitor the progress. If
-         * the timeout lapses, the assumption is that that particular sync stalled. */
+        /* Due to the possibility of the sync operation hanging, we fork a child process and monitor
+         * the progress. If the timeout lapses, the assumption is that the particular sync stalled. */
 
         r = asynchronous_sync(&pid);
         if (r < 0) {
@@ -294,7 +308,7 @@ static void bump_sysctl_printk_log_level(int min_level) {
 }
 
 int main(int argc, char *argv[]) {
-        bool need_umount, need_swapoff, need_loop_detach, need_dm_detach, in_container, use_watchdog = false, can_initrd;
+        bool need_umount, need_swapoff, need_loop_detach, need_dm_detach, need_md_detach, in_container, use_watchdog = false, can_initrd;
         _cleanup_free_ char *cgroup = NULL;
         char *arguments[3], *watchdog_device;
         int cmd, r, umount_log_level = LOG_INFO;
@@ -373,6 +387,7 @@ int main(int argc, char *argv[]) {
                 sync_with_progress();
 
         disable_coredumps();
+        disable_binfmt();
 
         log_info("Sending SIGTERM to remaining processes...");
         broadcast_signal(SIGTERM, true, true, arg_timeout);
@@ -384,6 +399,7 @@ int main(int argc, char *argv[]) {
         need_swapoff = !in_container;
         need_loop_detach = !in_container;
         need_dm_detach = !in_container;
+        need_md_detach = !in_container;
         can_initrd = !in_container && !in_initrd() && access("/run/initramfs/shutdown", X_OK) == 0;
 
         /* Unmount all mountpoints, swaps, and loopback devices */
@@ -436,6 +452,18 @@ int main(int argc, char *argv[]) {
                                 log_error_errno(r, "Failed to detach loop devices: %m");
                 }
 
+                if (need_md_detach) {
+                        log_info("Stopping MD devices.");
+                        r = md_detach_all(&changed, umount_log_level);
+                        if (r == 0) {
+                                need_md_detach = false;
+                                log_info("All MD devices stopped.");
+                        } else if (r > 0)
+                                log_info("Not all MD devices stopped, %d left.", r);
+                        else
+                                log_error_errno(r, "Failed to stop MD devices: %m");
+                }
+
                 if (need_dm_detach) {
                         log_info("Detaching DM devices.");
                         r = dm_detach_all(&changed, umount_log_level);
@@ -448,8 +476,9 @@ int main(int argc, char *argv[]) {
                                 log_error_errno(r, "Failed to detach DM devices: %m");
                 }
 
-                if (!need_umount && !need_swapoff && !need_loop_detach && !need_dm_detach) {
-                        log_info("All filesystems, swaps, loop devices and DM devices detached.");
+                if (!need_umount && !need_swapoff && !need_loop_detach && !need_dm_detach
+                            && !need_md_detach) {
+                        log_info("All filesystems, swaps, loop devices, MD devices and DM devices detached.");
                         /* Yay, done */
                         break;
                 }
@@ -467,19 +496,21 @@ int main(int argc, char *argv[]) {
                 /* If in this iteration we didn't manage to
                  * unmount/deactivate anything, we simply give up */
                 if (!changed) {
-                        log_info("Cannot finalize remaining%s%s%s%s continuing.",
+                        log_info("Cannot finalize remaining%s%s%s%s%s continuing.",
                                  need_umount ? " file systems," : "",
                                  need_swapoff ? " swap devices," : "",
                                  need_loop_detach ? " loop devices," : "",
-                                 need_dm_detach ? " DM devices," : "");
+                                 need_dm_detach ? " DM devices," : "",
+                                 need_md_detach ? " MD devices," : "");
                         break;
                 }
 
-                log_debug("Couldn't finalize remaining %s%s%s%s trying again.",
+                log_debug("Couldn't finalize remaining %s%s%s%s%s trying again.",
                           need_umount ? " file systems," : "",
                           need_swapoff ? " swap devices," : "",
                           need_loop_detach ? " loop devices," : "",
-                          need_dm_detach ? " DM devices," : "");
+                          need_dm_detach ? " DM devices," : "",
+                          need_md_detach ? " MD devices," : "");
         }
 
         /* We're done with the watchdog. */
@@ -509,12 +540,13 @@ int main(int argc, char *argv[]) {
                         log_error_errno(r, "Failed to switch root to \"/run/initramfs\": %m");
         }
 
-        if (need_umount || need_swapoff || need_loop_detach || need_dm_detach)
-                log_error("Failed to finalize %s%s%s%s ignoring",
+        if (need_umount || need_swapoff || need_loop_detach || need_dm_detach || need_md_detach)
+                log_error("Failed to finalize%s%s%s%s%s ignoring.",
                           need_umount ? " file systems," : "",
                           need_swapoff ? " swap devices," : "",
                           need_loop_detach ? " loop devices," : "",
-                          need_dm_detach ? " DM devices," : "");
+                          need_dm_detach ? " DM devices," : "",
+                          need_md_detach ? " MD devices," : "");
 
         /* The kernel will automatically flush ATA disks and suchlike on reboot(), but the file systems need to be
          * sync'ed explicitly in advance. So let's do this here, but not needlessly slow down containers. Note that we
@@ -547,6 +579,9 @@ int main(int argc, char *argv[]) {
                                 /* Child */
 
                                 execv(args[0], (char * const *) args);
+
+                                /* execv failed (kexec binary missing?), so try simply reboot(RB_KEXEC) */
+                                (void) reboot(cmd);
                                 _exit(EXIT_FAILURE);
                         }
 

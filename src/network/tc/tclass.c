@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+
+/* SPDX-License-Identifier: LGPL-2.1-or-later
  * Copyright © 2019 VMware, Inc. */
 
 #include <linux/pkt_sched.h>
@@ -18,10 +18,11 @@
 const TClassVTable * const tclass_vtable[_TCLASS_KIND_MAX] = {
         [TCLASS_KIND_DRR] = &drr_tclass_vtable,
         [TCLASS_KIND_HTB] = &htb_tclass_vtable,
+        [TCLASS_KIND_QFQ] = &qfq_tclass_vtable,
 };
 
 static int tclass_new(TClassKind kind, TClass **ret) {
-        TClass *tclass;
+        _cleanup_(tclass_freep) TClass *tclass = NULL;
         int r;
 
         tclass = malloc0(tclass_vtable[kind]->object_size);
@@ -81,11 +82,7 @@ int tclass_new_static(TClassKind kind, Network *network, const char *filename, u
         tclass->network = network;
         tclass->section = TAKE_PTR(n);
 
-        r = ordered_hashmap_ensure_allocated(&network->tc_by_section, &network_config_hash_ops);
-        if (r < 0)
-                return r;
-
-        r = ordered_hashmap_put(network->tc_by_section, tclass->section, tclass);
+        r = ordered_hashmap_ensure_put(&network->tc_by_section, &network_config_hash_ops, tclass->section, tclass);
         if (r < 0)
                 return r;
 
@@ -213,22 +210,27 @@ int config_parse_tclass_parent(
         assert(data);
 
         r = tclass_new_static(ltype, network, filename, section_line, &tclass);
-        if (r < 0)
-                return r;
+        if (r == -ENOMEM)
+                return log_oom();
+        if (r < 0) {
+                log_syntax(unit, LOG_WARNING, filename, line, r,
+                           "Failed to create traffic control class, ignoring assignment: %m");
+                return 0;
+        }
 
         if (streq(rvalue, "root"))
                 tclass->parent = TC_H_ROOT;
         else {
                 r = parse_handle(rvalue, &tclass->parent);
                 if (r < 0) {
-                        log_syntax(unit, LOG_ERR, filename, line, r,
+                        log_syntax(unit, LOG_WARNING, filename, line, r,
                                    "Failed to parse 'Parent=', ignoring assignment: %s",
                                    rvalue);
                         return 0;
                 }
         }
 
-        tclass = NULL;
+        TAKE_PTR(tclass);
 
         return 0;
 }
@@ -255,24 +257,29 @@ int config_parse_tclass_classid(
         assert(data);
 
         r = tclass_new_static(ltype, network, filename, section_line, &tclass);
-        if (r < 0)
-                return r;
+        if (r == -ENOMEM)
+                return log_oom();
+        if (r < 0) {
+                log_syntax(unit, LOG_WARNING, filename, line, r,
+                           "Failed to create traffic control class, ignoring assignment: %m");
+                return 0;
+        }
 
         if (isempty(rvalue)) {
                 tclass->classid = TC_H_UNSPEC;
-                tclass = NULL;
+                TAKE_PTR(tclass);
                 return 0;
         }
 
         r = parse_handle(rvalue, &tclass->classid);
         if (r < 0) {
-                log_syntax(unit, LOG_ERR, filename, line, r,
+                log_syntax(unit, LOG_WARNING, filename, line, r,
                            "Failed to parse 'ClassId=', ignoring assignment: %s",
                            rvalue);
                 return 0;
         }
 
-        tclass = NULL;
+        TAKE_PTR(tclass);
 
         return 0;
 }

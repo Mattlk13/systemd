@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <getopt.h>
 #include <locale.h>
@@ -126,19 +126,20 @@ static int import_fs(int argc, char *argv[], void *userdata) {
         local = empty_or_dash_to_null(local);
 
         if (local) {
-                if (!machine_name_is_valid(local)) {
-                        log_error("Local image name '%s' is not valid.", local);
-                        return -EINVAL;
-                }
+                if (!hostname_is_valid(local, 0))
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                               "Local image name '%s' is not valid.",
+                                               local);
 
                 if (!arg_force) {
-                        r = image_find(IMAGE_MACHINE, local, NULL);
+                        r = image_find(IMAGE_MACHINE, local, NULL, NULL);
                         if (r < 0) {
                                 if (r != -ENOENT)
                                         return log_error_errno(r, "Failed to check whether image '%s' exists: %m", local);
                         } else {
-                                log_error("Image '%s' already exists.", local);
-                                return -EEXIST;
+                                return log_error_errno(SYNTHETIC_ERRNO(EEXIST),
+                                                       "Image '%s' already exists.",
+                                                       local);
                         }
                 }
         } else
@@ -172,8 +173,8 @@ static int import_fs(int argc, char *argv[], void *userdata) {
         progress.limit = (RateLimit) { 200*USEC_PER_MSEC, 1 };
 
         /* Hook into SIGINT/SIGTERM, so that we can cancel things then */
-        assert(sigaction(SIGINT, &sa, &old_sigint_sa) >= 0);
-        assert(sigaction(SIGTERM, &sa, &old_sigterm_sa) >= 0);
+        assert_se(sigaction(SIGINT, &sa, &old_sigint_sa) >= 0);
+        assert_se(sigaction(SIGTERM, &sa, &old_sigterm_sa) >= 0);
 
         r = btrfs_subvol_snapshot_fd_full(
                         fd,
@@ -220,8 +221,8 @@ static int import_fs(int argc, char *argv[], void *userdata) {
 
 finish:
         /* Put old signal handlers into place */
-        assert(sigaction(SIGINT, &old_sigint_sa, NULL) >= 0);
-        assert(sigaction(SIGTERM, &old_sigterm_sa, NULL) >= 0);
+        assert_se(sigaction(SIGINT, &old_sigint_sa, NULL) >= 0);
+        assert_se(sigaction(SIGTERM, &old_sigterm_sa, NULL) >= 0);
 
         return 0;
 }

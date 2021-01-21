@@ -1,9 +1,18 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
+
+#include "sd-event.h"
+#include "in-addr-util.h"
 
 typedef struct DnsTransaction DnsTransaction;
 typedef enum DnsTransactionState DnsTransactionState;
 typedef enum DnsTransactionSource DnsTransactionSource;
+
+#include "resolved-dns-answer.h"
+#include "resolved-dns-dnssec.h"
+#include "resolved-dns-packet.h"
+#include "resolved-dns-question.h"
+#include "resolved-dns-server.h"
 
 enum DnsTransactionState {
         DNS_TRANSACTION_NULL,
@@ -36,13 +45,6 @@ enum DnsTransactionSource {
         _DNS_TRANSACTION_SOURCE_MAX,
         _DNS_TRANSACTION_SOURCE_INVALID = -1
 };
-
-#include "resolved-dns-answer.h"
-#include "resolved-dns-packet.h"
-#include "resolved-dns-question.h"
-#include "resolved-dns-scope.h"
-#include "resolved-dns-server.h"
-#include "resolved-dns-stream.h"
 
 struct DnsTransaction {
         DnsScope *scope;
@@ -137,6 +139,8 @@ int dns_transaction_new(DnsTransaction **ret, DnsScope *s, DnsResourceKey *key);
 DnsTransaction* dns_transaction_free(DnsTransaction *t);
 
 bool dns_transaction_gc(DnsTransaction *t);
+DEFINE_TRIVIAL_CLEANUP_FUNC(DnsTransaction*, dns_transaction_gc);
+
 int dns_transaction_go(DnsTransaction *t);
 
 void dns_transaction_process_reply(DnsTransaction *t, DnsPacket *p);

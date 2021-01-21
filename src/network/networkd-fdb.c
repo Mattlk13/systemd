@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 /***
   Copyright © 2014 Intel Corporation. All rights reserved.
 ***/
@@ -8,27 +8,33 @@
 
 #include "alloc-util.h"
 #include "bridge.h"
-#include "conf-parser.h"
 #include "netlink-util.h"
 #include "networkd-fdb.h"
+#include "networkd-link.h"
 #include "networkd-manager.h"
+#include "networkd-network.h"
 #include "parse-util.h"
-#include "string-util.h"
 #include "string-table.h"
-#include "util.h"
 #include "vlan-util.h"
 #include "vxlan.h"
 
 #define STATIC_FDB_ENTRIES_PER_NETWORK_MAX 1024U
 
-static const char* const fdb_ntf_flags_table[_NEIGHBOR_CACHE_ENTRY_FLAGS_MAX] = {
-        [NEIGHBOR_CACHE_ENTRY_FLAGS_USE] = "use",
-        [NEIGHBOR_CACHE_ENTRY_FLAGS_SELF] = "self",
-        [NEIGHBOR_CACHE_ENTRY_FLAGS_MASTER] = "master",
-        [NEIGHBOR_CACHE_ENTRY_FLAGS_ROUTER] = "router",
-};
+/* remove and FDB entry. */
+FdbEntry *fdb_entry_free(FdbEntry *fdb_entry) {
+        if (!fdb_entry)
+                return NULL;
 
-DEFINE_STRING_TABLE_LOOKUP(fdb_ntf_flags, NeighborCacheEntryFlags);
+        if (fdb_entry->network) {
+                assert(fdb_entry->section);
+                hashmap_remove(fdb_entry->network->fdb_entries_by_section, fdb_entry->section);
+        }
+
+        network_config_section_free(fdb_entry->section);
+        return mfree(fdb_entry);
+}
+
+DEFINE_NETWORK_SECTION_FUNCTIONS(FdbEntry, fdb_entry_free);
 
 /* create a new FDB entry or get an existing one. */
 static int fdb_entry_new_static(
@@ -43,23 +49,21 @@ static int fdb_entry_new_static(
 
         assert(network);
         assert(ret);
-        assert(!!filename == (section_line > 0));
+        assert(filename);
+        assert(section_line > 0);
+
+        r = network_config_section_new(filename, section_line, &n);
+        if (r < 0)
+                return r;
 
         /* search entry in hashmap first. */
-        if (filename) {
-                r = network_config_section_new(filename, section_line, &n);
-                if (r < 0)
-                        return r;
-
-                fdb_entry = hashmap_get(network->fdb_entries_by_section, n);
-                if (fdb_entry) {
-                        *ret = TAKE_PTR(fdb_entry);
-
-                        return 0;
-                }
+        fdb_entry = hashmap_get(network->fdb_entries_by_section, n);
+        if (fdb_entry) {
+                *ret = TAKE_PTR(fdb_entry);
+                return 0;
         }
 
-        if (network->n_static_fdb_entries >= STATIC_FDB_ENTRIES_PER_NETWORK_MAX)
+        if (hashmap_size(network->fdb_entries_by_section) >= STATIC_FDB_ENTRIES_PER_NETWORK_MAX)
                 return -E2BIG;
 
         /* allocate space for and FDB entry. */
@@ -70,24 +74,14 @@ static int fdb_entry_new_static(
         /* init FDB structure. */
         *fdb_entry = (FdbEntry) {
                 .network = network,
+                .section = TAKE_PTR(n),
                 .vni = VXLAN_VID_MAX + 1,
                 .fdb_ntf_flags = NEIGHBOR_CACHE_ENTRY_FLAGS_SELF,
         };
 
-        LIST_PREPEND(static_fdb_entries, network->static_fdb_entries, fdb_entry);
-        network->n_static_fdb_entries++;
-
-        if (filename) {
-                fdb_entry->section = TAKE_PTR(n);
-
-                r = hashmap_ensure_allocated(&network->fdb_entries_by_section, &network_config_hash_ops);
-                if (r < 0)
-                        return r;
-
-                r = hashmap_put(network->fdb_entries_by_section, fdb_entry->section, fdb_entry);
-                if (r < 0)
-                        return r;
-        }
+        r = hashmap_ensure_put(&network->fdb_entries_by_section, &network_config_hash_ops, fdb_entry->section, fdb_entry);
+        if (r < 0)
+                return r;
 
         /* return allocated FDB structure. */
         *ret = TAKE_PTR(fdb_entry);
@@ -114,7 +108,7 @@ static int set_fdb_handler(sd_netlink *rtnl, sd_netlink_message *m, Link *link) 
 }
 
 /* send a request to the kernel to add a FDB entry in its static MAC table. */
-int fdb_entry_configure(Link *link, FdbEntry *fdb_entry) {
+static int fdb_entry_configure(Link *link, FdbEntry *fdb_entry) {
         _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *req = NULL;
         int r;
 
@@ -124,7 +118,7 @@ int fdb_entry_configure(Link *link, FdbEntry *fdb_entry) {
         assert(fdb_entry);
 
         /* create new RTM message */
-        r = sd_rtnl_message_new_neigh(link->manager->rtnl, &req, RTM_NEWNEIGH, link->ifindex, PF_BRIDGE);
+        r = sd_rtnl_message_new_neigh(link->manager->rtnl, &req, RTM_NEWNEIGH, link->ifindex, AF_BRIDGE);
         if (r < 0)
                 return log_link_error_errno(link, r, "Could not create RTM_NEWNEIGH message: %m");
 
@@ -171,22 +165,30 @@ int fdb_entry_configure(Link *link, FdbEntry *fdb_entry) {
         return 1;
 }
 
-/* remove and FDB entry. */
-void fdb_entry_free(FdbEntry *fdb_entry) {
-        if (!fdb_entry)
-                return;
+int link_set_bridge_fdb(Link *link) {
+        FdbEntry *fdb_entry;
+        int r;
 
-        if (fdb_entry->network) {
-                LIST_REMOVE(static_fdb_entries, fdb_entry->network->static_fdb_entries, fdb_entry);
-                assert(fdb_entry->network->n_static_fdb_entries > 0);
-                fdb_entry->network->n_static_fdb_entries--;
+        assert(link);
+        assert(link->network);
 
-                if (fdb_entry->section)
-                        hashmap_remove(fdb_entry->network->fdb_entries_by_section, fdb_entry->section);
+        HASHMAP_FOREACH(fdb_entry, link->network->fdb_entries_by_section) {
+                r = fdb_entry_configure(link, fdb_entry);
+                if (r < 0)
+                        return log_link_error_errno(link, r, "Failed to add MAC entry to static MAC table: %m");
         }
 
-        network_config_section_free(fdb_entry->section);
-        free(fdb_entry);
+        return 0;
+}
+
+void network_drop_invalid_fdb_entries(Network *network) {
+        FdbEntry *fdb_entry;
+
+        assert(network);
+
+        HASHMAP_FOREACH(fdb_entry, network->fdb_entries_by_section)
+                if (section_is_invalid(fdb_entry->section))
+                        fdb_entry_free(fdb_entry);
 }
 
 /* parse the HW address from config files. */
@@ -218,7 +220,7 @@ int config_parse_fdb_hwaddr(
 
         r = ether_addr_from_string(rvalue, &fdb_entry->mac_addr);
         if (r < 0) {
-                log_syntax(unit, LOG_ERR, filename, line, r, "Not a valid MAC address, ignoring assignment: %s", rvalue);
+                log_syntax(unit, LOG_WARNING, filename, line, r, "Not a valid MAC address, ignoring assignment: %s", rvalue);
                 return 0;
         }
 
@@ -292,10 +294,12 @@ int config_parse_fdb_destination(
                 return log_oom();
 
         r = in_addr_from_string_auto(rvalue, &fdb_entry->family, &fdb_entry->destination_addr);
-        if (r < 0)
-                return log_syntax(unit, LOG_ERR, filename, line, r,
-                                  "FDB destination IP address is invalid, ignoring assignment: %s",
-                                  rvalue);
+        if (r < 0) {
+                log_syntax(unit, LOG_WARNING, filename, line, r,
+                           "FDB destination IP address is invalid, ignoring assignment: %s",
+                           rvalue);
+                return 0;
+        }
 
         fdb_entry = NULL;
 
@@ -331,14 +335,14 @@ int config_parse_fdb_vxlan_vni(
 
         r = safe_atou32(rvalue, &vni);
         if (r < 0) {
-                log_syntax(unit, LOG_ERR, filename, line, r,
+                log_syntax(unit, LOG_WARNING, filename, line, r,
                            "Failed to parse VXLAN Network Identifier (VNI), ignoring assignment: %s",
                            rvalue);
                 return 0;
         }
 
         if (vni > VXLAN_VID_MAX) {
-                log_syntax(unit, LOG_ERR, filename, line, 0,
+                log_syntax(unit, LOG_WARNING, filename, line, 0,
                            "FDB invalid VXLAN Network Identifier (VNI), ignoring assignment: %s",
                            rvalue);
                 return 0;
@@ -349,6 +353,15 @@ int config_parse_fdb_vxlan_vni(
 
         return 0;
 }
+
+static const char* const fdb_ntf_flags_table[_NEIGHBOR_CACHE_ENTRY_FLAGS_MAX] = {
+        [NEIGHBOR_CACHE_ENTRY_FLAGS_USE] = "use",
+        [NEIGHBOR_CACHE_ENTRY_FLAGS_SELF] = "self",
+        [NEIGHBOR_CACHE_ENTRY_FLAGS_MASTER] = "master",
+        [NEIGHBOR_CACHE_ENTRY_FLAGS_ROUTER] = "router",
+};
+
+DEFINE_PRIVATE_STRING_TABLE_LOOKUP_FROM_STRING(fdb_ntf_flags, NeighborCacheEntryFlags);
 
 int config_parse_fdb_ntf_flags(
                 const char *unit,
@@ -379,7 +392,7 @@ int config_parse_fdb_ntf_flags(
 
         f = fdb_ntf_flags_from_string(rvalue);
         if (f < 0) {
-                log_syntax(unit, LOG_ERR, filename, line, 0,
+                log_syntax(unit, LOG_WARNING, filename, line, SYNTHETIC_ERRNO(EINVAL),
                            "FDB failed to parse AssociatedWith=, ignoring assignment: %s",
                            rvalue);
                 return 0;

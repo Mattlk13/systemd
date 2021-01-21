@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
 #include <limits.h>
@@ -16,13 +16,12 @@
 #include "strv.h"
 #include "utf8.h"
 
-#define VALID_CHARS_ENV_NAME                    \
+/* We follow bash for the character set. Different shells have different rules. */
+#define VALID_BASH_ENV_NAME_CHARS               \
         DIGITS LETTERS                          \
         "_"
 
 static bool env_name_is_valid_n(const char *e, size_t n) {
-        const char *p;
-
         if (!e)
                 return false;
 
@@ -40,18 +39,15 @@ static bool env_name_is_valid_n(const char *e, size_t n) {
         if (n > (size_t) sysconf(_SC_ARG_MAX) - 2)
                 return false;
 
-        for (p = e; p < e + n; p++)
-                if (!strchr(VALID_CHARS_ENV_NAME, *p))
+        for (const char *p = e; p < e + n; p++)
+                if (!strchr(VALID_BASH_ENV_NAME_CHARS, *p))
                         return false;
 
         return true;
 }
 
 bool env_name_is_valid(const char *e) {
-        if (!e)
-                return false;
-
-        return env_name_is_valid_n(e, strlen(e));
+        return env_name_is_valid_n(e, strlen_ptr(e));
 }
 
 bool env_value_is_valid(const char *e) {
@@ -61,16 +57,13 @@ bool env_value_is_valid(const char *e) {
         if (!utf8_is_valid(e))
                 return false;
 
-        /* bash allows tabs and newlines in environment variables, and so
-         * should we */
-        if (string_has_cc(e, "\t\n"))
-                return false;
+        /* Note that variable *values* may contain control characters, in particular NL, TAB, BS, DEL, ESC…
+         * When printing those variables with show-environment, we'll escape them. Make sure to print
+         * environment variables carefully! */
 
-        /* POSIX says the overall size of the environment block cannot
-         * be > ARG_MAX, an individual assignment hence cannot be
-         * either. Discounting the shortest possible variable name of
-         * length 1, the equal sign and trailing NUL this hence leaves
-         * ARG_MAX-3 as longest possible variable value. */
+        /* POSIX says the overall size of the environment block cannot be > ARG_MAX, an individual assignment
+         * hence cannot be either. Discounting the shortest possible variable name of length 1, the equal
+         * sign and trailing NUL this hence leaves ARG_MAX-3 as longest possible variable value. */
         if (strlen(e) > sc_arg_max() - 3)
                 return false;
 
@@ -90,10 +83,8 @@ bool env_assignment_is_valid(const char *e) {
         if (!env_value_is_valid(eq + 1))
                 return false;
 
-        /* POSIX says the overall size of the environment block cannot
-         * be > ARG_MAX, hence the individual variable assignments
-         * cannot be either, but let's leave room for one trailing NUL
-         * byte. */
+        /* POSIX says the overall size of the environment block cannot be > ARG_MAX, hence the individual
+         * variable assignments cannot be either, but let's leave room for one trailing NUL byte. */
         if (strlen(e) > sc_arg_max() - 1)
                 return false;
 
@@ -191,14 +182,14 @@ static int env_append(char **r, char ***k, char **a) {
 
 char **strv_env_merge(size_t n_lists, ...) {
         _cleanup_strv_free_ char **ret = NULL;
-        size_t n = 0, i;
+        size_t n = 0;
         char **l, **k;
         va_list ap;
 
         /* Merges an arbitrary number of environment sets */
 
         va_start(ap, n_lists);
-        for (i = 0; i < n_lists; i++) {
+        for (size_t i = 0; i < n_lists; i++) {
                 l = va_arg(ap, char**);
                 n += strv_length(l);
         }
@@ -212,7 +203,7 @@ char **strv_env_merge(size_t n_lists, ...) {
         k = ret;
 
         va_start(ap, n_lists);
-        for (i = 0; i < n_lists; i++) {
+        for (size_t i = 0; i < n_lists; i++) {
                 l = va_arg(ap, char**);
                 if (env_append(ret, &k, l) < 0) {
                         va_end(ap);
@@ -278,10 +269,8 @@ char **strv_env_delete(char **x, size_t n_lists, ...) {
                 return NULL;
 
         STRV_FOREACH(k, x) {
-                size_t v;
-
                 va_start(ap, n_lists);
-                for (v = 0; v < n_lists; v++) {
+                for (size_t v = 0; v < n_lists; v++) {
                         char **l, **j;
 
                         l = va_arg(ap, char**);
@@ -312,7 +301,6 @@ char **strv_env_delete(char **x, size_t n_lists, ...) {
 }
 
 char **strv_env_unset(char **l, const char *p) {
-
         char **f, **t;
 
         if (!l)
@@ -546,7 +534,7 @@ char *replace_env_n(const char *format, size_t n, char **env, unsigned flags) {
                                 word = e+1;
                                 state = WORD;
 
-                        } else if (flags & REPLACE_ENV_ALLOW_BRACELESS && strchr(VALID_CHARS_ENV_NAME, *e)) {
+                        } else if (flags & REPLACE_ENV_ALLOW_BRACELESS && strchr(VALID_BASH_ENV_NAME_CHARS, *e)) {
                                 k = strnappend(r, word, e-word-1);
                                 if (!k)
                                         return NULL;
@@ -636,7 +624,7 @@ char *replace_env_n(const char *format, size_t n, char **env, unsigned flags) {
                 case VARIABLE_RAW:
                         assert(flags & REPLACE_ENV_ALLOW_BRACELESS);
 
-                        if (!strchr(VALID_CHARS_ENV_NAME, *e)) {
+                        if (!strchr(VALID_BASH_ENV_NAME_CHARS, *e)) {
                                 const char *t;
 
                                 t = strv_env_get_n(env, word+1, e-word-1, flags);
@@ -687,7 +675,7 @@ char **replace_env_argv(char **argv, char **env) {
                         if (e) {
                                 int r;
 
-                                r = strv_split_extract(&m, e, WHITESPACE, EXTRACT_RELAX|EXTRACT_UNQUOTE);
+                                r = strv_split_full(&m, e, WHITESPACE, EXTRACT_RELAX|EXTRACT_UNQUOTE);
                                 if (r < 0) {
                                         ret[k] = NULL;
                                         strv_free(ret);
@@ -748,4 +736,16 @@ int getenv_bool_secure(const char *p) {
                 return -ENXIO;
 
         return parse_boolean(e);
+}
+
+int set_unset_env(const char *name, const char *value, bool overwrite) {
+        int r;
+
+        if (value)
+                r = setenv(name, value, overwrite);
+        else
+                r = unsetenv(name);
+        if (r < 0)
+                return -errno;
+        return 0;
 }

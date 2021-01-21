@@ -35,6 +35,7 @@ LICENSE:
 REQUIREMENTS:
         Linux kernel >= 3.13
         Linux kernel >= 4.2 for unified cgroup hierarchy support
+        Linux kernel >= 5.4 for signed Verity images support
 
         Kernel Config Options:
           CONFIG_DEVTMPFS
@@ -102,6 +103,9 @@ REQUIREMENTS:
           CONFIG_EFIVAR_FS
           CONFIG_EFI_PARTITION
 
+        Required for signed Verity images support:
+          CONFIG_DM_VERITY_VERIFY_ROOTHASH_SIG
+
         We recommend to turn off Real-Time group scheduling in the
         kernel when using systemd. RT group scheduling effectively
         makes RT scheduling unavailable for most userspace, since it
@@ -144,12 +148,14 @@ REQUIREMENTS:
         libblkid >= 2.24 (from util-linux) (optional)
         libkmod >= 15 (optional)
         PAM >= 1.1.2 (optional)
-        libcryptsetup (optional)
+        libcryptsetup (optional), >= 2.3.0 required for signed Verity images support
         libaudit (optional)
         libacl (optional)
+        libfdisk >= 2.33 (from util-linux) (optional)
         libselinux (optional)
         liblzma (optional)
         liblz4 >= 1.3.0 / 130 (optional)
+        libzstd >= 1.4.0 (optional)
         libgcrypt (optional)
         libqrencode (optional)
         libmicrohttpd (optional)
@@ -181,20 +187,20 @@ REQUIREMENTS:
         polkit (optional)
 
         To build in directory build/:
-          meson build/ && ninja -C build
+          meson setup build/ && meson compile -C build/
 
         Any configuration options can be specified as -Darg=value... arguments
         to meson. After the build directory is initially configured, meson will
         refuse to run again, and options must be changed with:
-          mesonconf -Darg=value...
-        mesonconf without any arguments will print out available options and
+          meson configure -Darg=value build/
+        meson configure without any arguments will print out available options and
         their current values.
 
         Useful commands:
-          ninja -v some/target
-          ninja test
-          sudo ninja install
-          DESTDIR=... ninja install
+          meson compile -v -C build/ some/target
+          meson test -C build/
+          sudo meson install -C build/
+          DESTDIR=... meson install -C build/
 
         A tarball can be created with:
           git archive --format=tar --prefix=systemd-222/ v222 | xz > systemd-222.tar.xz
@@ -257,19 +263,19 @@ USERS AND GROUPS:
 NSS:
         systemd ships with four glibc NSS modules:
 
-        nss-myhostname resolves the local hostname to locally
-        configured IP addresses, as well as "localhost" to
-        127.0.0.1/::1.
+        nss-myhostname resolves the local hostname to locally configured IP
+        addresses, as well as "localhost" to 127.0.0.1/::1.
 
-        nss-resolve enables DNS resolution via the systemd-resolved
-        DNS/LLMNR caching stub resolver "systemd-resolved".
+        nss-resolve enables DNS resolution via the systemd-resolved DNS/LLMNR
+        caching stub resolver "systemd-resolved".
 
         nss-mymachines enables resolution of all local containers registered
-        with machined to their respective IP addresses. It also maps UID/GIDs
-        ranges used by containers to useful names.
+        with machined to their respective IP addresses.
 
-        nss-systemd enables resolution of all dynamically allocated service
-        users. (See the DynamicUser= setting in unit files.)
+        nss-systemd enables resolution of users/group registered via the
+        User/Group Record Lookup API (https://systemd.io/USER_GROUP_API/),
+        including all dynamically allocated service users. (See the
+        DynamicUser= setting in unit files.)
 
         To make use of these NSS modules, please add them to the "hosts:",
         "passwd:" and "group:" lines in /etc/nsswitch.conf. The "resolve"
@@ -278,8 +284,8 @@ NSS:
 
         The four modules should be used in the following order:
 
-                passwd: compat mymachines systemd
-                group: compat mymachines systemd
+                passwd: compat systemd
+                group: compat systemd
                 hosts: files mymachines resolve [!UNAVAIL=return] dns myhostname
 
 SYSV INIT.D SCRIPTS:
@@ -319,14 +325,14 @@ WARNINGS:
         we don't execve() systemd-shutdown.
 
 STABLE BRANCHES AND BACKPORTS:
-       Stable branches with backported patches are available in the
-       systemd-stable repo at https://github.com/systemd/systemd-stable.
+        Stable branches with backported patches are available in the
+        systemd-stable repo at https://github.com/systemd/systemd-stable.
 
-       Stable branches are started for certain releases of systemd and named
-       after them, e.g. v238-stable. Stable branches are managed by
-       distribution maintainers on an as needed basis. See
-       https://www.freedesktop.org/wiki/Software/systemd/Backports/ for some
-       more information and examples.
+        Stable branches are started for certain releases of systemd and named
+        after them, e.g. v238-stable. Stable branches are managed by
+        distribution maintainers on an as needed basis. See
+        https://www.freedesktop.org/wiki/Software/systemd/Backports/ for some
+        more information and examples.
 
 ENGINEERING AND CONSULTING SERVICES:
         Kinvolk (https://kinvolk.io) offers professional engineering

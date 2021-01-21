@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
 
@@ -8,7 +8,7 @@ int module_load_and_warn(struct kmod_ctx *ctx, const char *module, bool verbose)
         const int probe_flags = KMOD_PROBE_APPLY_BLACKLIST;
         struct kmod_list *itr;
         _cleanup_(kmod_module_unref_listp) struct kmod_list *modlist = NULL;
-        int r = 0;
+        int r;
 
         /* verbose==true means we should log at non-debug level if we
          * fail to find or load the module. */
@@ -51,7 +51,7 @@ int module_load_and_warn(struct kmod_ctx *ctx, const char *module, bool verbose)
                                          "Inserted module '%s'", kmod_module_get_name(mod));
                         else if (err == KMOD_PROBE_APPLY_BLACKLIST)
                                 log_full(verbose ? LOG_INFO : LOG_DEBUG,
-                                         "Module '%s' is blacklisted", kmod_module_get_name(mod));
+                                         "Module '%s' is deny-listed", kmod_module_get_name(mod));
                         else {
                                 assert(err < 0);
 

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+
+/* SPDX-License-Identifier: LGPL-2.1-or-later
  * Copyright © 2019 VMware, Inc. */
 #pragma once
 
@@ -13,8 +13,10 @@ typedef enum QDiscKind {
         QDISC_KIND_CAKE,
         QDISC_KIND_CODEL,
         QDISC_KIND_DRR,
+        QDISC_KIND_ETS,
         QDISC_KIND_FQ,
         QDISC_KIND_FQ_CODEL,
+        QDISC_KIND_FQ_PIE,
         QDISC_KIND_GRED,
         QDISC_KIND_HHF,
         QDISC_KIND_HTB,
@@ -23,6 +25,7 @@ typedef enum QDiscKind {
         QDISC_KIND_PFIFO_FAST,
         QDISC_KIND_PFIFO_HEAD_DROP,
         QDISC_KIND_PIE,
+        QDISC_KIND_QFQ,
         QDISC_KIND_SFB,
         QDISC_KIND_SFQ,
         QDISC_KIND_TBF,
@@ -86,13 +89,16 @@ CONFIG_PARSER_PROTOTYPE(config_parse_qdisc_handle);
 
 #include "cake.h"
 #include "codel.h"
+#include "ets.h"
 #include "fifo.h"
 #include "fq-codel.h"
+#include "fq-pie.h"
 #include "fq.h"
 #include "gred.h"
 #include "hhf.h"
 #include "htb.h"
 #include "pie.h"
+#include "qfq.h"
 #include "netem.h"
 #include "drr.h"
 #include "sfb.h"

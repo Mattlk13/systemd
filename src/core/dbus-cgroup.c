@@ -1,13 +1,14 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <arpa/inet.h>
 
 #include "af-list.h"
 #include "alloc-util.h"
 #include "bpf-firewall.h"
-#include "bus-util.h"
+#include "bus-get-properties.h"
 #include "cgroup-util.h"
 #include "cgroup.h"
+#include "core-varlink.h"
 #include "dbus-cgroup.h"
 #include "dbus-util.h"
 #include "errno-util.h"
@@ -19,6 +20,7 @@
 BUS_DEFINE_PROPERTY_GET(bus_property_get_tasks_max, "t", TasksMax, tasks_max_resolve);
 
 static BUS_DEFINE_PROPERTY_GET_ENUM(property_get_cgroup_device_policy, cgroup_device_policy, CGroupDevicePolicy);
+static BUS_DEFINE_PROPERTY_GET_ENUM(property_get_managed_oom_mode, managed_oom_mode, ManagedOOMMode);
 
 static int property_get_cgroup_mask(
                 sd_bus *bus,
@@ -391,6 +393,9 @@ const sd_bus_vtable bus_cgroup_vtable[] = {
         SD_BUS_PROPERTY("IPIngressFilterPath", "as", NULL, offsetof(CGroupContext, ip_filters_ingress), 0),
         SD_BUS_PROPERTY("IPEgressFilterPath", "as", NULL, offsetof(CGroupContext, ip_filters_egress), 0),
         SD_BUS_PROPERTY("DisableControllers", "as", property_get_cgroup_mask, offsetof(CGroupContext, disable_controllers), 0),
+        SD_BUS_PROPERTY("ManagedOOMSwap", "s", property_get_managed_oom_mode, offsetof(CGroupContext, moom_swap), 0),
+        SD_BUS_PROPERTY("ManagedOOMMemoryPressure", "s", property_get_managed_oom_mode, offsetof(CGroupContext, moom_mem_pressure), 0),
+        SD_BUS_PROPERTY("ManagedOOMMemoryPressureLimitPercent", "s", bus_property_get_percent, offsetof(CGroupContext, moom_mem_pressure_limit), 0),
         SD_BUS_VTABLE_END
 };
 
@@ -707,8 +712,7 @@ static int bus_cgroup_set_boolean(
                 return 1;                                               \
         }
 
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wtype-limits"
+DISABLE_WARNING_TYPE_LIMITS;
 BUS_DEFINE_SET_CGROUP_WEIGHT(cpu_weight, CGROUP_MASK_CPU, CGROUP_WEIGHT_IS_OK, CGROUP_WEIGHT_INVALID);
 BUS_DEFINE_SET_CGROUP_WEIGHT(cpu_shares, CGROUP_MASK_CPU, CGROUP_CPU_SHARES_IS_OK, CGROUP_CPU_SHARES_INVALID);
 BUS_DEFINE_SET_CGROUP_WEIGHT(io_weight, CGROUP_MASK_IO, CGROUP_WEIGHT_IS_OK, CGROUP_WEIGHT_INVALID);
@@ -716,7 +720,7 @@ BUS_DEFINE_SET_CGROUP_WEIGHT(blockio_weight, CGROUP_MASK_BLKIO, CGROUP_BLKIO_WEI
 BUS_DEFINE_SET_CGROUP_LIMIT(memory, CGROUP_MASK_MEMORY, physical_memory_scale, 1);
 BUS_DEFINE_SET_CGROUP_LIMIT(memory_protection, CGROUP_MASK_MEMORY, physical_memory_scale, 0);
 BUS_DEFINE_SET_CGROUP_LIMIT(swap, CGROUP_MASK_MEMORY, physical_memory_scale, 0);
-#pragma GCC diagnostic pop
+REENABLE_WARNING;
 
 static int bus_cgroup_set_tasks_max(
                 Unit *u,
@@ -1501,9 +1505,9 @@ int bus_cgroup_set_property(
                                         LIST_PREPEND(device_allow, c->device_allow, a);
                                 }
 
-                                a->r = !!strchr(rwm, 'r');
-                                a->w = !!strchr(rwm, 'w');
-                                a->m = !!strchr(rwm, 'm');
+                                a->r = strchr(rwm, 'r');
+                                a->w = strchr(rwm, 'w');
+                                a->m = strchr(rwm, 'm');
                         }
 
                         n++;
@@ -1664,6 +1668,45 @@ int bus_cgroup_set_property(
 
                         unit_write_setting(u, flags, name, buf);
                 }
+
+                return 1;
+        }
+
+        if (STR_IN_SET(name, "ManagedOOMSwap", "ManagedOOMMemoryPressure")) {
+                ManagedOOMMode *cgroup_mode = streq(name, "ManagedOOMSwap") ? &c->moom_swap : &c->moom_mem_pressure;
+                ManagedOOMMode m;
+                const char *mode;
+
+                if (!UNIT_VTABLE(u)->can_set_managed_oom)
+                        return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Cannot set %s for this unit type", name);
+
+                r = sd_bus_message_read(message, "s", &mode);
+                if (r < 0)
+                        return r;
+
+                m = managed_oom_mode_from_string(mode);
+                if (m < 0)
+                        return -EINVAL;
+
+                if (!UNIT_WRITE_FLAGS_NOOP(flags)) {
+                        *cgroup_mode = m;
+                        unit_write_settingf(u, flags, name, "%s=%s", name, mode);
+                }
+
+                (void) manager_varlink_send_managed_oom_update(u);
+                return 1;
+        }
+
+        if (streq(name, "ManagedOOMMemoryPressureLimitPercent")) {
+                if (!UNIT_VTABLE(u)->can_set_managed_oom)
+                        return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Cannot set %s for this unit type", name);
+
+                r = bus_set_transient_percent(u, name, &c->moom_mem_pressure_limit, message, flags, error);
+                if (r < 0)
+                        return r;
+
+                if (c->moom_mem_pressure == MANAGED_OOM_KILL)
+                        (void) manager_varlink_send_managed_oom_update(u);
 
                 return 1;
         }

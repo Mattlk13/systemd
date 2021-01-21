@@ -1,6 +1,7 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <linux/if_infiniband.h>
+#include <net/ethernet.h>
 #include <net/if_arp.h>
 
 #include "sd-device.h"
@@ -8,14 +9,13 @@
 
 #include "dhcp-identifier.h"
 #include "dhcp6-protocol.h"
-#include "network-internal.h"
+#include "network-util.h"
 #include "siphash24.h"
 #include "sparse-endian.h"
 #include "stdio-util.h"
 #include "udev-util.h"
 #include "virt.h"
 
-#define SYSTEMD_PEN    43793
 #define HASH_KEY       SD_ID128_MAKE(80,11,8c,c2,fe,4a,03,ee,3e,d6,0c,6f,36,39,14,09)
 #define APPLICATION_ID SD_ID128_MAKE(a5,0a,d1,12,bf,60,45,77,a2,fb,74,1a,b1,95,5b,03)
 #define USEC_2000       ((usec_t) 946684800000000) /* 2000-01-01 00:00:00 UTC */
@@ -27,11 +27,10 @@ int dhcp_validate_duid_len(uint16_t duid_type, size_t duid_len, bool strict) {
         if (duid_len > MAX_DUID_LEN)
                 return -EINVAL;
 
-        if (!strict) {
+        if (!strict)
                 /* Strict validation is not requested. We only ensure that the
                  * DUID is not too long. */
                 return 0;
-        }
 
         switch (duid_type) {
         case DUID_TYPE_LLT:

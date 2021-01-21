@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
 
@@ -61,7 +61,7 @@ int namespace_flags_to_string(unsigned long flags, char **ret) {
                 if ((flags & namespace_flag_map[i].flag) != namespace_flag_map[i].flag)
                         continue;
 
-                if (!strextend_with_separator(&s, " ", namespace_flag_map[i].name, NULL))
+                if (!strextend_with_separator(&s, " ", namespace_flag_map[i].name))
                         return -ENOMEM;
         }
 

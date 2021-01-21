@@ -1,17 +1,8 @@
-# SPDX-License-Identifier: LGPL-2.1+
-
-libcore_shared_sources = '''
-        killall.c
-        killall.h
-        loopback-setup.c
-        loopback-setup.h
-        machine-id-setup.c
-        machine-id-setup.h
-        mount-setup.c
-        mount-setup.h
-'''.split()
+# SPDX-License-Identifier: LGPL-2.1-or-later
 
 libcore_sources = '''
+        apparmor-setup.c
+        apparmor-setup.h
         audit-fd.c
         audit-fd.h
         automount.c
@@ -72,8 +63,8 @@ libcore_sources = '''
         emergency-action.h
         execute.c
         execute.h
-        hostname-setup.c
-        hostname-setup.h
+        generator-setup.c
+        generator-setup.h
         ima-setup.c
         ima-setup.h
         ip-address-access.c
@@ -149,22 +140,12 @@ load_fragment_gperf_nulstr_c = custom_target(
         command : [awk, '-f', '@INPUT0@', '@INPUT1@'],
         capture : true)
 
-# A convenience library to share code with other binaries:
-# systemd-shutdown, systemd-remount-fs, systemd-machine-id-setup, …
-libcore_shared = static_library(
-        'core-shared',
-        libcore_shared_sources,
-        include_directories : includes,
-        dependencies : [versiondep,
-                        libmount])
-
 libcore = static_library(
         'core',
         libcore_sources,
         load_fragment_gperf_c,
         load_fragment_gperf_nulstr_c,
         include_directories : includes,
-        link_whole : libcore_shared,
         dependencies : [versiondep,
                         threads,
                         librt,
@@ -174,7 +155,10 @@ libcore = static_library(
                         libkmod,
                         libapparmor,
                         libselinux,
-                        libmount])
+                        libmount,
+                        libacl])
+
+core_includes = [includes, include_directories('.')]
 
 systemd_sources = files('main.c')
 
@@ -187,12 +171,14 @@ in_files = [['macros.systemd',   rpmmacrosdir],
 foreach item : in_files
         file = item[0]
         dir = item[1]
+        if install_sysconfdir_samples or dir != pkgsysconfdir
+                configure_file(
+                        input : file + '.in',
+                        output : file,
+                        configuration : substs,
+                        install_dir : dir == 'no' ? '' : dir)
+        endif
 
-        configure_file(
-                input : file + '.in',
-                output : file,
-                configuration : substs,
-                install_dir : dir == 'no' ? '' : dir)
 endforeach
 
 install_data('org.freedesktop.systemd1.conf',
@@ -212,6 +198,17 @@ meson.add_install_script('sh', '-c', mkdir_p.format(systemsleepdir))
 meson.add_install_script('sh', '-c', mkdir_p.format(systemgeneratordir))
 meson.add_install_script('sh', '-c', mkdir_p.format(usergeneratordir))
 
-meson.add_install_script('sh', '-c', mkdir_p.format(join_paths(pkgsysconfdir, 'system')))
-meson.add_install_script('sh', '-c', mkdir_p.format(join_paths(pkgsysconfdir, 'user')))
-meson.add_install_script('sh', '-c', mkdir_p.format(join_paths(sysconfdir, 'xdg/systemd')))
+if install_sysconfdir
+        meson.add_install_script('sh', '-c', mkdir_p.format(join_paths(pkgsysconfdir, 'system')))
+        meson.add_install_script('sh', '-c', mkdir_p.format(join_paths(pkgsysconfdir, 'user')))
+        meson.add_install_script('sh', '-c', mkdir_p.format(join_paths(sysconfdir, 'xdg/systemd')))
+endif
+
+############################################################
+
+fuzzers += [
+        [['src/core/fuzz-unit-file.c'],
+         [libcore,
+          libshared],
+         [libmount]],
+]

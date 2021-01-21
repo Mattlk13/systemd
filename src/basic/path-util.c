@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
 #include <limits.h>
@@ -14,6 +14,7 @@
 
 #include "alloc-util.h"
 #include "extract-word.h"
+#include "fd-util.h"
 #include "fs-util.h"
 #include "glob-util.h"
 #include "log.h"
@@ -26,14 +27,6 @@
 #include "strv.h"
 #include "time-util.h"
 #include "utf8.h"
-
-bool path_is_absolute(const char *p) {
-        return p[0] == '/';
-}
-
-bool is_path(const char *p) {
-        return !!strchr(p, '/');
-}
 
 int path_split_and_make_absolute(const char *p, char ***ret) {
         char **l;
@@ -557,7 +550,7 @@ char* path_join_internal(const char *first, ...) {
 
         sz = strlen_ptr(first);
         va_start(ap, first);
-        while ((p = va_arg(ap, char*)) != (const char*) -1)
+        while ((p = va_arg(ap, char*)) != POINTER_MAX)
                 if (!isempty(p))
                         sz += 1 + strlen(p);
         va_end(ap);
@@ -577,7 +570,7 @@ char* path_join_internal(const char *first, ...) {
         }
 
         va_start(ap, first);
-        while ((p = va_arg(ap, char*)) != (const char*) -1) {
+        while ((p = va_arg(ap, char*)) != POINTER_MAX) {
                 if (isempty(p))
                         continue;
 
@@ -592,37 +585,68 @@ char* path_join_internal(const char *first, ...) {
         return joined;
 }
 
-int find_binary(const char *name, char **ret) {
+static int check_x_access(const char *path, int *ret_fd) {
+        _cleanup_close_ int fd = -1;
+        int r;
+
+        /* We need to use O_PATH because there may be executables for which we have only exec
+         * permissions, but not read (usually suid executables). */
+        fd = open(path, O_PATH|O_CLOEXEC);
+        if (fd < 0)
+                return -errno;
+
+        r = fd_verify_regular(fd);
+        if (r < 0)
+                return r;
+
+        r = access_fd(fd, X_OK);
+        if (r < 0)
+                return r;
+
+        if (ret_fd)
+                *ret_fd = TAKE_FD(fd);
+
+        return 0;
+}
+
+int find_executable_full(const char *name, bool use_path_envvar, char **ret_filename, int *ret_fd) {
         int last_error, r;
-        const char *p;
+        const char *p = NULL;
 
         assert(name);
 
         if (is_path(name)) {
-                if (access(name, X_OK) < 0)
-                        return -errno;
+                _cleanup_close_ int fd = -1;
 
-                if (ret) {
-                        r = path_make_absolute_cwd(name, ret);
+                r = check_x_access(name, ret_fd ? &fd : NULL);
+                if (r < 0)
+                        return r;
+
+                if (ret_filename) {
+                        r = path_make_absolute_cwd(name, ret_filename);
                         if (r < 0)
                                 return r;
                 }
 
+                if (ret_fd)
+                        *ret_fd = TAKE_FD(fd);
+
                 return 0;
         }
 
-        /**
-         * Plain getenv, not secure_getenv, because we want
-         * to actually allow the user to pick the binary.
-         */
-        p = getenv("PATH");
+        if (use_path_envvar)
+                /* Plain getenv, not secure_getenv, because we want to actually allow the user to pick the
+                 * binary. */
+                p = getenv("PATH");
         if (!p)
                 p = DEFAULT_PATH;
 
         last_error = -ENOENT;
 
+        /* Resolve a single-component name to a full path */
         for (;;) {
                 _cleanup_free_ char *j = NULL, *element = NULL;
+                _cleanup_close_ int fd = -1;
 
                 r = extract_first_word(&p, &element, ":", EXTRACT_RELAX|EXTRACT_DONT_COALESCE_SEPARATORS);
                 if (r < 0)
@@ -637,20 +661,21 @@ int find_binary(const char *name, char **ret) {
                 if (!j)
                         return -ENOMEM;
 
-                if (access(j, X_OK) >= 0) {
-                        /* Found it! */
-
-                        if (ret) {
-                                *ret = path_simplify(j, false);
-                                j = NULL;
-                        }
-
-                        return 0;
+                r = check_x_access(j, ret_fd ? &fd : NULL);
+                if (r < 0) {
+                        /* PATH entries which we don't have access to are ignored, as per tradition. */
+                        if (r != -EACCES)
+                                last_error = r;
+                        continue;
                 }
 
-                /* PATH entries which we don't have access to are ignored, as per tradition. */
-                if (errno != EACCES)
-                        last_error = -errno;
+                /* Found it! */
+                if (ret_filename)
+                        *ret_filename = path_simplify(TAKE_PTR(j), false);
+                if (ret_fd)
+                        *ret_fd = TAKE_FD(fd);
+
+                return 0;
         }
 
         return last_error;
@@ -691,18 +716,17 @@ bool paths_check_timestamp(const char* const* paths, usec_t *timestamp, bool upd
         return changed;
 }
 
-static int binary_is_good(const char *binary) {
+static int executable_is_good(const char *executable) {
         _cleanup_free_ char *p = NULL, *d = NULL;
         int r;
 
-        r = find_binary(binary, &p);
+        r = find_executable(executable, &p);
         if (r == -ENOENT)
                 return 0;
         if (r < 0)
                 return r;
 
-        /* An fsck that is linked to /bin/true is a non-existent
-         * fsck */
+        /* An fsck that is linked to /bin/true is a non-existent fsck */
 
         r = readlink_malloc(p, &d);
         if (r == -EINVAL) /* not a symlink */
@@ -725,19 +749,7 @@ int fsck_exists(const char *fstype) {
                 return -EINVAL;
 
         checker = strjoina("fsck.", fstype);
-        return binary_is_good(checker);
-}
-
-int mkfs_exists(const char *fstype) {
-        const char *mkfs;
-
-        assert(fstype);
-
-        if (streq(fstype, "auto"))
-                return -EINVAL;
-
-        mkfs = strjoina("mkfs.", fstype);
-        return binary_is_good(mkfs);
+        return executable_is_good(checker);
 }
 
 int parse_path_argument_and_warn(const char *path, bool suppress_root, char **arg) {
@@ -1051,7 +1063,7 @@ int systemd_installation_has_version(const char *root, unsigned minimal_version)
                 if (!path)
                         return -ENOMEM;
 
-                r = glob_extend(&names, path);
+                r = glob_extend(&names, path, 0);
                 if (r == -ENOENT)
                         continue;
                 if (r < 0)
@@ -1140,4 +1152,10 @@ bool prefixed_path_strv_contains(char **l, const char *path) {
         }
 
         return false;
+}
+
+bool credential_name_valid(const char *s) {
+        /* We want that credential names are both valid in filenames (since that's our primary way to pass
+         * them around) and as fdnames (which is how we might want to pass them around eventually) */
+        return filename_is_valid(s) && fdname_is_valid(s);
 }

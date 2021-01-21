@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "alloc-util.h"
 #include "dns-domain.h"
@@ -6,6 +6,7 @@
 #include "resolved-dns-packet.h"
 #include "resolved-dns-zone.h"
 #include "resolved-dnssd.h"
+#include "resolved-manager.h"
 #include "string-util.h"
 
 /* Never allow more than 1K entries */
@@ -161,7 +162,7 @@ static int dns_zone_link_item(DnsZone *z, DnsZoneItem *i) {
 }
 
 static int dns_zone_item_probe_start(DnsZoneItem *i)  {
-        DnsTransaction *t;
+        _cleanup_(dns_transaction_gcp) DnsTransaction *t = NULL;
         int r;
 
         assert(i);
@@ -182,25 +183,20 @@ static int dns_zone_item_probe_start(DnsZoneItem *i)  {
                         return r;
         }
 
-        r = set_ensure_allocated(&t->notify_zone_items, NULL);
-        if (r < 0)
-                goto gc;
-
         r = set_ensure_allocated(&t->notify_zone_items_done, NULL);
         if (r < 0)
-                goto gc;
+                return r;
 
-        r = set_put(t->notify_zone_items, i);
+        r = set_ensure_put(&t->notify_zone_items, NULL, i);
         if (r < 0)
-                goto gc;
+                return r;
 
-        i->probe_transaction = t;
         t->probing = true;
+        i->probe_transaction = TAKE_PTR(t);
 
-        if (t->state == DNS_TRANSACTION_NULL) {
-
+        if (i->probe_transaction->state == DNS_TRANSACTION_NULL) {
                 i->block_ready++;
-                r = dns_transaction_go(t);
+                r = dns_transaction_go(i->probe_transaction);
                 i->block_ready--;
 
                 if (r < 0) {
@@ -211,10 +207,6 @@ static int dns_zone_item_probe_start(DnsZoneItem *i)  {
 
         dns_zone_item_notify(i);
         return 0;
-
-gc:
-        dns_transaction_gc(t);
-        return r;
 }
 
 int dns_zone_put(DnsZone *z, DnsScope *s, DnsResourceRecord *rr, bool probe) {
@@ -239,13 +231,15 @@ int dns_zone_put(DnsZone *z, DnsScope *s, DnsResourceRecord *rr, bool probe) {
         if (r < 0)
                 return r;
 
-        i = new0(DnsZoneItem, 1);
+        i = new(DnsZoneItem, 1);
         if (!i)
                 return -ENOMEM;
 
-        i->scope = s;
-        i->rr = dns_resource_record_ref(rr);
-        i->probing_enabled = probe;
+        *i = (DnsZoneItem) {
+                .scope = s,
+                .rr = dns_resource_record_ref(rr),
+                .probing_enabled = probe,
+        };
 
         r = dns_zone_link_item(z, i);
         if (r < 0)
@@ -638,11 +632,10 @@ int dns_zone_verify_conflicts(DnsZone *zone, DnsResourceKey *key) {
 
 void dns_zone_verify_all(DnsZone *zone) {
         DnsZoneItem *i;
-        Iterator iterator;
 
         assert(zone);
 
-        HASHMAP_FOREACH(i, zone->by_key, iterator) {
+        HASHMAP_FOREACH(i, zone->by_key) {
                 DnsZoneItem *j;
 
                 LIST_FOREACH(by_key, j, i)
@@ -651,7 +644,6 @@ void dns_zone_verify_all(DnsZone *zone) {
 }
 
 void dns_zone_dump(DnsZone *zone, FILE *f) {
-        Iterator iterator;
         DnsZoneItem *i;
 
         if (!zone)
@@ -660,7 +652,7 @@ void dns_zone_dump(DnsZone *zone, FILE *f) {
         if (!f)
                 f = stdout;
 
-        HASHMAP_FOREACH(i, zone->by_key, iterator) {
+        HASHMAP_FOREACH(i, zone->by_key) {
                 DnsZoneItem *j;
 
                 LIST_FOREACH(by_key, j, i) {

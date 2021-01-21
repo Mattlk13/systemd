@@ -1,6 +1,9 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
+#include <sys/stat.h>
+
+#include "efi-loader-features.h"
 #include "efivars.h"
 
 #if ENABLE_EFI
@@ -22,6 +25,9 @@ int efi_loader_get_boot_usec(usec_t *firmware, usec_t *loader);
 int efi_loader_get_entries(char ***ret);
 
 int efi_loader_get_features(uint64_t *ret);
+
+int efi_loader_get_config_timeout_one_shot(usec_t *ret);
+int efi_loader_update_entry_one_shot_cache(char **cache, struct stat *cache_stat);
 
 #else
 
@@ -74,6 +80,14 @@ static inline int efi_loader_get_entries(char ***ret) {
 }
 
 static inline int efi_loader_get_features(uint64_t *ret) {
+        return -EOPNOTSUPP;
+}
+
+static inline int efi_loader_get_config_timeout_one_shot(usec_t *ret) {
+        return -EOPNOTSUPP;
+}
+
+static inline int efi_loader_update_entry_one_shot_cache(char **cache, struct stat *cache_stat) {
         return -EOPNOTSUPP;
 }
 

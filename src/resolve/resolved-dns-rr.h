@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 #include <netinet/in.h>
@@ -102,7 +102,7 @@ struct DnsResourceRecord {
         /* How many labels to strip to determine "synthesizing source" of this RR, i.e. the wildcard's immediate parent. -1 if not signed. */
         unsigned n_skip_labels_source;
 
-        bool unparseable:1;
+        bool unparsable:1;
 
         bool wire_format_canonical:1;
         void *wire_format;
@@ -330,6 +330,7 @@ DnsTxtItem *dns_txt_item_copy(DnsTxtItem *i);
 int dns_txt_item_new_empty(DnsTxtItem **ret);
 
 void dns_resource_record_hash_func(const DnsResourceRecord *i, struct siphash *state);
+int dns_resource_record_compare_func(const DnsResourceRecord *x, const DnsResourceRecord *y);
 
 extern const struct hash_ops dns_resource_key_hash_ops;
 extern const struct hash_ops dns_resource_record_hash_ops;

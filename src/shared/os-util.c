@@ -1,10 +1,12 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "alloc-util.h"
 #include "env-file.h"
 #include "fd-util.h"
+#include "fileio.h"
 #include "fs-util.h"
 #include "macro.h"
+#include "machine-image.h"
 #include "os-util.h"
 #include "string-util.h"
 #include "strv.h"
@@ -30,17 +32,31 @@ int path_is_os_tree(const char *path) {
         return 1;
 }
 
-int open_os_release(const char *root, char **ret_path, int *ret_fd) {
+int open_extension_release(const char *root, const char *extension, char **ret_path, int *ret_fd) {
         _cleanup_free_ char *q = NULL;
-        const char *p;
         int r, fd;
 
-        FOREACH_STRING(p, "/etc/os-release", "/usr/lib/os-release") {
-                r = chase_symlinks(p, root, CHASE_PREFIX_ROOT,
-                                   ret_path ? &q : NULL,
-                                   ret_fd ? &fd : NULL);
-                if (r != -ENOENT)
-                        break;
+        if (extension) {
+                const char *extension_full_path;
+
+                if (!image_name_is_valid(extension))
+                        return log_debug_errno(SYNTHETIC_ERRNO(EINVAL),
+                                               "The extension name %s is invalid.", extension);
+
+                extension_full_path = strjoina("/usr/lib/extension-release.d/extension-release.", extension);
+                r = chase_symlinks(extension_full_path, root, CHASE_PREFIX_ROOT,
+                                  ret_path ? &q : NULL,
+                                  ret_fd ? &fd : NULL);
+        } else {
+                const char *p;
+
+                FOREACH_STRING(p, "/etc/os-release", "/usr/lib/os-release") {
+                        r = chase_symlinks(p, root, CHASE_PREFIX_ROOT,
+                                        ret_path ? &q : NULL,
+                                        ret_fd ? &fd : NULL);
+                        if (r != -ENOENT)
+                                break;
+                }
         }
         if (r < 0)
                 return r;
@@ -63,23 +79,22 @@ int open_os_release(const char *root, char **ret_path, int *ret_fd) {
         return 0;
 }
 
-int fopen_os_release(const char *root, char **ret_path, FILE **ret_file) {
+int fopen_extension_release(const char *root, const char *extension, char **ret_path, FILE **ret_file) {
         _cleanup_free_ char *p = NULL;
         _cleanup_close_ int fd = -1;
         FILE *f;
         int r;
 
         if (!ret_file)
-                return open_os_release(root, ret_path, NULL);
+                return open_extension_release(root, extension, ret_path, NULL);
 
-        r = open_os_release(root, ret_path ? &p : NULL, &fd);
+        r = open_extension_release(root, extension, ret_path ? &p : NULL, &fd);
         if (r < 0)
                 return r;
 
-        f = fdopen(fd, "r");
+        f = take_fdopen(&fd, "r");
         if (!f)
                 return -errno;
-        fd = -1;
 
         *ret_file = f;
 
@@ -89,18 +104,35 @@ int fopen_os_release(const char *root, char **ret_path, FILE **ret_file) {
         return 0;
 }
 
-int parse_os_release(const char *root, ...) {
+static int parse_release_internal(const char *root, const char *extension, va_list ap) {
         _cleanup_fclose_ FILE *f = NULL;
         _cleanup_free_ char *p = NULL;
-        va_list ap;
         int r;
 
-        r = fopen_os_release(root, &p, &f);
+        r = fopen_extension_release(root, extension, &p, &f);
         if (r < 0)
                 return r;
 
+        return parse_env_filev(f, p, ap);
+}
+
+int parse_extension_release(const char *root, const char *extension, ...) {
+        va_list ap;
+        int r;
+
+        va_start(ap, extension);
+        r = parse_release_internal(root, extension, ap);
+        va_end(ap);
+
+        return r;
+}
+
+int parse_os_release(const char *root, ...) {
+        va_list ap;
+        int r;
+
         va_start(ap, root);
-        r = parse_env_filev(f, p, ap);
+        r = parse_release_internal(root, NULL, ap);
         va_end(ap);
 
         return r;
@@ -116,4 +148,34 @@ int load_os_release_pairs(const char *root, char ***ret) {
                 return r;
 
         return load_env_file_pairs(f, p, ret);
+}
+
+int load_os_release_pairs_with_prefix(const char *root, const char *prefix, char ***ret) {
+        _cleanup_strv_free_ char **os_release_pairs = NULL, **os_release_pairs_prefixed = NULL;
+        char **p, **q;
+        int r;
+
+        r = load_os_release_pairs(root, &os_release_pairs);
+        if (r < 0)
+                return r;
+
+        STRV_FOREACH_PAIR(p, q, os_release_pairs) {
+                char *line;
+
+                /* We strictly return only the four main ID fields and ignore the rest */
+                if (!STR_IN_SET(*p, "ID", "VERSION_ID", "BUILD_ID", "VARIANT_ID"))
+                        continue;
+
+                ascii_strlower(*p);
+                line = strjoin(prefix, *p, "=", *q);
+                if (!line)
+                        return -ENOMEM;
+                r = strv_consume(&os_release_pairs_prefixed, line);
+                if (r < 0)
+                        return r;
+        }
+
+        *ret = TAKE_PTR(os_release_pairs_prefixed);
+
+        return 0;
 }

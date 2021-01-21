@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 #include <sched.h>
@@ -38,10 +38,18 @@ typedef enum UserNamespaceMode {
 
 typedef enum ResolvConfMode {
         RESOLV_CONF_OFF,
-        RESOLV_CONF_COPY_HOST,
-        RESOLV_CONF_COPY_STATIC,
+        RESOLV_CONF_COPY_HOST,     /* /etc/resolv.conf */
+        RESOLV_CONF_COPY_STATIC,   /* /usr/lib/systemd/resolv.conf */
+        RESOLV_CONF_COPY_UPLINK,   /* /run/systemd/resolve/resolv.conf */
+        RESOLV_CONF_COPY_STUB,     /* /run/systemd/resolve/stub-resolv.conf */
+        RESOLV_CONF_REPLACE_HOST,
+        RESOLV_CONF_REPLACE_STATIC,
+        RESOLV_CONF_REPLACE_UPLINK,
+        RESOLV_CONF_REPLACE_STUB,
         RESOLV_CONF_BIND_HOST,
         RESOLV_CONF_BIND_STATIC,
+        RESOLV_CONF_BIND_UPLINK,
+        RESOLV_CONF_BIND_STUB,
         RESOLV_CONF_DELETE,
         RESOLV_CONF_AUTO,
         _RESOLV_CONF_MODE_MAX,
@@ -108,9 +116,10 @@ typedef enum SettingsMask {
         SETTING_USE_CGNS          = UINT64_C(1) << 27,
         SETTING_CLONE_NS_FLAGS    = UINT64_C(1) << 28,
         SETTING_CONSOLE_MODE      = UINT64_C(1) << 29,
-        SETTING_RLIMIT_FIRST      = UINT64_C(1) << 30, /* we define one bit per resource limit here */
-        SETTING_RLIMIT_LAST       = UINT64_C(1) << (30 + _RLIMIT_MAX - 1),
-        _SETTINGS_MASK_ALL        = (UINT64_C(1) << (30 + _RLIMIT_MAX)) -1,
+        SETTING_CREDENTIALS       = UINT64_C(1) << 30,
+        SETTING_RLIMIT_FIRST      = UINT64_C(1) << 31, /* we define one bit per resource limit here */
+        SETTING_RLIMIT_LAST       = UINT64_C(1) << (31 + _RLIMIT_MAX - 1),
+        _SETTINGS_MASK_ALL        = (UINT64_C(1) << (31 + _RLIMIT_MAX)) -1,
         _SETTING_FORCE_ENUM_WIDTH = UINT64_MAX
 } SettingsMask;
 
@@ -148,6 +157,7 @@ typedef struct Settings {
         char *user;
         uint64_t capability;
         uint64_t drop_capability;
+        uint64_t ambient_capability;
         int kill_signal;
         unsigned long personality;
         sd_id128_t machine_id;
@@ -157,8 +167,8 @@ typedef struct Settings {
         UserNamespaceMode userns_mode;
         uid_t uid_shift, uid_range;
         bool notify_ready;
-        char **syscall_whitelist;
-        char **syscall_blacklist;
+        char **syscall_allow_list;
+        char **syscall_deny_list;
         struct rlimit *rlimit[_RLIMIT_MAX];
         char *hostname;
         int no_new_privileges;
@@ -226,7 +236,6 @@ DEFINE_TRIVIAL_CLEANUP_FUNC(Settings*, settings_free);
 const struct ConfigPerfItem* nspawn_gperf_lookup(const char *key, GPERF_LEN_TYPE length);
 
 CONFIG_PARSER_PROTOTYPE(config_parse_capability);
-CONFIG_PARSER_PROTOTYPE(config_parse_id128);
 CONFIG_PARSER_PROTOTYPE(config_parse_expose_port);
 CONFIG_PARSER_PROTOTYPE(config_parse_volatile_mode);
 CONFIG_PARSER_PROTOTYPE(config_parse_pivot_root);

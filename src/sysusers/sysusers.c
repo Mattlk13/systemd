@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <getopt.h>
 #include <utmp.h>
@@ -7,23 +7,26 @@
 #include "conf-files.h"
 #include "copy.h"
 #include "def.h"
+#include "dissect-image.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "format-util.h"
 #include "fs-util.h"
 #include "hashmap.h"
 #include "main-func.h"
+#include "mount-util.h"
 #include "pager.h"
 #include "path-util.h"
 #include "pretty-print.h"
-#include "set.h"
 #include "selinux-util.h"
+#include "set.h"
 #include "smack-util.h"
 #include "specifier.h"
 #include "string-util.h"
 #include "strv.h"
 #include "tmpfile-util-label.h"
 #include "uid-range.h"
+#include "user-record.h"
 #include "user-util.h"
 #include "utf8.h"
 #include "util.h"
@@ -63,6 +66,7 @@ typedef struct Item {
 } Item;
 
 static char *arg_root = NULL;
+static char *arg_image = NULL;
 static bool arg_cat_config = false;
 static const char *arg_replace = NULL;
 static bool arg_inline = false;
@@ -80,6 +84,9 @@ static uid_t search_uid = UID_INVALID;
 static UidRange *uid_range = NULL;
 static unsigned n_uid_range = 0;
 
+static UGIDAllocationRange login_defs = {};
+static bool login_defs_need_warning = false;
+
 STATIC_DESTRUCTOR_REGISTER(groups, ordered_hashmap_freep);
 STATIC_DESTRUCTOR_REGISTER(users, ordered_hashmap_freep);
 STATIC_DESTRUCTOR_REGISTER(members, ordered_hashmap_freep);
@@ -93,11 +100,32 @@ STATIC_DESTRUCTOR_REGISTER(database_by_groupname, hashmap_freep);
 STATIC_DESTRUCTOR_REGISTER(database_groups, set_free_freep);
 STATIC_DESTRUCTOR_REGISTER(uid_range, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_root, freep);
+STATIC_DESTRUCTOR_REGISTER(arg_image, freep);
 
 static int errno_is_not_exists(int code) {
         /* See getpwnam(3) and getgrnam(3): those codes and others can be returned if the user or group are
          * not found. */
         return IN_SET(code, 0, ENOENT, ESRCH, EBADF, EPERM);
+}
+
+static void maybe_emit_login_defs_warning(void) {
+        if (!login_defs_need_warning)
+                return;
+
+        if (login_defs.system_alloc_uid_min != SYSTEM_ALLOC_UID_MIN ||
+            login_defs.system_uid_max != SYSTEM_UID_MAX)
+                log_warning("login.defs specifies UID allocation range "UID_FMT"–"UID_FMT
+                            " that is different than the built-in defaults ("UID_FMT"–"UID_FMT")",
+                            login_defs.system_alloc_uid_min, login_defs.system_uid_max,
+                            SYSTEM_ALLOC_UID_MIN, SYSTEM_UID_MAX);
+        if (login_defs.system_alloc_gid_min != SYSTEM_ALLOC_GID_MIN ||
+            login_defs.system_gid_max != SYSTEM_GID_MAX)
+                log_warning("login.defs specifies GID allocation range "GID_FMT"–"GID_FMT
+                            " that is different than the built-in defaults ("GID_FMT"–"GID_FMT")",
+                            login_defs.system_alloc_gid_min, login_defs.system_gid_max,
+                            SYSTEM_ALLOC_GID_MIN, SYSTEM_GID_MAX);
+
+        login_defs_need_warning = false;
 }
 
 static int load_user_database(void) {
@@ -197,13 +225,15 @@ static int load_group_database(void) {
 }
 
 static int make_backup(const char *target, const char *x) {
-        _cleanup_close_ int src = -1;
+        _cleanup_(unlink_and_freep) char *dst_tmp = NULL;
         _cleanup_fclose_ FILE *dst = NULL;
-        _cleanup_free_ char *dst_tmp = NULL;
-        char *backup;
-        struct timespec ts[2];
+        _cleanup_close_ int src = -1;
+        const char *backup;
         struct stat st;
         int r;
+
+        assert(target);
+        assert(x);
 
         src = open(x, O_RDONLY|O_CLOEXEC|O_NOCTTY);
         if (src < 0) {
@@ -216,43 +246,38 @@ static int make_backup(const char *target, const char *x) {
         if (fstat(src, &st) < 0)
                 return -errno;
 
-        r = fopen_temporary_label(target, x, &dst, &dst_tmp);
+        r = fopen_temporary_label(
+                        target,   /* The path for which to the lookup the label */
+                        x,        /* Where we want the file actually to end up */
+                        &dst,
+                        &dst_tmp  /* The temporary file we write to */);
         if (r < 0)
                 return r;
 
         r = copy_bytes(src, fileno(dst), (uint64_t) -1, COPY_REFLINK);
         if (r < 0)
-                goto fail;
-
-        /* Don't fail on chmod() or chown(). If it stays owned by us
-         * and/or unreadable by others, then it isn't too bad... */
+                return r;
 
         backup = strjoina(x, "-");
 
-        /* Copy over the access mask */
-        r = chmod_and_chown_unsafe(dst_tmp, st.st_mode & 07777, st.st_uid, st.st_gid);
+        /* Copy over the access mask. Don't fail on chmod() or chown(). If it stays owned by us and/or
+         * unreadable by others, then it isn't too bad... */
+        r = fchmod_and_chown(fileno(dst), st.st_mode & 07777, st.st_uid, st.st_gid);
         if (r < 0)
                 log_warning_errno(r, "Failed to change access mode or ownership of %s: %m", backup);
 
-        ts[0] = st.st_atim;
-        ts[1] = st.st_mtim;
-        if (futimens(fileno(dst), ts) < 0)
+        if (futimens(fileno(dst), (const struct timespec[2]) { st.st_atim, st.st_mtim }) < 0)
                 log_warning_errno(errno, "Failed to fix access and modification time of %s: %m", backup);
 
-        r = fflush_sync_and_check(dst);
+        r = fsync_full(fileno(dst));
         if (r < 0)
-                goto fail;
+                return r;
 
-        if (rename(dst_tmp, backup) < 0) {
-                r = -errno;
-                goto fail;
-        }
+        if (rename(dst_tmp, backup) < 0)
+                return errno;
 
+        dst_tmp = mfree(dst_tmp); /* disable the unlink_and_freep() hook now that the file has been renamed*/
         return 0;
-
-fail:
-        (void) unlink(dst_tmp);
-        return r;
 }
 
 static int putgrent_with_members(const struct group *gr, FILE *group) {
@@ -345,28 +370,6 @@ static int putsgent_with_members(const struct sgrp *sg, FILE *gshadow) {
 }
 #endif
 
-static int sync_rights(FILE *from, const char *to) {
-        struct stat st;
-
-        if (fstat(fileno(from), &st) < 0)
-                return -errno;
-
-        return chmod_and_chown_unsafe(to, st.st_mode & 07777, st.st_uid, st.st_gid);
-}
-
-static int rename_and_apply_smack(const char *temp_path, const char *dest_path) {
-        int r = 0;
-        if (rename(temp_path, dest_path) < 0)
-                return -errno;
-
-#ifdef SMACK_RUN_LABEL
-        r = mac_smack_apply(dest_path, SMACK_ATTR_ACCESS, SMACK_FLOOR_LABEL);
-        if (r < 0)
-                return r;
-#endif
-        return r;
-}
-
 static const char* default_shell(uid_t uid) {
         return uid == 0 ? "/bin/sh" : NOLOGIN;
 }
@@ -375,7 +378,6 @@ static int write_temporary_passwd(const char *passwd_path, FILE **tmpfile, char 
         _cleanup_fclose_ FILE *original = NULL, *passwd = NULL;
         _cleanup_(unlink_and_freep) char *passwd_tmp = NULL;
         struct passwd *pw = NULL;
-        Iterator iterator;
         Item *i;
         int r;
 
@@ -389,7 +391,7 @@ static int write_temporary_passwd(const char *passwd_path, FILE **tmpfile, char 
         original = fopen(passwd_path, "re");
         if (original) {
 
-                r = sync_rights(original, passwd_tmp);
+                r = sync_rights(fileno(original), fileno(passwd));
                 if (r < 0)
                         return r;
 
@@ -424,7 +426,7 @@ static int write_temporary_passwd(const char *passwd_path, FILE **tmpfile, char 
                         return -errno;
         }
 
-        ORDERED_HASHMAP_FOREACH(i, todo_uids, iterator) {
+        ORDERED_HASHMAP_FOREACH(i, todo_uids) {
                 struct passwd n = {
                         .pw_name = i->name,
                         .pw_uid = i->uid,
@@ -474,7 +476,6 @@ static int write_temporary_shadow(const char *shadow_path, FILE **tmpfile, char 
         _cleanup_fclose_ FILE *original = NULL, *shadow = NULL;
         _cleanup_(unlink_and_freep) char *shadow_tmp = NULL;
         struct spwd *sp = NULL;
-        Iterator iterator;
         long lstchg;
         Item *i;
         int r;
@@ -491,7 +492,7 @@ static int write_temporary_shadow(const char *shadow_path, FILE **tmpfile, char 
         original = fopen(shadow_path, "re");
         if (original) {
 
-                r = sync_rights(original, shadow_tmp);
+                r = sync_rights(fileno(original), fileno(shadow));
                 if (r < 0)
                         return r;
 
@@ -526,10 +527,10 @@ static int write_temporary_shadow(const char *shadow_path, FILE **tmpfile, char 
                         return -errno;
         }
 
-        ORDERED_HASHMAP_FOREACH(i, todo_uids, iterator) {
+        ORDERED_HASHMAP_FOREACH(i, todo_uids) {
                 struct spwd n = {
                         .sp_namp = i->name,
-                        .sp_pwdp = (char*) "!!", /* lock this password, and make it invalid */
+                        .sp_pwdp = (char*) "!*", /* lock this password, and make it invalid */
                         .sp_lstchg = lstchg,
                         .sp_min = -1,
                         .sp_max = -1,
@@ -574,7 +575,6 @@ static int write_temporary_group(const char *group_path, FILE **tmpfile, char **
         _cleanup_(unlink_and_freep) char *group_tmp = NULL;
         bool group_changed = false;
         struct group *gr = NULL;
-        Iterator iterator;
         Item *i;
         int r;
 
@@ -588,7 +588,7 @@ static int write_temporary_group(const char *group_path, FILE **tmpfile, char **
         original = fopen(group_path, "re");
         if (original) {
 
-                r = sync_rights(original, group_tmp);
+                r = sync_rights(fileno(original), fileno(group));
                 if (r < 0)
                         return r;
 
@@ -629,7 +629,7 @@ static int write_temporary_group(const char *group_path, FILE **tmpfile, char **
                         return -errno;
         }
 
-        ORDERED_HASHMAP_FOREACH(i, todo_gids, iterator) {
+        ORDERED_HASHMAP_FOREACH(i, todo_gids) {
                 struct group n = {
                         .gr_name = i->name,
                         .gr_gid = i->gid,
@@ -672,7 +672,6 @@ static int write_temporary_gshadow(const char * gshadow_path, FILE **tmpfile, ch
         _cleanup_fclose_ FILE *original = NULL, *gshadow = NULL;
         _cleanup_(unlink_and_freep) char *gshadow_tmp = NULL;
         bool group_changed = false;
-        Iterator iterator;
         Item *i;
         int r;
 
@@ -687,7 +686,7 @@ static int write_temporary_gshadow(const char * gshadow_path, FILE **tmpfile, ch
         if (original) {
                 struct sgrp *sg;
 
-                r = sync_rights(original, gshadow_tmp);
+                r = sync_rights(fileno(original), fileno(gshadow));
                 if (r < 0)
                         return r;
 
@@ -715,10 +714,10 @@ static int write_temporary_gshadow(const char * gshadow_path, FILE **tmpfile, ch
                         return -errno;
         }
 
-        ORDERED_HASHMAP_FOREACH(i, todo_gids, iterator) {
+        ORDERED_HASHMAP_FOREACH(i, todo_gids) {
                 struct sgrp n = {
                         .sg_namp = i->name,
-                        .sg_passwd = (char*) "!!",
+                        .sg_passwd = (char*) "!*",
                 };
 
                 r = putsgent_with_members(&n, gshadow);
@@ -794,14 +793,14 @@ static int write_files(void) {
 
         /* And make the new files count */
         if (group) {
-                r = rename_and_apply_smack(group_tmp, group_path);
+                r = rename_and_apply_smack_floor_label(group_tmp, group_path);
                 if (r < 0)
                         return r;
 
                 group_tmp = mfree(group_tmp);
         }
         if (gshadow) {
-                r = rename_and_apply_smack(gshadow_tmp, gshadow_path);
+                r = rename_and_apply_smack_floor_label(gshadow_tmp, gshadow_path);
                 if (r < 0)
                         return r;
 
@@ -809,14 +808,14 @@ static int write_files(void) {
         }
 
         if (passwd) {
-                r = rename_and_apply_smack(passwd_tmp, passwd_path);
+                r = rename_and_apply_smack_floor_label(passwd_tmp, passwd_path);
                 if (r < 0)
                         return r;
 
                 passwd_tmp = mfree(passwd_tmp);
         }
         if (shadow) {
-                r = rename_and_apply_smack(shadow_tmp, shadow_path);
+                r = rename_and_apply_smack_floor_label(shadow_tmp, shadow_path);
                 if (r < 0)
                         return r;
 
@@ -1026,6 +1025,8 @@ static int add_user(Item *i) {
 
         /* And if that didn't work either, let's try to find a free one */
         if (!i->uid_set) {
+                maybe_emit_login_defs_warning();
+
                 for (;;) {
                         r = uid_range_next_lower(uid_range, n_uid_range, &search_uid);
                         if (r < 0)
@@ -1042,13 +1043,15 @@ static int add_user(Item *i) {
                 i->uid = search_uid;
         }
 
-        r = ordered_hashmap_ensure_allocated(&todo_uids, NULL);
-        if (r < 0)
+        r = ordered_hashmap_ensure_put(&todo_uids, NULL, UID_TO_PTR(i->uid), i);
+        if (r == -EEXIST)
+                return log_error_errno(r, "Requested user %s with uid " UID_FMT " and gid" GID_FMT " to be created is duplicated "
+                                       "or conflicts with another user.", i->name, i->uid, i->gid);
+        if (r == -ENOMEM)
                 return log_oom();
-
-        r = ordered_hashmap_put(todo_uids, UID_TO_PTR(i->uid), i);
         if (r < 0)
-                return log_oom();
+                return log_error_errno(r, "Failed to store user %s with uid " UID_FMT " and gid " GID_FMT " to be created: %m",
+                                       i->name, i->uid, i->gid);
 
         i->todo_user = true;
         log_info("Creating user %s (%s) with uid " UID_FMT " and gid " GID_FMT ".", i->name, strna(i->description), i->uid, i->gid);
@@ -1192,6 +1195,8 @@ static int add_group(Item *i) {
 
         /* And if that didn't work either, let's try to find a free one */
         if (!i->gid_set) {
+                maybe_emit_login_defs_warning();
+
                 for (;;) {
                         /* We look for new GIDs in the UID pool! */
                         r = uid_range_next_lower(uid_range, n_uid_range, &search_uid);
@@ -1209,13 +1214,13 @@ static int add_group(Item *i) {
                 i->gid = search_uid;
         }
 
-        r = ordered_hashmap_ensure_allocated(&todo_gids, NULL);
-        if (r < 0)
+        r = ordered_hashmap_ensure_put(&todo_gids, NULL, GID_TO_PTR(i->gid), i);
+        if (r == -EEXIST)
+                return log_error_errno(r, "Requested group %s with gid "GID_FMT " to be created is duplicated or conflicts with another user.", i->name, i->gid);
+        if (r == -ENOMEM)
                 return log_oom();
-
-        r = ordered_hashmap_put(todo_gids, GID_TO_PTR(i->gid), i);
         if (r < 0)
-                return log_oom();
+                return log_error_errno(r, "Failed to store group %s with gid " GID_FMT " to be created: %m", i->name, i->gid);
 
         i->todo_group = true;
         log_info("Creating group %s with gid " GID_FMT ".", i->name, i->gid);
@@ -1285,20 +1290,15 @@ DEFINE_PRIVATE_HASH_OPS_WITH_VALUE_DESTRUCTOR(item_hash_ops, char, string_hash_f
 
 static int add_implicit(void) {
         char *g, **l;
-        Iterator iterator;
         int r;
 
         /* Implicitly create additional users and groups, if they were listed in "m" lines */
-        ORDERED_HASHMAP_FOREACH_KEY(l, g, members, iterator) {
+        ORDERED_HASHMAP_FOREACH_KEY(l, g, members) {
                 char **m;
 
                 STRV_FOREACH(m, l)
                         if (!ordered_hashmap_get(users, *m)) {
                                 _cleanup_(item_freep) Item *j = NULL;
-
-                                r = ordered_hashmap_ensure_allocated(&users, &item_hash_ops);
-                                if (r < 0)
-                                        return log_oom();
 
                                 j = new0(Item, 1);
                                 if (!j)
@@ -1309,21 +1309,19 @@ static int add_implicit(void) {
                                 if (!j->name)
                                         return log_oom();
 
-                                r = ordered_hashmap_put(users, j->name, j);
-                                if (r < 0)
+                                r = ordered_hashmap_ensure_put(&users, &item_hash_ops, j->name, j);
+                                if (r == -ENOMEM)
                                         return log_oom();
+                                if (r < 0)
+                                        return log_error_errno(r, "Failed to add implicit user '%s': %m", j->name);
 
                                 log_debug("Adding implicit user '%s' due to m line", j->name);
-                                j = NULL;
+                                TAKE_PTR(j);
                         }
 
                 if (!(ordered_hashmap_get(users, g) ||
                       ordered_hashmap_get(groups, g))) {
                         _cleanup_(item_freep) Item *j = NULL;
-
-                        r = ordered_hashmap_ensure_allocated(&groups, &item_hash_ops);
-                        if (r < 0)
-                                return log_oom();
 
                         j = new0(Item, 1);
                         if (!j)
@@ -1334,12 +1332,14 @@ static int add_implicit(void) {
                         if (!j->name)
                                 return log_oom();
 
-                        r = ordered_hashmap_put(groups, j->name, j);
-                        if (r < 0)
+                        r = ordered_hashmap_ensure_put(&groups, &item_hash_ops, j->name, j);
+                        if (r == -ENOMEM)
                                 return log_oom();
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to add implicit group '%s': %m", j->name);
 
                         log_debug("Adding implicit group '%s' due to m line", j->name);
-                        j = NULL;
+                        TAKE_PTR(j);
                 }
         }
 
@@ -1389,12 +1389,8 @@ static bool item_equal(Item *a, Item *b) {
 static int parse_line(const char *fname, unsigned line, const char *buffer) {
 
         static const Specifier specifier_table[] = {
-                { 'm', specifier_machine_id,     NULL },
-                { 'b', specifier_boot_id,        NULL },
-                { 'H', specifier_host_name,      NULL },
-                { 'v', specifier_kernel_release, NULL },
-                { 'T', specifier_tmp_dir,        NULL },
-                { 'V', specifier_var_tmp_dir,    NULL },
+                COMMON_SYSTEM_SPECIFIERS,
+                COMMON_TMP_SPECIFIERS,
                 {}
         };
 
@@ -1443,9 +1439,9 @@ static int parse_line(const char *fname, unsigned line, const char *buffer) {
         if (name) {
                 r = specifier_printf(name, specifier_table, NULL, &resolved_name);
                 if (r < 0)
-                        log_error_errno(r, "[%s:%u] Failed to replace specifiers: %s", fname, line, name);
+                        return log_error_errno(r, "[%s:%u] Failed to replace specifiers in '%s': %m", fname, line, name);
 
-                if (!valid_user_group_name(resolved_name))
+                if (!valid_user_group_name(resolved_name, 0))
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                "[%s:%u] '%s' is not a valid user or group name.",
                                                fname, line, resolved_name);
@@ -1458,7 +1454,7 @@ static int parse_line(const char *fname, unsigned line, const char *buffer) {
         if (id) {
                 r = specifier_printf(id, specifier_table, NULL, &resolved_id);
                 if (r < 0)
-                        return log_error_errno(r, "[%s:%u] Failed to replace specifiers: %s",
+                        return log_error_errno(r, "[%s:%u] Failed to replace specifiers in '%s': %m",
                                                fname, line, name);
         }
 
@@ -1469,7 +1465,7 @@ static int parse_line(const char *fname, unsigned line, const char *buffer) {
         if (description) {
                 r = specifier_printf(description, specifier_table, NULL, &resolved_description);
                 if (r < 0)
-                        return log_error_errno(r, "[%s:%u] Failed to replace specifiers: %s",
+                        return log_error_errno(r, "[%s:%u] Failed to replace specifiers in '%s': %m",
                                                fname, line, description);
 
                 if (!valid_gecos(resolved_description))
@@ -1485,7 +1481,7 @@ static int parse_line(const char *fname, unsigned line, const char *buffer) {
         if (home) {
                 r = specifier_printf(home, specifier_table, NULL, &resolved_home);
                 if (r < 0)
-                        return log_error_errno(r, "[%s:%u] Failed to replace specifiers: %s",
+                        return log_error_errno(r, "[%s:%u] Failed to replace specifiers in '%s': %m",
                                                fname, line, home);
 
                 if (!valid_home(resolved_home))
@@ -1501,7 +1497,7 @@ static int parse_line(const char *fname, unsigned line, const char *buffer) {
         if (shell) {
                 r = specifier_printf(shell, specifier_table, NULL, &resolved_shell);
                 if (r < 0)
-                        return log_error_errno(r, "[%s:%u] Failed to replace specifiers: %s",
+                        return log_error_errno(r, "[%s:%u] Failed to replace specifiers in '%s': %m",
                                                fname, line, shell);
 
                 if (!valid_shell(resolved_shell))
@@ -1548,7 +1544,7 @@ static int parse_line(const char *fname, unsigned line, const char *buffer) {
                                                "[%s:%u] Lines of type 'm' require a group name in the third field.",
                                                fname, line);
 
-                if (!valid_user_group_name(resolved_id))
+                if (!valid_user_group_name(resolved_id, 0))
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                "[%s:%u] '%s' is not a valid user or group name.",
                                                fname, line, resolved_id);
@@ -1589,7 +1585,7 @@ static int parse_line(const char *fname, unsigned line, const char *buffer) {
                                 if (split_pair(resolved_id, ":", &uid, &gid) == 0) {
                                         r = parse_gid(gid, &i->gid);
                                         if (r < 0) {
-                                                if (valid_user_group_name(gid))
+                                                if (valid_user_group_name(gid, 0))
                                                         i->group_name = TAKE_PTR(gid);
                                                 else
                                                         return log_error_errno(r, "Failed to parse GID: '%s': %m", id);
@@ -1755,6 +1751,7 @@ static int help(void) {
                "     --version              Show package version\n"
                "     --cat-config           Show configuration files\n"
                "     --root=PATH            Operate on an alternate filesystem root\n"
+               "     --image=PATH           Operate on disk image as filesystem root\n"
                "     --replace=PATH         Treat arguments as replacement for PATH\n"
                "     --inline               Treat arguments as configuration lines\n"
                "     --no-pager             Do not pipe output into a pager\n"
@@ -1772,6 +1769,7 @@ static int parse_argv(int argc, char *argv[]) {
                 ARG_VERSION = 0x100,
                 ARG_CAT_CONFIG,
                 ARG_ROOT,
+                ARG_IMAGE,
                 ARG_REPLACE,
                 ARG_INLINE,
                 ARG_NO_PAGER,
@@ -1782,6 +1780,7 @@ static int parse_argv(int argc, char *argv[]) {
                 { "version",    no_argument,       NULL, ARG_VERSION    },
                 { "cat-config", no_argument,       NULL, ARG_CAT_CONFIG },
                 { "root",       required_argument, NULL, ARG_ROOT       },
+                { "image",      required_argument, NULL, ARG_IMAGE          },
                 { "replace",    required_argument, NULL, ARG_REPLACE    },
                 { "inline",     no_argument,       NULL, ARG_INLINE     },
                 { "no-pager",   no_argument,       NULL, ARG_NO_PAGER   },
@@ -1808,10 +1807,21 @@ static int parse_argv(int argc, char *argv[]) {
                         break;
 
                 case ARG_ROOT:
-                        r = parse_path_argument_and_warn(optarg, true, &arg_root);
+                        r = parse_path_argument_and_warn(optarg, /* suppress_root= */ false, &arg_root);
                         if (r < 0)
                                 return r;
                         break;
+
+                case ARG_IMAGE:
+#ifdef STANDALONE
+                        return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP),
+                                               "This systemd-sysusers version is compiled without support for --image=.");
+#else
+                        r = parse_path_argument_and_warn(optarg, /* suppress_root= */ false, &arg_image);
+                        if (r < 0)
+                                return r;
+                        break;
+#endif
 
                 case ARG_REPLACE:
                         if (!path_is_absolute(optarg) ||
@@ -1844,6 +1854,9 @@ static int parse_argv(int argc, char *argv[]) {
         if (arg_replace && optind >= argc)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "When --replace= is given, some configuration items must be specified");
+
+        if (arg_image && arg_root)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Please specify either --root= or --image=, the combination of both is not supported.");
 
         return 1;
 }
@@ -1896,8 +1909,12 @@ static int read_config_files(char **args) {
 }
 
 static int run(int argc, char *argv[]) {
+#ifndef STANDALONE
+        _cleanup_(loop_device_unrefp) LoopDevice *loop_device = NULL;
+        _cleanup_(decrypted_image_unrefp) DecryptedImage *decrypted_image = NULL;
+        _cleanup_(umount_and_rmdir_and_freep) char *unlink_dir = NULL;
+#endif
         _cleanup_close_ int lock = -1;
-        Iterator iterator;
         Item *i;
         int r;
 
@@ -1914,7 +1931,28 @@ static int run(int argc, char *argv[]) {
 
         r = mac_selinux_init();
         if (r < 0)
-                return log_error_errno(r, "SELinux setup failed: %m");
+                return r;
+
+#ifndef STANDALONE
+        if (arg_image) {
+                assert(!arg_root);
+
+                r = mount_image_privately_interactively(
+                                arg_image,
+                                DISSECT_IMAGE_REQUIRE_ROOT|DISSECT_IMAGE_VALIDATE_OS|DISSECT_IMAGE_RELAX_VAR_CHECK|DISSECT_IMAGE_FSCK,
+                                &unlink_dir,
+                                &loop_device,
+                                &decrypted_image);
+                if (r < 0)
+                        return r;
+
+                arg_root = strdup(unlink_dir);
+                if (!arg_root)
+                        return log_oom();
+        }
+#else
+        assert(!arg_image);
+#endif
 
         /* If command line arguments are specified along with --replace, read all
          * configuration files and insert the positional arguments at the specified
@@ -1938,10 +1976,25 @@ static int run(int argc, char *argv[]) {
                 return log_error_errno(errno, "Failed to set SYSTEMD_NSS_BYPASS_SYNTHETIC environment variable: %m");
 
         if (!uid_range) {
-                /* Default to default range of 1..SYSTEM_UID_MAX */
-                r = uid_range_add(&uid_range, &n_uid_range, 1, SYSTEM_UID_MAX);
+                /* Default to default range of SYSTEMD_UID_MIN..SYSTEM_UID_MAX. */
+                r = read_login_defs(&login_defs, NULL, arg_root);
                 if (r < 0)
-                        return log_oom();
+                        return log_error_errno(r, "Failed to read %s%s: %m",
+                                               strempty(arg_root), "/etc/login.defs");
+
+                login_defs_need_warning = true;
+
+                /* We pick a range that very conservative: we look at compiled-in maximum and the value in
+                 * /etc/login.defs. That way the uids/gids which we allocate will be interpreted correctly,
+                 * even if /etc/login.defs is removed later. (The bottom bound doesn't matter much, since
+                 * it's only used during allocation, so we use the configured value directly). */
+                uid_t begin = login_defs.system_alloc_uid_min,
+                      end = MIN3((uid_t) SYSTEM_UID_MAX, login_defs.system_uid_max, login_defs.system_gid_max);
+                if (begin < end) {
+                        r = uid_range_add(&uid_range, &n_uid_range, begin, end - begin + 1);
+                        if (r < 0)
+                                return log_oom();
+                }
         }
 
         r = add_implicit();
@@ -1960,10 +2013,10 @@ static int run(int argc, char *argv[]) {
         if (r < 0)
                 return log_error_errno(r, "Failed to read group database: %m");
 
-        ORDERED_HASHMAP_FOREACH(i, groups, iterator)
+        ORDERED_HASHMAP_FOREACH(i, groups)
                 (void) process_item(i);
 
-        ORDERED_HASHMAP_FOREACH(i, users, iterator)
+        ORDERED_HASHMAP_FOREACH(i, users)
                 (void) process_item(i);
 
         r = write_files();

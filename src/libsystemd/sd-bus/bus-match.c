@@ -1,10 +1,9 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "alloc-util.h"
 #include "bus-internal.h"
 #include "bus-match.h"
 #include "bus-message.h"
-#include "bus-util.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "hexdecoct.h"
@@ -961,9 +960,8 @@ void bus_match_free(struct bus_match_node *node) {
                 return;
 
         if (BUS_MATCH_CAN_HASH(node->type)) {
-                Iterator i;
 
-                HASHMAP_FOREACH(c, node->compare.children, i)
+                HASHMAP_FOREACH(c, node->compare.children)
                         bus_match_free(c);
 
                 assert(hashmap_isempty(node->compare.children));
@@ -1054,9 +1052,8 @@ void bus_match_dump(struct bus_match_node *node, unsigned level) {
                 putchar('\n');
 
         if (BUS_MATCH_CAN_HASH(node->type)) {
-                Iterator i;
 
-                HASHMAP_FOREACH(c, node->compare.children, i)
+                HASHMAP_FOREACH(c, node->compare.children)
                         bus_match_dump(c, level + 1);
         }
 

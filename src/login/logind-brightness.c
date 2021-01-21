@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "bus-util.h"
 #include "device-util.h"
@@ -174,15 +174,11 @@ static int set_add_message(Set **set, sd_bus_message *message) {
         if (r <= 0)
                 return r;
 
-        r = set_ensure_allocated(set, &bus_message_hash_ops);
-        if (r < 0)
+        r = set_ensure_put(set, &bus_message_hash_ops, message);
+        if (r <= 0)
                 return r;
-
-        r = set_put(*set, message);
-        if (r < 0)
-                return r;
-
         sd_bus_message_ref(message);
+
         return 1;
 }
 
@@ -221,10 +217,6 @@ int manager_write_brightness(
                 return 0;
         }
 
-        r = hashmap_ensure_allocated(&m->brightness_writers, &brightness_writer_hash_ops);
-        if (r < 0)
-                return log_oom();
-
         w = new(BrightnessWriter, 1);
         if (!w)
                 return log_oom();
@@ -238,9 +230,12 @@ int manager_write_brightness(
         if (!w->path)
                 return log_oom();
 
-        r = hashmap_put(m->brightness_writers, w->path, w);
+        r = hashmap_ensure_put(&m->brightness_writers, &brightness_writer_hash_ops, w->path, w);
+        if (r == -ENOMEM)
+                return log_oom();
         if (r < 0)
                 return log_error_errno(r, "Failed to add brightness writer to hashmap: %m");
+
         w->manager = m;
 
         r = set_add_message(&w->current_messages, message);

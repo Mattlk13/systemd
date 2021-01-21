@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 #include <stdbool.h>
@@ -46,6 +46,14 @@ typedef enum CGroupDevicePolicy {
         _CGROUP_DEVICE_POLICY_MAX,
         _CGROUP_DEVICE_POLICY_INVALID = -1
 } CGroupDevicePolicy;
+
+typedef enum FreezerAction {
+        FREEZER_FREEZE,
+        FREEZER_THAW,
+
+        _FREEZER_ACTION_MAX,
+        _FREEZER_ACTION_INVALID = -1,
+} FreezerAction;
 
 struct CGroupDeviceAllow {
         LIST_FIELDS(CGroupDeviceAllow, device_allow);
@@ -151,6 +159,11 @@ struct CGroupContext {
 
         /* Common */
         TasksMax tasks_max;
+
+        /* Settings for systemd-oomd */
+        ManagedOOMMode moom_swap;
+        ManagedOOMMode moom_mem_pressure;
+        int moom_mem_pressure_limit;
 };
 
 /* Used when querying IP accounting data */
@@ -195,8 +208,6 @@ CGroupMask unit_get_own_mask(Unit *u);
 CGroupMask unit_get_delegate_mask(Unit *u);
 CGroupMask unit_get_members_mask(Unit *u);
 CGroupMask unit_get_siblings_mask(Unit *u);
-CGroupMask unit_get_subtree_mask(Unit *u);
-CGroupMask unit_get_disable_mask(Unit *u);
 CGroupMask unit_get_ancestor_disable_mask(Unit *u);
 
 CGroupMask unit_get_target_mask(Unit *u);
@@ -204,7 +215,7 @@ CGroupMask unit_get_enable_mask(Unit *u);
 
 void unit_invalidate_cgroup_members_masks(Unit *u);
 
-void unit_add_to_cgroup_realize_queue(Unit *u);
+void unit_add_family_to_cgroup_realize_queue(Unit *u);
 
 const char *unit_get_realized_cgroup_path(Unit *u, CGroupMask mask);
 char *unit_default_cgroup_path(const Unit *u);
@@ -212,12 +223,17 @@ int unit_set_cgroup_path(Unit *u, const char *path);
 int unit_pick_cgroup_path(Unit *u);
 
 int unit_realize_cgroup(Unit *u);
-void unit_release_cgroup(Unit *u);
 void unit_prune_cgroup(Unit *u);
 int unit_watch_cgroup(Unit *u);
 int unit_watch_cgroup_memory(Unit *u);
 
+void unit_release_cgroup(Unit *u);
+/* Releases the cgroup only if it is recursively empty.
+ * Returns true if the cgroup was released, false otherwise. */
+bool unit_maybe_release_cgroup(Unit *u);
+
 void unit_add_to_cgroup_empty_queue(Unit *u);
+int unit_check_oomd_kill(Unit *u);
 int unit_check_oom(Unit *u);
 
 int unit_attach_pids_to_cgroup(Unit *u, Set *pids, const char *suffix_path);
@@ -274,3 +290,7 @@ bool unit_cgroup_delegate(Unit *u);
 int compare_job_priority(const void *a, const void *b);
 
 int unit_get_cpuset(Unit *u, CPUSet *cpus, const char *name);
+int unit_cgroup_freezer_action(Unit *u, FreezerAction action);
+
+const char* freezer_action_to_string(FreezerAction a) _const_;
+FreezerAction freezer_action_from_string(const char *s) _pure_;

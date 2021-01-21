@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 #include <netinet/ip.h>
@@ -71,6 +71,7 @@ struct DnsPacket {
         union in_addr_union sender, destination;
         uint16_t sender_port, destination_port;
         uint32_t ttl;
+        usec_t timestamp; /* CLOCK_BOOTTIME (or CLOCK_MONOTONIC if the former doesn't exist) */
 
         /* For support of truncated packets */
         DnsPacket *more;
@@ -198,7 +199,7 @@ int dns_packet_append_label(DnsPacket *p, const char *s, size_t l, bool canonica
 int dns_packet_append_name(DnsPacket *p, const char *name, bool allow_compression, bool canonical_candidate, size_t *start);
 int dns_packet_append_key(DnsPacket *p, const DnsResourceKey *key, const DnsAnswerFlags flags, size_t *start);
 int dns_packet_append_rr(DnsPacket *p, const DnsResourceRecord *rr, const DnsAnswerFlags flags, size_t *start, size_t *rdata_start);
-int dns_packet_append_opt(DnsPacket *p, uint16_t max_udp_size, bool edns0_do, int rcode, size_t *start);
+int dns_packet_append_opt(DnsPacket *p, uint16_t max_udp_size, bool edns0_do, bool include_rfc6975, int rcode, size_t *start);
 int dns_packet_append_question(DnsPacket *p, DnsQuestion *q);
 int dns_packet_append_answer(DnsPacket *p, DnsAnswer *a);
 
@@ -220,14 +221,6 @@ void dns_packet_rewind(DnsPacket *p, size_t idx);
 
 int dns_packet_skip_question(DnsPacket *p);
 int dns_packet_extract(DnsPacket *p);
-
-static inline bool DNS_PACKET_SHALL_CACHE(DnsPacket *p) {
-        /* Never cache data originating from localhost, under the
-         * assumption, that it's coming from a locally DNS forwarder
-         * or server, that is caching on its own. */
-
-        return in_addr_is_localhost(p->family, &p->sender) == 0;
-}
 
 /* https://www.iana.org/assignments/dns-parameters/dns-parameters.xhtml#dns-parameters-6 */
 enum {

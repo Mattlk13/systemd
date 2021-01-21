@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 /***
   Copyright © 2018 Dell Inc.
 ***/
@@ -59,10 +59,14 @@ int parse_sleep_config(SleepConfig **ret_sleep_config) {
                 {}
         };
 
-        (void) config_parse_many_nulstr(PKGSYSCONFDIR "/sleep.conf",
-                                        CONF_PATHS_NULSTR("systemd/sleep.conf.d"),
-                                        "Sleep\0", config_item_table_lookup, items,
-                                        CONFIG_PARSE_WARN, NULL);
+        (void) config_parse_many_nulstr(
+                        PKGSYSCONFDIR "/sleep.conf",
+                        CONF_PATHS_NULSTR("systemd/sleep.conf.d"),
+                        "Sleep\0",
+                        config_item_table_lookup, items,
+                        CONFIG_PARSE_WARN,
+                        NULL,
+                        NULL);
 
         /* use default values unless set */
         sc->allow_suspend = allow_suspend != 0;
@@ -96,38 +100,40 @@ int parse_sleep_config(SleepConfig **ret_sleep_config) {
 }
 
 int can_sleep_state(char **types) {
-        char **type;
+        _cleanup_free_ char *text = NULL;
         int r;
-        _cleanup_free_ char *p = NULL;
 
         if (strv_isempty(types))
                 return true;
 
         /* If /sys is read-only we cannot sleep */
-        if (access("/sys/power/state", W_OK) < 0)
+        if (access("/sys/power/state", W_OK) < 0) {
+                log_debug_errno(errno, "/sys/power/state is not writable, cannot sleep: %m");
                 return false;
-
-        r = read_one_line_file("/sys/power/state", &p);
-        if (r < 0)
-                return false;
-
-        STRV_FOREACH(type, types) {
-                const char *word, *state;
-                size_t l, k;
-
-                k = strlen(*type);
-                FOREACH_WORD_SEPARATOR(word, l, p, WHITESPACE, state)
-                        if (l == k && memcmp(word, *type, l) == 0)
-                                return true;
         }
 
-        return false;
+        r = read_one_line_file("/sys/power/state", &text);
+        if (r < 0) {
+                log_debug_errno(r, "Failed to read /sys/power/state, cannot sleep: %m");
+                return false;
+        }
+
+        const char *found;
+        r = string_contains_word_strv(text, NULL, types, &found);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to parse /sys/power/state: %m");
+        if (r > 0)
+                log_debug("Sleep mode \"%s\" is supported by the kernel.", found);
+        else if (DEBUG_LOGGING) {
+                _cleanup_free_ char *t = strv_join(types, "/");
+                log_debug("Sleep mode %s not supported by the kernel, sorry.", strnull(t));
+        }
+        return r;
 }
 
 int can_sleep_disk(char **types) {
-        char **type;
+        _cleanup_free_ char *text = NULL;
         int r;
-        _cleanup_free_ char *p = NULL;
 
         if (strv_isempty(types))
                 return true;
@@ -138,29 +144,38 @@ int can_sleep_disk(char **types) {
                 return false;
         }
 
-        r = read_one_line_file("/sys/power/disk", &p);
+        r = read_one_line_file("/sys/power/disk", &text);
         if (r < 0) {
                 log_debug_errno(r, "Couldn't read /sys/power/disk: %m");
                 return false;
         }
 
-        STRV_FOREACH(type, types) {
-                const char *word, *state;
-                size_t l, k;
+        for (const char *p = text;;) {
+                _cleanup_free_ char *word = NULL;
 
-                k = strlen(*type);
-                FOREACH_WORD_SEPARATOR(word, l, p, WHITESPACE, state) {
-                        if (l == k && memcmp(word, *type, l) == 0)
-                                return true;
+                r = extract_first_word(&p, &word, NULL, 0);
+                if (r < 0)
+                        return log_debug_errno(r, "Failed to parse /sys/power/disk: %m");
+                if (r == 0)
+                        break;
 
-                        if (l == k + 2 &&
-                            word[0] == '[' &&
-                            memcmp(word + 1, *type, l - 2) == 0 &&
-                            word[l-1] == ']')
-                                return true;
+                char *s = word;
+                size_t l = strlen(s);
+                if (s[0] == '[' && s[l-1] == ']') {
+                        s[l-1] = '\0';
+                        s++;
+                }
+
+                if (strv_contains(types, s)) {
+                        log_debug("Disk sleep mode \"%s\" is supported by the kernel.", s);
+                        return true;
                 }
         }
 
+        if (DEBUG_LOGGING) {
+                _cleanup_free_ char *t = strv_join(types, "/");
+                log_debug("Disk sleep mode %s not supported by the kernel, sorry.", strnull(t));
+        }
         return false;
 }
 
@@ -195,20 +210,21 @@ static int swap_device_to_device_id(const SwapEntry *swap, dev_t *ret_dev) {
 
         r = stat(swap->device, &sb);
         if (r < 0)
-                return r;
+                return -errno;
 
         if (streq(swap->type, "partition")) {
                 if (!S_ISBLK(sb.st_mode))
                         return -ENOTBLK;
+
                 *ret_dev = sb.st_rdev;
                 return 0;
+        }
 
-        } else
-                return get_block_device(swap->device, ret_dev);
+        return get_block_device(swap->device, ret_dev);
 }
 
 /*
- * Attempt to calculate the swap file offset on supported filesystems. On unsuported
+ * Attempt to calculate the swap file offset on supported filesystems. On unsupported
  * filesystems, a debug message is logged and ret_offset is set to UINT64_MAX.
  */
 static int calculate_swap_file_offset(const SwapEntry *swap, uint64_t *ret_offset) {
@@ -223,15 +239,15 @@ static int calculate_swap_file_offset(const SwapEntry *swap, uint64_t *ret_offse
 
         fd = open(swap->device, O_RDONLY|O_CLOEXEC|O_NOCTTY);
         if (fd < 0)
-                return log_error_errno(errno, "Failed to open %s: %m", swap->device);
+                return log_debug_errno(errno, "Failed to open swap file %s to determine on-disk offset: %m", swap->device);
 
         if (fstat(fd, &sb) < 0)
-                return log_error_errno(errno, "Failed to stat %s: %m", swap->device);
+                return log_debug_errno(errno, "Failed to stat %s: %m", swap->device);
 
         btrfs = btrfs_is_filesystem(fd);
         if (btrfs < 0)
-                return log_error_errno(btrfs, "Error checking %s for Btrfs filesystem: %m", swap->device);
-        else if (btrfs > 0) {
+                return log_debug_errno(btrfs, "Error checking %s for Btrfs filesystem: %m", swap->device);
+        if (btrfs > 0) {
                 log_debug("%s: detection of swap file offset on Btrfs is not supported", swap->device);
                 *ret_offset = UINT64_MAX;
                 return 0;
@@ -242,14 +258,13 @@ static int calculate_swap_file_offset(const SwapEntry *swap, uint64_t *ret_offse
                 return log_debug_errno(r, "Unable to read extent map for '%s': %m", swap->device);
 
         *ret_offset = fiemap->fm_extents[0].fe_physical / page_size();
-
         return 0;
 }
 
 static int read_resume_files(dev_t *ret_resume, uint64_t *ret_resume_offset) {
         _cleanup_free_ char *resume_str = NULL, *resume_offset_str = NULL;
-        dev_t resume;
         uint64_t resume_offset = 0;
+        dev_t resume;
         int r;
 
         r = read_one_line_file("/sys/power/resume", &resume_str);
@@ -262,13 +277,13 @@ static int read_resume_files(dev_t *ret_resume, uint64_t *ret_resume_offset) {
 
         r = read_one_line_file("/sys/power/resume_offset", &resume_offset_str);
         if (r == -ENOENT)
-                log_debug("Kernel does not support resume_offset; swap file offset detection will be skipped.");
+                log_debug_errno(r, "Kernel does not support resume_offset; swap file offset detection will be skipped.");
         else if (r < 0)
                 return log_debug_errno(r, "Error reading /sys/power/resume_offset: %m");
         else {
                 r = safe_atou64(resume_offset_str, &resume_offset);
                 if (r < 0)
-                        return log_error_errno(r, "Failed to parse value in /sys/power/resume_offset \"%s\": %m", resume_offset_str);
+                        return log_debug_errno(r, "Failed to parse value in /sys/power/resume_offset \"%s\": %m", resume_offset_str);
         }
 
         if (resume_offset > 0 && resume == 0)
@@ -321,9 +336,8 @@ int find_hibernate_location(HibernateLocation **ret_hibernate_location) {
 
         f = fopen("/proc/swaps", "re");
         if (!f) {
-                log_full(errno == ENOENT ? LOG_DEBUG : LOG_WARNING,
-                         "Failed to open /proc/swaps: %m");
-                return negative_errno();
+                log_debug_errno(errno, "Failed to open /proc/swaps: %m");
+                return errno == ENOENT ? -EOPNOTSUPP : -errno; /* Convert swap not supported to a recognizable error */
         }
 
         (void) fscanf(f, "%*s %*s %*s %*s %*s\n");
@@ -334,7 +348,7 @@ int find_hibernate_location(HibernateLocation **ret_hibernate_location) {
 
                 swap = new0(SwapEntry, 1);
                 if (!swap)
-                        return log_oom();
+                        return -ENOMEM;
 
                 k = fscanf(f,
                            "%ms "       /* device/file */
@@ -346,13 +360,13 @@ int find_hibernate_location(HibernateLocation **ret_hibernate_location) {
                 if (k == EOF)
                         break;
                 if (k != 5) {
-                        log_warning("Failed to parse /proc/swaps:%u", i);
+                        log_debug("Failed to parse /proc/swaps:%u, ignoring", i);
                         continue;
                 }
 
                 if (streq(swap->type, "file")) {
                         if (endswith(swap->device, "\\040(deleted)")) {
-                                log_warning("Ignoring deleted swap file '%s'.", swap->device);
+                                log_debug("Ignoring deleted swap file '%s'.", swap->device);
                                 continue;
                         }
 
@@ -389,12 +403,14 @@ int find_hibernate_location(HibernateLocation **ret_hibernate_location) {
                 dev_t swap_device;
                 r = swap_device_to_device_id(swap, &swap_device);
                 if (r < 0)
-                        return log_error_errno(r, "%s: failed to query device number: %m", swap->device);
+                        return log_debug_errno(r, "%s: failed to query device number: %m", swap->device);
+                if (swap_device == 0)
+                        return log_debug_errno(SYNTHETIC_ERRNO(ENODEV), "%s: not backed by block device.", swap->device);
 
                 hibernate_location = hibernate_location_free(hibernate_location);
                 hibernate_location = new(HibernateLocation, 1);
                 if (!hibernate_location)
-                        return log_oom();
+                        return -ENOMEM;
 
                 *hibernate_location = (HibernateLocation) {
                         .devno = swap_device,
@@ -581,8 +597,7 @@ static bool can_s2h(const SleepConfig *sleep_config) {
         int r;
 
         if (!clock_supported(CLOCK_BOOTTIME_ALARM)) {
-                log_full(errno == ENOENT ? LOG_DEBUG : LOG_WARNING,
-                         "CLOCK_BOOTTIME_ALARM is not supported");
+                log_debug("CLOCK_BOOTTIME_ALARM is not supported.");
                 return false;
         }
 
@@ -671,9 +686,9 @@ int sleep_settings(const char *verb, const SleepConfig *sleep_config, bool *ret_
         return 0;
 }
 
-void free_sleep_config(SleepConfig *sc) {
+SleepConfig* free_sleep_config(SleepConfig *sc) {
         if (!sc)
-                return;
+                return NULL;
 
         strv_free(sc->suspend_modes);
         strv_free(sc->suspend_states);
@@ -684,5 +699,5 @@ void free_sleep_config(SleepConfig *sc) {
         strv_free(sc->hybrid_modes);
         strv_free(sc->hybrid_states);
 
-        free(sc);
+        return mfree(sc);
 }

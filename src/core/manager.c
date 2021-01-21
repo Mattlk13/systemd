@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
 #include <fcntl.h>
@@ -44,11 +44,13 @@
 #include "fd-util.h"
 #include "fileio.h"
 #include "fs-util.h"
+#include "generator-setup.h"
 #include "hashmap.h"
 #include "install.h"
 #include "io-util.h"
 #include "label.h"
 #include "locale-setup.h"
+#include "load-fragment.h"
 #include "log.h"
 #include "macro.h"
 #include "manager.h"
@@ -61,6 +63,7 @@
 #include "ratelimit.h"
 #include "rlimit-util.h"
 #include "rm-rf.h"
+#include "selinux-util.h"
 #include "serialize.h"
 #include "signal-util.h"
 #include "socket-util.h"
@@ -109,6 +112,7 @@ static int manager_dispatch_sigchld(sd_event_source *source, void *userdata);
 static int manager_dispatch_timezone_change(sd_event_source *source, const struct inotify_event *event, void *userdata);
 static int manager_run_environment_generators(Manager *m);
 static int manager_run_generators(Manager *m);
+static void manager_vacuum(Manager *m);
 
 static usec_t manager_watch_jobs_next_time(Manager *m) {
         return usec_add(now(CLOCK_MONOTONIC),
@@ -180,7 +184,7 @@ static void draw_cylon(char buffer[], size_t buflen, unsigned width, unsigned po
         }
 }
 
-void manager_flip_auto_status(Manager *m, bool enable, const char *reason) {
+static void manager_flip_auto_status(Manager *m, bool enable, const char *reason) {
         assert(m);
 
         if (enable) {
@@ -194,7 +198,6 @@ void manager_flip_auto_status(Manager *m, bool enable, const char *reason) {
 
 static void manager_print_jobs_in_progress(Manager *m) {
         _cleanup_free_ char *job_of_n = NULL;
-        Iterator i;
         Job *j;
         unsigned counter = 0, print_nr;
         char cylon[6 + CYLON_BUFFER_EXTRA + 1];
@@ -209,7 +212,7 @@ static void manager_print_jobs_in_progress(Manager *m) {
 
         print_nr = (m->jobs_in_progress_iteration / JOBS_IN_PROGRESS_PERIOD_DIVISOR) % m->n_running_jobs;
 
-        HASHMAP_FOREACH(j, m->jobs, i)
+        HASHMAP_FOREACH(j, m->jobs)
                 if (j->state == JOB_RUNNING && counter++ == print_nr)
                         break;
 
@@ -312,9 +315,9 @@ static int manager_check_ask_password(Manager *m) {
                                     m->ask_password_inotify_fd, EPOLLIN,
                                     manager_dispatch_ask_password_fd, m);
                 if (r < 0) {
-                        log_error_errno(errno, "Failed to add event source for /run/systemd/ask-password: %m");
+                        log_error_errno(r, "Failed to add event source for /run/systemd/ask-password: %m");
                         manager_close_ask_password(m);
-                        return -errno;
+                        return r;
                 }
 
                 (void) sd_event_source_set_description(m->ask_password_event_source, "manager-ask-password");
@@ -586,6 +589,9 @@ static char** sanitize_environment(char **l) {
         /* Let's remove some environment variables that we need ourselves to communicate with our clients */
         strv_env_unset_many(
                         l,
+                        "CACHE_DIRECTORY",
+                        "CONFIGURATION_DIRECTORY",
+                        "CREDENTIALS_DIRECTORY",
                         "EXIT_CODE",
                         "EXIT_STATUS",
                         "INVOCATION_ID",
@@ -593,13 +599,16 @@ static char** sanitize_environment(char **l) {
                         "LISTEN_FDNAMES",
                         "LISTEN_FDS",
                         "LISTEN_PID",
+                        "LOGS_DIRECTORY",
                         "MAINPID",
                         "MANAGERPID",
                         "NOTIFY_SOCKET",
                         "PIDFILE",
                         "REMOTE_ADDR",
                         "REMOTE_PORT",
+                        "RUNTIME_DIRECTORY",
                         "SERVICE_RESULT",
+                        "STATE_DIRECTORY",
                         "WATCHDOG_PID",
                         "WATCHDOG_USEC",
                         NULL);
@@ -662,34 +671,28 @@ static int manager_setup_prefix(Manager *m) {
         };
 
         static const struct table_entry paths_system[_EXEC_DIRECTORY_TYPE_MAX] = {
-                [EXEC_DIRECTORY_RUNTIME] = { SD_PATH_SYSTEM_RUNTIME, NULL },
-                [EXEC_DIRECTORY_STATE] = { SD_PATH_SYSTEM_STATE_PRIVATE, NULL },
-                [EXEC_DIRECTORY_CACHE] = { SD_PATH_SYSTEM_STATE_CACHE, NULL },
-                [EXEC_DIRECTORY_LOGS] = { SD_PATH_SYSTEM_STATE_LOGS, NULL },
+                [EXEC_DIRECTORY_RUNTIME] =       { SD_PATH_SYSTEM_RUNTIME,       NULL },
+                [EXEC_DIRECTORY_STATE] =         { SD_PATH_SYSTEM_STATE_PRIVATE, NULL },
+                [EXEC_DIRECTORY_CACHE] =         { SD_PATH_SYSTEM_STATE_CACHE,   NULL },
+                [EXEC_DIRECTORY_LOGS] =          { SD_PATH_SYSTEM_STATE_LOGS,    NULL },
                 [EXEC_DIRECTORY_CONFIGURATION] = { SD_PATH_SYSTEM_CONFIGURATION, NULL },
         };
 
         static const struct table_entry paths_user[_EXEC_DIRECTORY_TYPE_MAX] = {
-                [EXEC_DIRECTORY_RUNTIME] = { SD_PATH_USER_RUNTIME, NULL },
-                [EXEC_DIRECTORY_STATE] = { SD_PATH_USER_CONFIGURATION, NULL },
-                [EXEC_DIRECTORY_CACHE] = { SD_PATH_USER_STATE_CACHE, NULL },
-                [EXEC_DIRECTORY_LOGS] = { SD_PATH_USER_CONFIGURATION, "log" },
-                [EXEC_DIRECTORY_CONFIGURATION] = { SD_PATH_USER_CONFIGURATION, NULL },
+                [EXEC_DIRECTORY_RUNTIME] =       { SD_PATH_USER_RUNTIME,       NULL  },
+                [EXEC_DIRECTORY_STATE] =         { SD_PATH_USER_CONFIGURATION, NULL  },
+                [EXEC_DIRECTORY_CACHE] =         { SD_PATH_USER_STATE_CACHE,   NULL  },
+                [EXEC_DIRECTORY_LOGS] =          { SD_PATH_USER_CONFIGURATION, "log" },
+                [EXEC_DIRECTORY_CONFIGURATION] = { SD_PATH_USER_CONFIGURATION, NULL  },
         };
-
-        const struct table_entry *p;
-        ExecDirectoryType i;
-        int r;
 
         assert(m);
 
-        if (MANAGER_IS_SYSTEM(m))
-                p = paths_system;
-        else
-                p = paths_user;
+        const struct table_entry *p = MANAGER_IS_SYSTEM(m) ? paths_system : paths_user;
+        int r;
 
-        for (i = 0; i < _EXEC_DIRECTORY_TYPE_MAX; i++) {
-                r = sd_path_home(p[i].type, p[i].suffix, &m->prefix[i]);
+        for (ExecDirectoryType i = 0; i < _EXEC_DIRECTORY_TYPE_MAX; i++) {
+                r = sd_path_lookup(p[i].type, p[i].suffix, &m->prefix[i]);
                 if (r < 0)
                         return r;
         }
@@ -700,8 +703,8 @@ static int manager_setup_prefix(Manager *m) {
 static void manager_free_unit_name_maps(Manager *m) {
         m->unit_id_map = hashmap_free(m->unit_id_map);
         m->unit_name_map = hashmap_free(m->unit_name_map);
-        m->unit_path_cache = set_free_free(m->unit_path_cache);
-        m->unit_cache_mtime =  0;
+        m->unit_path_cache = set_free(m->unit_path_cache);
+        m->unit_cache_timestamp_hash = 0;
 }
 
 static int manager_setup_run_queue(Manager *m) {
@@ -752,6 +755,7 @@ static int manager_setup_sigchld_event_source(Manager *m) {
 
 int manager_new(UnitFileScope scope, ManagerTestRunFlags test_run_flags, Manager **_m) {
         _cleanup_(manager_freep) Manager *m = NULL;
+        const char *e;
         int r;
 
         assert(_m);
@@ -777,6 +781,12 @@ int manager_new(UnitFileScope scope, ManagerTestRunFlags test_run_flags, Manager
 
                 .original_log_level = -1,
                 .original_log_target = _LOG_TARGET_INVALID,
+
+                .watchdog_overridden[WATCHDOG_RUNTIME] = USEC_INFINITY,
+                .watchdog_overridden[WATCHDOG_REBOOT] = USEC_INFINITY,
+                .watchdog_overridden[WATCHDOG_KEXEC] = USEC_INFINITY,
+
+                .show_status_overridden = _SHOW_STATUS_INVALID,
 
                 .notify_fd = -1,
                 .cgroups_agent_fd = -1,
@@ -833,10 +843,6 @@ int manager_new(UnitFileScope scope, ManagerTestRunFlags test_run_flags, Manager
         if (r < 0)
                 return r;
 
-        r = hashmap_ensure_allocated(&m->jobs, NULL);
-        if (r < 0)
-                return r;
-
         r = hashmap_ensure_allocated(&m->cgroup_unit, &path_hash_ops);
         if (r < 0)
                 return r;
@@ -852,6 +858,13 @@ int manager_new(UnitFileScope scope, ManagerTestRunFlags test_run_flags, Manager
         r = manager_setup_prefix(m);
         if (r < 0)
                 return r;
+
+        e = secure_getenv("CREDENTIALS_DIRECTORY");
+        if (e) {
+                m->received_credentials = strdup(e);
+                if (!m->received_credentials)
+                        return -ENOMEM;
+        }
 
         r = sd_event_default(&m->event);
         if (r < 0)
@@ -950,9 +963,9 @@ static int manager_setup_notify(Manager *m) {
                 (void) mkdir_parents_label(m->notify_socket, 0755);
                 (void) sockaddr_un_unlink(&sa.un);
 
-                r = bind(fd, &sa.sa, sa_len);
+                r = mac_selinux_bind(fd, &sa.sa, sa_len);
                 if (r < 0)
-                        return log_error_errno(errno, "bind(%s) failed: %m", m->notify_socket);
+                        return log_error_errno(r, "bind(%s) failed: %m", m->notify_socket);
 
                 r = setsockopt_int(fd, SOL_SOCKET, SO_PASSCRED, true);
                 if (r < 0)
@@ -1133,13 +1146,12 @@ enum {
 
 static void unit_gc_mark_good(Unit *u, unsigned gc_marker) {
         Unit *other;
-        Iterator i;
         void *v;
 
         u->gc_marker = gc_marker + GC_OFFSET_GOOD;
 
         /* Recursively mark referenced units as GOOD as well */
-        HASHMAP_FOREACH_KEY(v, other, u->dependencies[UNIT_REFERENCES], i)
+        HASHMAP_FOREACH_KEY(v, other, u->dependencies[UNIT_REFERENCES])
                 if (other->gc_marker == gc_marker + GC_OFFSET_UNSURE)
                         unit_gc_mark_good(other, gc_marker);
 }
@@ -1147,7 +1159,6 @@ static void unit_gc_mark_good(Unit *u, unsigned gc_marker) {
 static void unit_gc_sweep(Unit *u, unsigned gc_marker) {
         Unit *other;
         bool is_bad;
-        Iterator i;
         void *v;
 
         assert(u);
@@ -1166,7 +1177,7 @@ static void unit_gc_sweep(Unit *u, unsigned gc_marker) {
 
         is_bad = true;
 
-        HASHMAP_FOREACH_KEY(v, other, u->dependencies[UNIT_REFERENCED_BY], i) {
+        HASHMAP_FOREACH_KEY(v, other, u->dependencies[UNIT_REFERENCED_BY]) {
                 unit_gc_sweep(other, gc_marker);
 
                 if (other->gc_marker == gc_marker + GC_OFFSET_GOOD)
@@ -1338,15 +1349,12 @@ static void manager_clear_jobs_and_units(Manager *m) {
 }
 
 Manager* manager_free(Manager *m) {
-        ExecDirectoryType dt;
-        UnitType c;
-
         if (!m)
                 return NULL;
 
         manager_clear_jobs_and_units(m);
 
-        for (c = 0; c < _UNIT_TYPE_MAX; c++)
+        for (UnitType c = 0; c < _UNIT_TYPE_MAX; c++)
                 if (unit_vtable[c]->shutdown)
                         unit_vtable[c]->shutdown(m);
 
@@ -1417,22 +1425,21 @@ Manager* manager_free(Manager *m) {
         hashmap_free(m->uid_refs);
         hashmap_free(m->gid_refs);
 
-        for (dt = 0; dt < _EXEC_DIRECTORY_TYPE_MAX; dt++)
+        for (ExecDirectoryType dt = 0; dt < _EXEC_DIRECTORY_TYPE_MAX; dt++)
                 m->prefix[dt] = mfree(m->prefix[dt]);
+        free(m->received_credentials);
 
         return mfree(m);
 }
 
 static void manager_enumerate_perpetual(Manager *m) {
-        UnitType c;
-
         assert(m);
 
         if (m->test_run_flags == MANAGER_TEST_RUN_MINIMAL)
                 return;
 
         /* Let's ask every type to load all units from disk/kernel that it might know */
-        for (c = 0; c < _UNIT_TYPE_MAX; c++) {
+        for (UnitType c = 0; c < _UNIT_TYPE_MAX; c++) {
                 if (!unit_type_supported(c)) {
                         log_debug("Unit type .%s is not supported on this system.", unit_type_to_string(c));
                         continue;
@@ -1444,15 +1451,13 @@ static void manager_enumerate_perpetual(Manager *m) {
 }
 
 static void manager_enumerate(Manager *m) {
-        UnitType c;
-
         assert(m);
 
         if (m->test_run_flags == MANAGER_TEST_RUN_MINIMAL)
                 return;
 
         /* Let's ask every type to load all units from disk/kernel that it might know */
-        for (c = 0; c < _UNIT_TYPE_MAX; c++) {
+        for (UnitType c = 0; c < _UNIT_TYPE_MAX; c++) {
                 if (!unit_type_supported(c)) {
                         log_debug("Unit type .%s is not supported on this system.", unit_type_to_string(c));
                         continue;
@@ -1466,7 +1471,6 @@ static void manager_enumerate(Manager *m) {
 }
 
 static void manager_coldplug(Manager *m) {
-        Iterator i;
         Unit *u;
         char *k;
         int r;
@@ -1476,7 +1480,7 @@ static void manager_coldplug(Manager *m) {
         log_debug("Invoking unit coldplug() handlers…");
 
         /* Let's place the units back into their deserialized state */
-        HASHMAP_FOREACH_KEY(u, k, m->units, i) {
+        HASHMAP_FOREACH_KEY(u, k, m->units) {
 
                 /* ignore aliases */
                 if (u->id != k)
@@ -1489,7 +1493,6 @@ static void manager_coldplug(Manager *m) {
 }
 
 static void manager_catchup(Manager *m) {
-        Iterator i;
         Unit *u;
         char *k;
 
@@ -1498,7 +1501,7 @@ static void manager_catchup(Manager *m) {
         log_debug("Invoking unit catchup() handlers…");
 
         /* Let's catch up on any state changes that happened while we were reloading/reexecing */
-        HASHMAP_FOREACH_KEY(u, k, m->units, i) {
+        HASHMAP_FOREACH_KEY(u, k, m->units) {
 
                 /* ignore aliases */
                 if (u->id != k)
@@ -1509,12 +1512,11 @@ static void manager_catchup(Manager *m) {
 }
 
 static void manager_distribute_fds(Manager *m, FDSet *fds) {
-        Iterator i;
         Unit *u;
 
         assert(m);
 
-        HASHMAP_FOREACH(u, m->units, i) {
+        HASHMAP_FOREACH(u, m->units) {
 
                 if (fdset_size(fds) <= 0)
                         break;
@@ -1593,20 +1595,6 @@ static void manager_preset_all(Manager *m) {
                                "Failed to populate /etc with preset unit settings, ignoring: %m");
         else
                 log_info("Populated /etc with preset unit settings.");
-}
-
-static void manager_vacuum(Manager *m) {
-        assert(m);
-
-        /* Release any dynamic users no longer referenced */
-        dynamic_user_vacuum(m, true);
-
-        /* Release any references to UIDs/GIDs no longer referenced, and destroy any IPC owned by them */
-        manager_vacuum_uid_refs(m);
-        manager_vacuum_gid_refs(m);
-
-        /* Release any runtimes no longer referenced */
-        exec_runtime_vacuum(m);
 }
 
 static void manager_ready(Manager *m) {
@@ -1889,7 +1877,6 @@ Unit *manager_get_unit(Manager *m, const char *name) {
 
 static int manager_dispatch_target_deps_queue(Manager *m) {
         Unit *u;
-        unsigned k;
         int r = 0;
 
         static const UnitDependency deps[] = {
@@ -1907,12 +1894,11 @@ static int manager_dispatch_target_deps_queue(Manager *m) {
                 LIST_REMOVE(target_deps_queue, u->manager->target_deps_queue, u);
                 u->in_target_deps_queue = false;
 
-                for (k = 0; k < ELEMENTSOF(deps); k++) {
+                for (size_t k = 0; k < ELEMENTSOF(deps); k++) {
                         Unit *target;
-                        Iterator i;
                         void *v;
 
-                        HASHMAP_FOREACH_KEY(v, target, u->dependencies[deps[k]], i) {
+                        HASHMAP_FOREACH_KEY(v, target, u->dependencies[deps[k]]) {
                                 r = unit_add_default_target_dependency(u, target);
                                 if (r < 0)
                                         return r;
@@ -1954,6 +1940,24 @@ unsigned manager_dispatch_load_queue(Manager *m) {
         return n;
 }
 
+bool manager_unit_cache_should_retry_load(Unit *u) {
+        assert(u);
+
+        /* Automatic reloading from disk only applies to units which were not found sometime in the past, and
+         * the not-found stub is kept pinned in the unit graph by dependencies. For units that were
+         * previously loaded, we don't do automatic reloading, and daemon-reload is necessary to update. */
+        if (u->load_state != UNIT_NOT_FOUND)
+                return false;
+
+        /* The cache has been updated since the last time we tried to load the unit. There might be new
+         * fragment paths to read. */
+        if (u->manager->unit_cache_timestamp_hash != u->fragment_not_found_timestamp_hash)
+                return true;
+
+        /* The cache needs to be updated because there are modifications on disk. */
+        return !lookup_paths_timestamp_hash_same(&u->manager->lookup_paths, u->manager->unit_cache_timestamp_hash, NULL);
+}
+
 int manager_load_unit_prepare(
                 Manager *m,
                 const char *name,
@@ -1967,17 +1971,20 @@ int manager_load_unit_prepare(
         int r;
 
         assert(m);
-        assert(name || path);
         assert(_ret);
 
-        /* This will prepare the unit for loading, but not actually
-         * load anything from disk. */
+        /* This will prepare the unit for loading, but not actually load anything from disk. */
 
-        if (path && !is_path(path))
+        if (path && !path_is_absolute(path))
                 return sd_bus_error_setf(e, SD_BUS_ERROR_INVALID_ARGS, "Path %s is not absolute.", path);
 
-        if (!name)
+        if (!name) {
+                /* 'name' and 'path' must not both be null. Check here 'path' using assert_se() to
+                 * workaround a bug in gcc that generates a -Wnonnull warning when calling basename(),
+                 * but this cannot be possible in any code path (See #6119). */
+                assert_se(path);
                 name = basename(path);
+        }
 
         t = unit_name_to_type(name);
 
@@ -1990,18 +1997,31 @@ int manager_load_unit_prepare(
 
         ret = manager_get_unit(m, name);
         if (ret) {
-                *_ret = ret;
-                return 1;
+                /* The time-based cache allows to start new units without daemon-reload,
+                 * but if they are already referenced (because of dependencies or ordering)
+                 * then we have to force a load of the fragment. As an optimization, check
+                 * first if anything in the usual paths was modified since the last time
+                 * the cache was loaded. Also check if the last time an attempt to load the
+                 * unit was made was before the most recent cache refresh, so that we know
+                 * we need to try again — even if the cache is current, it might have been
+                 * updated in a different context before we had a chance to retry loading
+                 * this particular unit. */
+                if (manager_unit_cache_should_retry_load(ret))
+                        ret->load_state = UNIT_STUB;
+                else {
+                        *_ret = ret;
+                        return 1;
+                }
+        } else {
+                ret = cleanup_ret = unit_new(m, unit_vtable[t]->object_size);
+                if (!ret)
+                        return -ENOMEM;
         }
 
-        ret = cleanup_ret = unit_new(m, unit_vtable[t]->object_size);
-        if (!ret)
-                return -ENOMEM;
-
         if (path) {
-                ret->fragment_path = strdup(path);
-                if (!ret->fragment_path)
-                        return -ENOMEM;
+                r = free_and_strdup(&ret->fragment_path, path);
+                if (r < 0)
+                        return r;
         }
 
         r = unit_add_name(ret, name);
@@ -2070,36 +2090,32 @@ int manager_load_startable_unit_or_warn(
 }
 
 void manager_dump_jobs(Manager *s, FILE *f, const char *prefix) {
-        Iterator i;
         Job *j;
 
         assert(s);
         assert(f);
 
-        HASHMAP_FOREACH(j, s->jobs, i)
+        HASHMAP_FOREACH(j, s->jobs)
                 job_dump(j, f, prefix);
 }
 
 void manager_dump_units(Manager *s, FILE *f, const char *prefix) {
-        Iterator i;
         Unit *u;
         const char *t;
 
         assert(s);
         assert(f);
 
-        HASHMAP_FOREACH_KEY(u, t, s->units, i)
+        HASHMAP_FOREACH_KEY(u, t, s->units)
                 if (u->id == t)
                         unit_dump(u, f, prefix);
 }
 
 void manager_dump(Manager *m, FILE *f, const char *prefix) {
-        ManagerTimestamp q;
-
         assert(m);
         assert(f);
 
-        for (q = 0; q < _MANAGER_TIMESTAMP_MAX; q++) {
+        for (ManagerTimestamp q = 0; q < _MANAGER_TIMESTAMP_MAX; q++) {
                 const dual_timestamp *t = m->timestamps + q;
                 char buf[CONST_MAX(FORMAT_TIMESPAN_MAX, FORMAT_TIMESTAMP_MAX)];
 
@@ -2283,37 +2299,48 @@ static int manager_dispatch_cgroups_agent_fd(sd_event_source *source, int fd, ui
         return 0;
 }
 
+static bool manager_process_barrier_fd(char * const *tags, FDSet *fds) {
+
+        /* nothing else must be sent when using BARRIER=1 */
+        if (strv_contains(tags, "BARRIER=1")) {
+                if (strv_length(tags) == 1) {
+                        if (fdset_size(fds) != 1)
+                                log_warning("Got incorrect number of fds with BARRIER=1, closing them.");
+                } else
+                        log_warning("Extra notification messages sent with BARRIER=1, ignoring everything.");
+
+                /* Drop the message if BARRIER=1 was found */
+                return true;
+        }
+
+        return false;
+}
+
 static void manager_invoke_notify_message(
                 Manager *m,
                 Unit *u,
                 const struct ucred *ucred,
-                const char *buf,
+                char * const *tags,
                 FDSet *fds) {
 
         assert(m);
         assert(u);
         assert(ucred);
-        assert(buf);
+        assert(tags);
 
         if (u->notifygen == m->notifygen) /* Already invoked on this same unit in this same iteration? */
                 return;
         u->notifygen = m->notifygen;
 
-        if (UNIT_VTABLE(u)->notify_message) {
-                _cleanup_strv_free_ char **tags = NULL;
-
-                tags = strv_split(buf, NEWLINE);
-                if (!tags) {
-                        log_oom();
-                        return;
-                }
-
+        if (UNIT_VTABLE(u)->notify_message)
                 UNIT_VTABLE(u)->notify_message(u, ucred, tags, fds);
 
-        } else if (DEBUG_LOGGING) {
-                _cleanup_free_ char *x = NULL, *y = NULL;
+        else if (DEBUG_LOGGING) {
+                _cleanup_free_ char *buf = NULL, *x = NULL, *y = NULL;
 
-                x = ellipsize(buf, 20, 90);
+                buf = strv_join(tags, ", ");
+                if (buf)
+                        x = ellipsize(buf, 20, 90);
                 if (x)
                         y = cescape(x);
 
@@ -2330,11 +2357,8 @@ static int manager_dispatch_notify_fd(sd_event_source *source, int fd, uint32_t 
                 .iov_base = buf,
                 .iov_len = sizeof(buf)-1,
         };
-        union {
-                struct cmsghdr cmsghdr;
-                uint8_t buf[CMSG_SPACE(sizeof(struct ucred)) +
-                            CMSG_SPACE(sizeof(int) * NOTIFY_FD_MAX)];
-        } control = {};
+        CMSG_BUFFER_TYPE(CMSG_SPACE(sizeof(struct ucred)) +
+                         CMSG_SPACE(sizeof(int) * NOTIFY_FD_MAX)) control;
         struct msghdr msghdr = {
                 .msg_iov = &iovec,
                 .msg_iovlen = 1,
@@ -2345,6 +2369,7 @@ static int manager_dispatch_notify_fd(sd_event_source *source, int fd, uint32_t 
         struct cmsghdr *cmsg;
         struct ucred *ucred = NULL;
         _cleanup_free_ Unit **array_copy = NULL;
+        _cleanup_strv_free_ char **tags = NULL;
         Unit *u1, *u2, **array;
         int r, *fd_array = NULL;
         size_t n_fds = 0;
@@ -2359,20 +2384,24 @@ static int manager_dispatch_notify_fd(sd_event_source *source, int fd, uint32_t 
                 return 0;
         }
 
-        n = recvmsg(m->notify_fd, &msghdr, MSG_DONTWAIT|MSG_CMSG_CLOEXEC|MSG_TRUNC);
-        if (n < 0) {
-                if (IN_SET(errno, EAGAIN, EINTR))
-                        return 0; /* Spurious wakeup, try again */
-
-                /* If this is any other, real error, then let's stop processing this socket. This of course means we
-                 * won't take notification messages anymore, but that's still better than busy looping around this:
-                 * being woken up over and over again but being unable to actually read the message off the socket. */
-                return log_error_errno(errno, "Failed to receive notification message: %m");
+        n = recvmsg_safe(m->notify_fd, &msghdr, MSG_DONTWAIT|MSG_CMSG_CLOEXEC|MSG_TRUNC);
+        if (IN_SET(n, -EAGAIN, -EINTR))
+                return 0; /* Spurious wakeup, try again */
+        if (n == -EXFULL) {
+                log_warning("Got message with truncated control data (too many fds sent?), ignoring.");
+                return 0;
         }
+        if (n < 0)
+                /* If this is any other, real error, then let's stop processing this socket. This of course
+                 * means we won't take notification messages anymore, but that's still better than busy
+                 * looping around this: being woken up over and over again but being unable to actually read
+                 * the message off the socket. */
+                return log_error_errno(n, "Failed to receive notification message: %m");
 
         CMSG_FOREACH(cmsg, &msghdr) {
                 if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS) {
 
+                        assert(!fd_array);
                         fd_array = (int*) CMSG_DATA(cmsg);
                         n_fds = (cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int);
 
@@ -2380,6 +2409,7 @@ static int manager_dispatch_notify_fd(sd_event_source *source, int fd, uint32_t 
                            cmsg->cmsg_type == SCM_CREDENTIALS &&
                            cmsg->cmsg_len == CMSG_LEN(sizeof(struct ucred))) {
 
+                        assert(!ucred);
                         ucred = (struct ucred*) CMSG_DATA(cmsg);
                 }
         }
@@ -2412,8 +2442,17 @@ static int manager_dispatch_notify_fd(sd_event_source *source, int fd, uint32_t 
                 return 0;
         }
 
-        /* Make sure it's NUL-terminated. */
+        /* Make sure it's NUL-terminated, then parse it to obtain the tags list */
         buf[n] = 0;
+        tags = strv_split_newlines(buf);
+        if (!tags) {
+                log_oom();
+                return 0;
+        }
+
+        /* possibly a barrier fd, let's see */
+        if (manager_process_barrier_fd(tags, fds))
+                return 0;
 
         /* Increase the generation counter used for filtering out duplicate unit invocations. */
         m->notifygen++;
@@ -2435,16 +2474,16 @@ static int manager_dispatch_notify_fd(sd_event_source *source, int fd, uint32_t 
         /* And now invoke the per-unit callbacks. Note that manager_invoke_notify_message() will handle duplicate units
          * make sure we only invoke each unit's handler once. */
         if (u1) {
-                manager_invoke_notify_message(m, u1, ucred, buf, fds);
+                manager_invoke_notify_message(m, u1, ucred, tags, fds);
                 found = true;
         }
         if (u2) {
-                manager_invoke_notify_message(m, u2, ucred, buf, fds);
+                manager_invoke_notify_message(m, u2, ucred, tags, fds);
                 found = true;
         }
         if (array_copy)
                 for (size_t i = 0; array_copy[i]; i++) {
-                        manager_invoke_notify_message(m, array_copy[i], ucred, buf, fds);
+                        manager_invoke_notify_message(m, array_copy[i], ucred, tags, fds);
                         found = true;
                 }
 
@@ -2542,6 +2581,11 @@ static int manager_dispatch_sigchld(sd_event_source *source, void *userdata) {
                         /* We check for oom condition, in case we got SIGCHLD before the oom notification.
                          * We only do this for the cgroup the PID belonged to. */
                         (void) unit_check_oom(u1);
+
+                        /* This only logs for now. In the future when the interface for kills/notifications
+                         * is more stable we can extend service results table similar to how kernel oom kills
+                         * are managed. */
+                        (void) unit_check_oomd_kill(u1);
 
                         manager_invoke_sigchld_event(m, u1, &si);
                 }
@@ -2745,11 +2789,11 @@ static int manager_dispatch_signal_fd(sd_event_source *source, int fd, uint32_t 
                 switch (sfsi.ssi_signo - SIGRTMIN) {
 
                 case 20:
-                        manager_set_show_status(m, SHOW_STATUS_YES, "signal");
+                        manager_override_show_status(m, SHOW_STATUS_YES, "signal");
                         break;
 
                 case 21:
-                        manager_set_show_status(m, SHOW_STATUS_NO, "signal");
+                        manager_override_show_status(m, SHOW_STATUS_NO, "signal");
                         break;
 
                 case 22:
@@ -2792,7 +2836,6 @@ static int manager_dispatch_signal_fd(sd_event_source *source, int fd, uint32_t 
 
 static int manager_dispatch_time_change_fd(sd_event_source *source, int fd, uint32_t revents, void *userdata) {
         Manager *m = userdata;
-        Iterator i;
         Unit *u;
 
         assert(m);
@@ -2805,7 +2848,7 @@ static int manager_dispatch_time_change_fd(sd_event_source *source, int fd, uint
         /* Restart the watch */
         (void) manager_setup_time_change(m);
 
-        HASHMAP_FOREACH(u, m->units, i)
+        HASHMAP_FOREACH(u, m->units)
                 if (UNIT_VTABLE(u)->time_change)
                         UNIT_VTABLE(u)->time_change(u);
 
@@ -2819,7 +2862,6 @@ static int manager_dispatch_timezone_change(
 
         Manager *m = userdata;
         int changed;
-        Iterator i;
         Unit *u;
 
         assert(m);
@@ -2838,7 +2880,7 @@ static int manager_dispatch_timezone_change(
 
         log_debug("Timezone has been changed (now: %s).", tzname[daylight]);
 
-        HASHMAP_FOREACH(u, m->units, i)
+        HASHMAP_FOREACH(u, m->units)
                 if (UNIT_VTABLE(u)->timezone_change)
                         UNIT_VTABLE(u)->timezone_change(u);
 
@@ -2868,15 +2910,13 @@ static int manager_dispatch_idle_pipe_fd(sd_event_source *source, int fd, uint32
 static int manager_dispatch_jobs_in_progress(sd_event_source *source, usec_t usec, void *userdata) {
         Manager *m = userdata;
         int r;
-        uint64_t next;
 
         assert(m);
         assert(source);
 
         manager_print_jobs_in_progress(m);
 
-        next = now(CLOCK_MONOTONIC) + JOBS_IN_PROGRESS_PERIOD_USEC;
-        r = sd_event_source_set_time(source, next);
+        r = sd_event_source_set_time_relative(source, JOBS_IN_PROGRESS_PERIOD_USEC);
         if (r < 0)
                 return r;
 
@@ -2898,10 +2938,13 @@ int manager_loop(Manager *m) {
                 return log_error_errno(r, "Failed to enable SIGCHLD event source: %m");
 
         while (m->objective == MANAGER_OK) {
-                usec_t wait_usec;
+                usec_t wait_usec, watchdog_usec;
 
-                if (timestamp_is_set(m->runtime_watchdog) && MANAGER_IS_SYSTEM(m))
-                        watchdog_ping();
+                watchdog_usec = manager_get_watchdog(m, WATCHDOG_RUNTIME);
+                if (m->runtime_watchdog_running)
+                        (void) watchdog_ping();
+                else if (timestamp_is_set(watchdog_usec))
+                        manager_retry_runtime_watchdog(m);
 
                 if (!ratelimit_below(&rl)) {
                         /* Yay, something is going seriously wrong, pause a little */
@@ -2930,12 +2973,10 @@ int manager_loop(Manager *m) {
                 if (manager_dispatch_dbus_queue(m) > 0)
                         continue;
 
-                /* Sleep for half the watchdog time */
-                if (timestamp_is_set(m->runtime_watchdog) && MANAGER_IS_SYSTEM(m)) {
-                        wait_usec = m->runtime_watchdog / 2;
-                        if (wait_usec <= 0)
-                                wait_usec = 1;
-                } else
+                /* Sleep for watchdog runtime wait time */
+                if (timestamp_is_set(watchdog_usec))
+                        wait_usec = watchdog_runtime_wait();
+                else
                         wait_usec = USEC_INFINITY;
 
                 r = sd_event_run(m->event, wait_usec);
@@ -3106,7 +3147,7 @@ void manager_send_unit_plymouth(Manager *m, Unit *u) {
 }
 
 int manager_open_serialization(Manager *m, FILE **_f) {
-        int fd;
+        _cleanup_close_ int fd = -1;
         FILE *f;
 
         assert(_f);
@@ -3115,11 +3156,9 @@ int manager_open_serialization(Manager *m, FILE **_f) {
         if (fd < 0)
                 return fd;
 
-        f = fdopen(fd, "w+");
-        if (!f) {
-                safe_close(fd);
+        f = take_fdopen(&fd, "w+");
+        if (!f)
                 return -errno;
-        }
 
         *_f = f;
         return 0;
@@ -3138,15 +3177,53 @@ static bool manager_timestamp_shall_serialize(ManagerTimestamp t) {
                        MANAGER_TIMESTAMP_UNITS_LOAD_START, MANAGER_TIMESTAMP_UNITS_LOAD_FINISH);
 }
 
+#define DESTROY_IPC_FLAG (UINT32_C(1) << 31)
+
+static void manager_serialize_uid_refs_internal(
+                Manager *m,
+                FILE *f,
+                Hashmap **uid_refs,
+                const char *field_name) {
+
+        void *p, *k;
+
+        assert(m);
+        assert(f);
+        assert(uid_refs);
+        assert(field_name);
+
+        /* Serialize the UID reference table. Or actually, just the IPC destruction flag of it, as
+         * the actual counter of it is better rebuild after a reload/reexec. */
+
+        HASHMAP_FOREACH_KEY(p, k, *uid_refs) {
+                uint32_t c;
+                uid_t uid;
+
+                uid = PTR_TO_UID(k);
+                c = PTR_TO_UINT32(p);
+
+                if (!(c & DESTROY_IPC_FLAG))
+                        continue;
+
+                (void) serialize_item_format(f, field_name, UID_FMT, uid);
+        }
+}
+
+static void manager_serialize_uid_refs(Manager *m, FILE *f) {
+        manager_serialize_uid_refs_internal(m, f, &m->uid_refs, "destroy-ipc-uid");
+}
+
+static void manager_serialize_gid_refs(Manager *m, FILE *f) {
+        manager_serialize_uid_refs_internal(m, f, &m->gid_refs, "destroy-ipc-gid");
+}
+
 int manager_serialize(
                 Manager *m,
                 FILE *f,
                 FDSet *fds,
                 bool switching_root) {
 
-        ManagerTimestamp q;
         const char *t;
-        Iterator i;
         Unit *u;
         int r;
 
@@ -3167,16 +3244,20 @@ int manager_serialize(
         /* After switching root, udevd has not been started yet. So, enumeration results should not be emitted. */
         (void) serialize_bool(f, "honor-device-enumeration", !switching_root);
 
-        t = show_status_to_string(m->show_status);
-        if (t)
-                (void) serialize_item(f, "show-status", t);
+        if (m->show_status_overridden != _SHOW_STATUS_INVALID)
+                (void) serialize_item(f, "show-status-overridden",
+                                      show_status_to_string(m->show_status_overridden));
 
         if (m->log_level_overridden)
                 (void) serialize_item_format(f, "log-level-override", "%i", log_get_max_level());
         if (m->log_target_overridden)
                 (void) serialize_item(f, "log-target-override", log_target_to_string(log_get_target()));
 
-        for (q = 0; q < _MANAGER_TIMESTAMP_MAX; q++) {
+        (void) serialize_usec(f, "runtime-watchdog-overridden", m->watchdog_overridden[WATCHDOG_RUNTIME]);
+        (void) serialize_usec(f, "reboot-watchdog-overridden", m->watchdog_overridden[WATCHDOG_REBOOT]);
+        (void) serialize_usec(f, "kexec-watchdog-overridden", m->watchdog_overridden[WATCHDOG_KEXEC]);
+
+        for (ManagerTimestamp q = 0; q < _MANAGER_TIMESTAMP_MAX; q++) {
                 _cleanup_free_ char *joined = NULL;
 
                 if (!manager_timestamp_shall_serialize(q))
@@ -3235,7 +3316,7 @@ int manager_serialize(
 
         (void) fputc('\n', f);
 
-        HASHMAP_FOREACH_KEY(u, t, m->units, i) {
+        HASHMAP_FOREACH_KEY(u, t, m->units) {
                 if (u->id != t)
                         continue;
 
@@ -3308,11 +3389,159 @@ static int manager_deserialize_units(Manager *m, FILE *f, FDSet *fds) {
         return 0;
 }
 
+usec_t manager_get_watchdog(Manager *m, WatchdogType t) {
+        assert(m);
+
+        if (MANAGER_IS_USER(m))
+                return USEC_INFINITY;
+
+        if (timestamp_is_set(m->watchdog_overridden[t]))
+                return m->watchdog_overridden[t];
+
+        return m->watchdog[t];
+}
+
+void manager_set_watchdog(Manager *m, WatchdogType t, usec_t timeout) {
+        int r = 0;
+
+        assert(m);
+
+        if (MANAGER_IS_USER(m))
+                return;
+
+        if (m->watchdog[t] == timeout)
+                return;
+
+        if (t == WATCHDOG_RUNTIME)
+                if (!timestamp_is_set(m->watchdog_overridden[WATCHDOG_RUNTIME])) {
+                        if (timestamp_is_set(timeout)) {
+                                r = watchdog_set_timeout(&timeout);
+
+                                if (r >= 0)
+                                        m->runtime_watchdog_running = true;
+                        } else {
+                                watchdog_close(true);
+                                m->runtime_watchdog_running = false;
+                        }
+                }
+
+        m->watchdog[t] = timeout;
+}
+
+int manager_override_watchdog(Manager *m, WatchdogType t, usec_t timeout) {
+        int r = 0;
+
+        assert(m);
+
+        if (MANAGER_IS_USER(m))
+                return 0;
+
+        if (m->watchdog_overridden[t] == timeout)
+                return 0;
+
+        if (t == WATCHDOG_RUNTIME) {
+                usec_t *p;
+
+                p = timestamp_is_set(timeout) ? &timeout : &m->watchdog[t];
+                if (timestamp_is_set(*p)) {
+                        r = watchdog_set_timeout(p);
+
+                        if (r >= 0)
+                                m->runtime_watchdog_running = true;
+                } else {
+                        watchdog_close(true);
+                        m->runtime_watchdog_running = false;
+                }
+        }
+
+        m->watchdog_overridden[t] = timeout;
+
+        return 0;
+}
+
+void manager_retry_runtime_watchdog(Manager *m) {
+        int r = 0;
+
+        assert(m);
+
+        if (timestamp_is_set(m->watchdog_overridden[WATCHDOG_RUNTIME]))
+                r = watchdog_set_timeout(&m->watchdog_overridden[WATCHDOG_RUNTIME]);
+        else
+                r = watchdog_set_timeout(&m->watchdog[WATCHDOG_RUNTIME]);
+
+        if (r >= 0)
+                m->runtime_watchdog_running = true;
+}
+
+static void manager_deserialize_uid_refs_one_internal(
+                Manager *m,
+                Hashmap** uid_refs,
+                const char *value) {
+
+        uid_t uid;
+        uint32_t c;
+        int r;
+
+        assert(m);
+        assert(uid_refs);
+        assert(value);
+
+        r = parse_uid(value, &uid);
+        if (r < 0 || uid == 0) {
+                log_debug("Unable to parse UID reference serialization: " UID_FMT, uid);
+                return;
+        }
+
+        r = hashmap_ensure_allocated(uid_refs, &trivial_hash_ops);
+        if (r < 0) {
+                log_oom();
+                return;
+        }
+
+        c = PTR_TO_UINT32(hashmap_get(*uid_refs, UID_TO_PTR(uid)));
+        if (c & DESTROY_IPC_FLAG)
+                return;
+
+        c |= DESTROY_IPC_FLAG;
+
+        r = hashmap_replace(*uid_refs, UID_TO_PTR(uid), UINT32_TO_PTR(c));
+        if (r < 0) {
+                log_debug_errno(r, "Failed to add UID reference entry: %m");
+                return;
+        }
+}
+
+static void manager_deserialize_uid_refs_one(Manager *m, const char *value) {
+        manager_deserialize_uid_refs_one_internal(m, &m->uid_refs, value);
+}
+
+static void manager_deserialize_gid_refs_one(Manager *m, const char *value) {
+        manager_deserialize_uid_refs_one_internal(m, &m->gid_refs, value);
+}
+
 int manager_deserialize(Manager *m, FILE *f, FDSet *fds) {
         int r = 0;
 
         assert(m);
         assert(f);
+
+        if (DEBUG_LOGGING) {
+                if (fdset_isempty(fds))
+                        log_debug("No file descriptors passed");
+                else {
+                        int fd;
+
+                        FDSET_FOREACH(fd, fds) {
+                                _cleanup_free_ char *fn = NULL;
+
+                                r = fd_get_path(fd, &fn);
+                                if (r < 0)
+                                        log_debug_errno(r, "Received serialized fd %i → %m", fd);
+                                else
+                                        log_debug("Received serialized fd %i → %s", fd, strna(fn));
+                        }
+                }
+        }
 
         log_debug("Deserializing state...");
 
@@ -3404,14 +3633,14 @@ int manager_deserialize(Manager *m, FILE *f, FDSet *fds) {
                         else
                                 m->honor_device_enumeration = b;
 
-                } else if ((val = startswith(l, "show-status="))) {
+                } else if ((val = startswith(l, "show-status-overridden="))) {
                         ShowStatus s;
 
                         s = show_status_from_string(val);
                         if (s < 0)
-                                log_notice("Failed to parse show-status flag '%s', ignoring.", val);
+                                log_notice("Failed to parse show-status-overridden flag '%s', ignoring.", val);
                         else
-                                manager_set_show_status(m, s, "deserialization");
+                                manager_override_show_status(m, s, "deserialize");
 
                 } else if ((val = startswith(l, "log-level-override="))) {
                         int level;
@@ -3430,6 +3659,30 @@ int manager_deserialize(Manager *m, FILE *f, FDSet *fds) {
                                 log_notice("Failed to parse log-target-override value '%s', ignoring.", val);
                         else
                                 manager_override_log_target(m, target);
+
+                } else if ((val = startswith(l, "runtime-watchdog-overridden="))) {
+                        usec_t t;
+
+                        if (deserialize_usec(val, &t) < 0)
+                                log_notice("Failed to parse runtime-watchdog-overridden value '%s', ignoring.", val);
+                        else
+                                manager_override_watchdog(m, WATCHDOG_RUNTIME, t);
+
+                } else if ((val = startswith(l, "reboot-watchdog-overridden="))) {
+                        usec_t t;
+
+                        if (deserialize_usec(val, &t) < 0)
+                                log_notice("Failed to parse reboot-watchdog-overridden value '%s', ignoring.", val);
+                        else
+                                manager_override_watchdog(m, WATCHDOG_REBOOT, t);
+
+                } else if ((val = startswith(l, "kexec-watchdog-overridden="))) {
+                        usec_t t;
+
+                        if (deserialize_usec(val, &t) < 0)
+                                log_notice("Failed to parse kexec-watchdog-overridden value '%s', ignoring.", val);
+                        else
+                                manager_override_watchdog(m, WATCHDOG_KEXEC, t);
 
                 } else if (startswith(l, "env=")) {
                         r = deserialize_environment(l + 4, &m->client_environment);
@@ -3482,7 +3735,7 @@ int manager_deserialize(Manager *m, FILE *f, FDSet *fds) {
                 else if ((val = startswith(l, "destroy-ipc-gid=")))
                         manager_deserialize_gid_refs_one(m, val);
                 else if ((val = startswith(l, "exec-runtime=")))
-                        exec_runtime_deserialize_one(m, val, fds);
+                        (void) exec_runtime_deserialize_one(m, val, fds);
                 else if ((val = startswith(l, "subscribed="))) {
 
                         if (strv_extend(&m->deserialized_subscribed, val) < 0)
@@ -3606,11 +3859,10 @@ int manager_reload(Manager *m) {
 
 void manager_reset_failed(Manager *m) {
         Unit *u;
-        Iterator i;
 
         assert(m);
 
-        HASHMAP_FOREACH(u, m->units, i)
+        HASHMAP_FOREACH(u, m->units)
                 unit_reset_failed(u);
 }
 
@@ -3786,6 +4038,11 @@ void manager_check_finished(Manager *m) {
                                                         manager_watch_jobs_next_time(m));
                 return;
         }
+
+        /* The jobs hashmap tends to grow a lot during boot, and then it's not reused until shutdown. Let's
+           kill the hashmap if it is relatively large. */
+        if (hashmap_buckets(m->jobs) > hashmap_size(m->units) / 10)
+                m->jobs = hashmap_free(m->jobs);
 
         manager_flip_auto_status(m, false, "boot finished");
 
@@ -3968,11 +4225,9 @@ int manager_get_effective_environment(Manager *m, char ***ret) {
 }
 
 int manager_set_default_rlimits(Manager *m, struct rlimit **default_rlimit) {
-        int i;
-
         assert(m);
 
-        for (i = 0; i < _RLIMIT_MAX; i++) {
+        for (unsigned i = 0; i < _RLIMIT_MAX; i++) {
                 m->rlimit[i] = mfree(m->rlimit[i]);
 
                 if (!default_rlimit[i])
@@ -4071,49 +4326,78 @@ void manager_recheck_journal(Manager *m) {
         log_open();
 }
 
-void manager_set_show_status(Manager *m, ShowStatus mode, const char *reason) {
+static ShowStatus manager_get_show_status(Manager *m) {
         assert(m);
-        assert(mode >= 0 && mode < _SHOW_STATUS_MAX);
 
-        if (!MANAGER_IS_SYSTEM(m))
-                return;
+        if (MANAGER_IS_USER(m))
+                return _SHOW_STATUS_INVALID;
 
-        if (mode == m->show_status)
-                return;
+        if (m->show_status_overridden != _SHOW_STATUS_INVALID)
+                return m->show_status_overridden;
 
-        bool enabled = IN_SET(mode, SHOW_STATUS_TEMPORARY, SHOW_STATUS_YES);
-        log_debug("%s (%s) showing of status (%s).",
-                  enabled ? "Enabling" : "Disabling",
-                  strna(show_status_to_string(mode)),
-                  reason);
-        m->show_status = mode;
+        return m->show_status;
+}
 
-        if (enabled)
+bool manager_get_show_status_on(Manager *m) {
+        assert(m);
+
+        return show_status_on(manager_get_show_status(m));
+}
+
+static void set_show_status_marker(bool b) {
+        if (b)
                 (void) touch("/run/systemd/show-status");
         else
                 (void) unlink("/run/systemd/show-status");
 }
 
-static bool manager_get_show_status(Manager *m, StatusType type) {
+void manager_set_show_status(Manager *m, ShowStatus mode, const char *reason) {
         assert(m);
+        assert(reason);
+        assert(mode >= 0 && mode < _SHOW_STATUS_MAX);
 
-        if (!MANAGER_IS_SYSTEM(m))
-                return false;
+        if (MANAGER_IS_USER(m))
+                return;
 
-        if (m->no_console_output)
-                return false;
+        if (mode == m->show_status)
+                return;
 
-        if (!IN_SET(manager_state(m), MANAGER_INITIALIZING, MANAGER_STARTING, MANAGER_STOPPING))
-                return false;
+        if (m->show_status_overridden == _SHOW_STATUS_INVALID) {
+                bool enabled;
 
-        /* If we cannot find out the status properly, just proceed. */
-        if (type != STATUS_TYPE_EMERGENCY && manager_check_ask_password(m) > 0)
-                return false;
+                enabled = show_status_on(mode);
+                log_debug("%s (%s) showing of status (%s).",
+                          enabled ? "Enabling" : "Disabling",
+                          strna(show_status_to_string(mode)),
+                          reason);
 
-        if (type == STATUS_TYPE_NOTICE && m->show_status != SHOW_STATUS_NO)
-                return true;
+                set_show_status_marker(enabled);
+        }
 
-        return show_status_on(m->show_status);
+        m->show_status = mode;
+}
+
+void manager_override_show_status(Manager *m, ShowStatus mode, const char *reason) {
+        assert(m);
+        assert(mode < _SHOW_STATUS_MAX);
+
+        if (MANAGER_IS_USER(m))
+                return;
+
+        if (mode == m->show_status_overridden)
+                return;
+
+        m->show_status_overridden = mode;
+
+        if (mode == _SHOW_STATUS_INVALID)
+                mode = m->show_status;
+
+        log_debug("%s (%s) showing of status (%s).",
+                  m->show_status_overridden != _SHOW_STATUS_INVALID ? "Overriding" : "Restoring",
+                  strna(show_status_to_string(mode)),
+                  reason);
+
+        set_show_status_marker(show_status_on(mode));
 }
 
 const char *manager_get_confirm_spawn(Manager *m) {
@@ -4131,11 +4415,11 @@ const char *manager_get_confirm_spawn(Manager *m) {
          *
          * If the console suddenly disappear at the time our children will really it
          * then they will simply fail to acquire it and a positive answer will be
-         * assumed. New children will fallback to /dev/console though.
+         * assumed. New children will fall back to /dev/console though.
          *
          * Note: TTYs are devices that can come and go any time, and frequently aren't
          * available yet during early boot (consider a USB rs232 dongle...). If for any
-         * reason the configured console is not ready, we fallback to the default
+         * reason the configured console is not ready, we fall back to the default
          * console. */
 
         if (!m->confirm_spawn || path_equal(m->confirm_spawn, "/dev/console"))
@@ -4188,12 +4472,34 @@ bool manager_is_confirm_spawn_disabled(Manager *m) {
         return access("/run/systemd/confirm_spawn_disabled", F_OK) >= 0;
 }
 
+static bool manager_should_show_status(Manager *m, StatusType type) {
+        assert(m);
+
+        if (!MANAGER_IS_SYSTEM(m))
+                return false;
+
+        if (m->no_console_output)
+                return false;
+
+        if (!IN_SET(manager_state(m), MANAGER_INITIALIZING, MANAGER_STARTING, MANAGER_STOPPING))
+                return false;
+
+        /* If we cannot find out the status properly, just proceed. */
+        if (type != STATUS_TYPE_EMERGENCY && manager_check_ask_password(m) > 0)
+                return false;
+
+        if (type == STATUS_TYPE_NOTICE && m->show_status != SHOW_STATUS_NO)
+                return true;
+
+        return manager_get_show_status_on(m);
+}
+
 void manager_status_printf(Manager *m, StatusType type, const char *status, const char *format, ...) {
         va_list ap;
 
         /* If m is NULL, assume we're after shutdown and let the messages through. */
 
-        if (m && !manager_get_show_status(m, type))
+        if (m && !manager_should_show_status(m, type))
                 return;
 
         /* XXX We should totally drop the check for ephemeral here
@@ -4228,11 +4534,8 @@ int manager_update_failed_units(Manager *m, Unit *u, bool failed) {
         size = set_size(m->failed_units);
 
         if (failed) {
-                r = set_ensure_allocated(&m->failed_units, NULL);
+                r = set_ensure_put(&m->failed_units, NULL, u);
                 if (r < 0)
-                        return log_oom();
-
-                if (set_put(m->failed_units, u) < 0)
                         return log_oom();
         } else
                 (void) set_remove(m->failed_units, u);
@@ -4248,6 +4551,11 @@ ManagerState manager_state(Manager *m) {
 
         assert(m);
 
+        /* Is the special shutdown target active or queued? If so, we are in shutdown state */
+        u = manager_get_unit(m, SPECIAL_SHUTDOWN_TARGET);
+        if (u && unit_active_or_pending(u))
+                return MANAGER_STOPPING;
+
         /* Did we ever finish booting? If not then we are still starting up */
         if (!MANAGER_IS_FINISHED(m)) {
 
@@ -4257,11 +4565,6 @@ ManagerState manager_state(Manager *m) {
 
                 return MANAGER_STARTING;
         }
-
-        /* Is the special shutdown target active or queued? If so, we are in shutdown state */
-        u = manager_get_unit(m, SPECIAL_SHUTDOWN_TARGET);
-        if (u && unit_active_or_pending(u))
-                return MANAGER_STOPPING;
 
         if (MANAGER_IS_SYSTEM(m)) {
                 /* Are the rescue or emergency targets active or queued? If so we are in maintenance state */
@@ -4280,8 +4583,6 @@ ManagerState manager_state(Manager *m) {
 
         return MANAGER_RUNNING;
 }
-
-#define DESTROY_IPC_FLAG (UINT32_C(1) << 31)
 
 static void manager_unref_uid_internal(
                 Manager *m,
@@ -4392,14 +4693,13 @@ static void manager_vacuum_uid_refs_internal(
                 Hashmap **uid_refs,
                 int (*_clean_ipc)(uid_t uid)) {
 
-        Iterator i;
         void *p, *k;
 
         assert(m);
         assert(uid_refs);
         assert(_clean_ipc);
 
-        HASHMAP_FOREACH_KEY(p, k, *uid_refs, i) {
+        HASHMAP_FOREACH_KEY(p, k, *uid_refs) {
                 uint32_t c, n;
                 uid_t uid;
 
@@ -4421,97 +4721,26 @@ static void manager_vacuum_uid_refs_internal(
         }
 }
 
-void manager_vacuum_uid_refs(Manager *m) {
+static void manager_vacuum_uid_refs(Manager *m) {
         manager_vacuum_uid_refs_internal(m, &m->uid_refs, clean_ipc_by_uid);
 }
 
-void manager_vacuum_gid_refs(Manager *m) {
+static void manager_vacuum_gid_refs(Manager *m) {
         manager_vacuum_uid_refs_internal(m, &m->gid_refs, clean_ipc_by_gid);
 }
 
-static void manager_serialize_uid_refs_internal(
-                Manager *m,
-                FILE *f,
-                Hashmap **uid_refs,
-                const char *field_name) {
-
-        Iterator i;
-        void *p, *k;
-
+static void manager_vacuum(Manager *m) {
         assert(m);
-        assert(f);
-        assert(uid_refs);
-        assert(field_name);
 
-        /* Serialize the UID reference table. Or actually, just the IPC destruction flag of it, as the actual counter
-         * of it is better rebuild after a reload/reexec. */
+        /* Release any dynamic users no longer referenced */
+        dynamic_user_vacuum(m, true);
 
-        HASHMAP_FOREACH_KEY(p, k, *uid_refs, i) {
-                uint32_t c;
-                uid_t uid;
+        /* Release any references to UIDs/GIDs no longer referenced, and destroy any IPC owned by them */
+        manager_vacuum_uid_refs(m);
+        manager_vacuum_gid_refs(m);
 
-                uid = PTR_TO_UID(k);
-                c = PTR_TO_UINT32(p);
-
-                if (!(c & DESTROY_IPC_FLAG))
-                        continue;
-
-                (void) serialize_item_format(f, field_name, UID_FMT, uid);
-        }
-}
-
-void manager_serialize_uid_refs(Manager *m, FILE *f) {
-        manager_serialize_uid_refs_internal(m, f, &m->uid_refs, "destroy-ipc-uid");
-}
-
-void manager_serialize_gid_refs(Manager *m, FILE *f) {
-        manager_serialize_uid_refs_internal(m, f, &m->gid_refs, "destroy-ipc-gid");
-}
-
-static void manager_deserialize_uid_refs_one_internal(
-                Manager *m,
-                Hashmap** uid_refs,
-                const char *value) {
-
-        uid_t uid;
-        uint32_t c;
-        int r;
-
-        assert(m);
-        assert(uid_refs);
-        assert(value);
-
-        r = parse_uid(value, &uid);
-        if (r < 0 || uid == 0) {
-                log_debug("Unable to parse UID reference serialization: " UID_FMT, uid);
-                return;
-        }
-
-        r = hashmap_ensure_allocated(uid_refs, &trivial_hash_ops);
-        if (r < 0) {
-                log_oom();
-                return;
-        }
-
-        c = PTR_TO_UINT32(hashmap_get(*uid_refs, UID_TO_PTR(uid)));
-        if (c & DESTROY_IPC_FLAG)
-                return;
-
-        c |= DESTROY_IPC_FLAG;
-
-        r = hashmap_replace(*uid_refs, UID_TO_PTR(uid), UINT32_TO_PTR(c));
-        if (r < 0) {
-                log_debug_errno(r, "Failed to add UID reference entry: %m");
-                return;
-        }
-}
-
-void manager_deserialize_uid_refs_one(Manager *m, const char *value) {
-        manager_deserialize_uid_refs_one_internal(m, &m->uid_refs, value);
-}
-
-void manager_deserialize_gid_refs_one(Manager *m, const char *value) {
-        manager_deserialize_uid_refs_one_internal(m, &m->gid_refs, value);
+        /* Release any runtimes no longer referenced */
+        exec_runtime_vacuum(m);
 }
 
 int manager_dispatch_user_lookup_fd(sd_event_source *source, int fd, uint32_t revents, void *userdata) {

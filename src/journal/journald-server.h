@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 #include <stdbool.h>
@@ -108,6 +108,7 @@ struct Server {
         JournalCompressOptions compress;
         bool seal;
         bool read_kmsg;
+        int set_audit;
 
         bool forward_to_kmsg;
         bool forward_to_syslog;

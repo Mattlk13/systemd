@@ -49,12 +49,19 @@ All tools:
 * `$SYSTEMD_CRYPTTAB` — if set, use this path instead of /etc/crypttab. Only
   useful for debugging. Currently only supported by systemd-cryptsetup-generator.
 
+* `$SYSTEMD_VERITYTAB` — if set, use this path instead of /etc/veritytab. Only
+  useful for debugging. Currently only supported by systemd-veritysetup-generator.
+
 * `$SYSTEMD_EFI_OPTIONS` — if set, used instead of the string in the
   SystemdOptions EFI variable. Analogous to `$SYSTEMD_PROC_CMDLINE`.
 
-* `$SYSTEMD_IN_INITRD` — takes a boolean. If set, overrides initrd detection.
-  This is useful for debugging and testing initrd-only programs in the main
-  system.
+* `$SYSTEMD_IN_INITRD=[auto|lenient|0|1]` — if set, specifies initrd detection
+  method. Defaults to `auto`. Behavior is defined as follows:
+  `auto`: Checks if `/etc/initrd-release` exists, and a temporary fs is mounted
+          on `/`. If both conditions meet, then it's in initrd.
+  `lenient`: Similar to `auto`, but the rootfs check is skipped.
+  `0|1`: Simply overrides initrd detection. This is useful for debugging and
+         testing initrd-only programs in the main system.
 
 * `$SYSTEMD_BUS_TIMEOUT=SECS` — specifies the maximum time to wait for method call
   completion. If no time unit is specified, assumes seconds. The usual other units
@@ -79,6 +86,16 @@ All tools:
   variable. Takes a prefix such as `$6$` or `$y$`. (Note that this is only
   honoured on systems built with libxcrypt and is ignored on systems using
   glibc's original, internal crypt() implementation.)
+
+* `$SYSTEMD_RDRAND=0` — if set, the RDRAND instruction will never be used,
+  even if the CPU supports it.
+
+* `$SYSTEMD_SECCOMP=0` – if set, seccomp filters will not be enforced, even if
+  support for it is compiled in and available in the kernel.
+
+* `$SYSTEMD_LOG_SECCOMP=1` — if set, system calls blocked by seccomp filtering,
+  for example in systemd-nspawn, will be logged to the audit log, if the current
+  kernel version supports this.
 
 systemctl:
 
@@ -145,7 +162,7 @@ systemd-udevd:
   boot loader menu through EFI a file `/run/systemd/reboot-to-boot-loader-menu`
   is created whenever this is requested. The file contains the requested boot
   loader menu timeout in µs, formatted in ASCII decimals, or zero in case no
-  time-out is requested. This file may be checked for by services run during
+  timeout is requested. This file may be checked for by services run during
   system shutdown in order to request the appropriate operation from the boot
   loader in an alternative fashion.
 
@@ -250,3 +267,15 @@ systemd-firstboot and localectl:
 * `SYSTEMD_LIST_NON_UTF8_LOCALES=1` – if set non-UTF-8 locales are listed among
   the installed ones. By default non-UTF-8 locales are suppressed from the
   selection, since we are living in the 21st century.
+
+systemd-sysext:
+
+* `SYSTEMD_SYSEXT_HIERARCHIES` – if set to a colon-separated list of absolute
+  paths this variable may be used to override which hierarchies to manage with
+  `systemd-sysext`. By default only `/usr/` and `/opt/` are managed. With this
+  environment variable this list may be changed, in order to add or remove
+  directories from this list. This should only reference "real" file systems
+  and directories that only contain "real" file systems as submounts — do not
+  specify API file systems such as `/proc/` or `/sys/` here, or hierarchies
+  that have them as submounts. In particular, do not specify the root directory
+  `/` here.

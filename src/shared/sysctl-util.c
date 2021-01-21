@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
 #include <fcntl.h>
@@ -122,6 +122,7 @@ int sysctl_read_ip_property(int af, const char *ifname, const char *property, ch
         if (r < 0)
                 return r;
 
+        truncate_nl(value);
         if (ret)
                 *ret = TAKE_PTR(value);
 

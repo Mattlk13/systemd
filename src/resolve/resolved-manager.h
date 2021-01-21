@@ -1,5 +1,7 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
+
+#include <sys/stat.h>
 
 #include "sd-event.h"
 #include "sd-netlink.h"
@@ -9,16 +11,15 @@
 #include "list.h"
 #include "ordered-set.h"
 #include "resolve-util.h"
+#include "varlink.h"
 
 typedef struct Manager Manager;
 
-#include "resolved-conf.h"
 #include "resolved-dns-query.h"
 #include "resolved-dns-search-domain.h"
-#include "resolved-dns-server.h"
 #include "resolved-dns-stream.h"
+#include "resolved-dns-stub.h"
 #include "resolved-dns-trust-anchor.h"
-#include "resolved-dnstls.h"
 #include "resolved-link.h"
 
 #define MANAGER_SEARCH_DOMAINS_MAX 256
@@ -38,6 +39,7 @@ struct Manager {
         DnssecMode dnssec_mode;
         DnsOverTlsMode dns_over_tls_mode;
         DnsCacheMode enable_cache;
+        bool cache_from_localhost;
         DnsStubListenerMode dns_stub_listener_mode;
 
 #if ENABLE_DNS_OVER_TLS
@@ -70,10 +72,11 @@ struct Manager {
         LIST_HEAD(DnsSearchDomain, search_domains);
         unsigned n_search_domains;
 
-        bool need_builtin_fallbacks:1;
+        bool need_builtin_fallbacks;
+        bool read_resolv_conf;
+        bool resolve_unicast_single_label;
 
-        bool read_resolv_conf:1;
-        usec_t resolv_conf_mtime;
+        struct stat resolv_conf_stat;
 
         DnsTrustAnchor trust_anchor;
 
@@ -126,17 +129,21 @@ struct Manager {
 
         /* Data from /etc/hosts */
         EtcHosts etc_hosts;
-        usec_t etc_hosts_last, etc_hosts_mtime;
+        usec_t etc_hosts_last;
+        struct stat etc_hosts_stat;
         bool read_etc_hosts;
 
-        /* Local DNS stub on 127.0.0.53:53 */
-        int dns_stub_udp_fd;
-        int dns_stub_tcp_fd;
+        OrderedSet *dns_extra_stub_listeners;
 
+        /* Local DNS stub on 127.0.0.53:53 */
         sd_event_source *dns_stub_udp_event_source;
         sd_event_source *dns_stub_tcp_event_source;
 
         Hashmap *polkit_registry;
+
+        VarlinkServer *varlink_server;
+
+        sd_event_source *clock_change_event_source;
 };
 
 /* Manager */
@@ -165,6 +172,7 @@ void manager_verify_all(Manager *m);
 
 DEFINE_TRIVIAL_CLEANUP_FUNC(Manager*, manager_free);
 
+/* For some reason we need some extra cmsg space on some kernels/archs. One of those days we need to figure out why */
 #define EXTRA_CMSG_SPACE 1024
 
 int manager_is_own_hostname(Manager *m, const char *name);
@@ -179,9 +187,9 @@ DnsOverTlsMode manager_get_dns_over_tls_mode(Manager *m);
 
 void manager_dnssec_verdict(Manager *m, DnssecVerdict verdict, const DnsResourceKey *key);
 
-bool manager_routable(Manager *m, int family);
+bool manager_routable(Manager *m);
 
-void manager_flush_caches(Manager *m);
+void manager_flush_caches(Manager *m, int log_level);
 void manager_reset_server_features(Manager *m);
 
 void manager_cleanup_saved_user(Manager *m);

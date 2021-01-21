@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 #include <microhttpd.h>
@@ -45,6 +45,12 @@
 
 #if MHD_VERSION < 0x00094203
 #  define MHD_create_response_from_fd_at_offset64 MHD_create_response_from_fd_at_offset
+#endif
+
+#if MHD_VERSION >= 0x00097002
+#  define mhd_result enum MHD_Result
+#else
+#  define mhd_result int
 #endif
 
 void microhttpd_logger(void *arg, const char *fmt, va_list ap) _printf_(2, 0);

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "alloc-util.h"
 #include "dns-domain.h"
@@ -57,55 +57,6 @@ uint16_t dnssec_keytag(DnsResourceRecord *dnskey, bool mask_revoke) {
         sum += (sum >> 16) & UINT32_C(0xFFFF);
 
         return sum & UINT32_C(0xFFFF);
-}
-
-int dnssec_canonicalize(const char *n, char *buffer, size_t buffer_max) {
-        size_t c = 0;
-        int r;
-
-        /* Converts the specified hostname into DNSSEC canonicalized
-         * form. */
-
-        if (buffer_max < 2)
-                return -ENOBUFS;
-
-        for (;;) {
-                r = dns_label_unescape(&n, buffer, buffer_max, 0);
-                if (r < 0)
-                        return r;
-                if (r == 0)
-                        break;
-
-                if (buffer_max < (size_t) r + 2)
-                        return -ENOBUFS;
-
-                /* The DNSSEC canonical form is not clear on what to
-                 * do with dots appearing in labels, the way DNS-SD
-                 * does it. Refuse it for now. */
-
-                if (memchr(buffer, '.', r))
-                        return -EINVAL;
-
-                ascii_strlower_n(buffer, (size_t) r);
-                buffer[r] = '.';
-
-                buffer += r + 1;
-                c += r + 1;
-
-                buffer_max -= r + 1;
-        }
-
-        if (c <= 0) {
-                /* Not even a single label: this is the root domain name */
-
-                assert(buffer_max > 2);
-                buffer[0] = '.';
-                buffer[1] = 0;
-
-                return 1;
-        }
-
-        return (int) c;
 }
 
 #if HAVE_GCRYPT
@@ -1429,7 +1380,7 @@ static int nsec3_hashed_domain_make(DnsResourceRecord *nsec3, const char *domain
  * matches the wildcard domain.
  *
  * Based on this we can prove either the existence of the record in @key, or NXDOMAIN or NODATA, or
- * that there is no proof either way. The latter is the case if a the proof of non-existence of a given
+ * that there is no proof either way. The latter is the case if a proof of non-existence of a given
  * name uses an NSEC3 record with the opt-out bit set. Lastly, if we are given insufficient NSEC3 records
  * to conclude anything we indicate this by returning NO_RR. */
 static int dnssec_test_nsec3(DnsAnswer *answer, DnsResourceKey *key, DnssecNsecResult *result, bool *authenticated, uint32_t *ttl) {
@@ -1862,6 +1813,8 @@ int dnssec_nsec_test(DnsAnswer *answer, DnsResourceKey *key, DnssecNsecResult *r
 
                 /* The following checks only make sense for NSEC RRs that are not expanded from a wildcard */
                 r = dns_resource_record_is_synthetic(rr);
+                if (r == -ENODATA) /* No signing RR known. */
+                        continue;
                 if (r < 0)
                         return r;
                 if (r > 0)

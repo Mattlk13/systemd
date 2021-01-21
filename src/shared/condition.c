@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
 #include <fcntl.h>
@@ -25,6 +25,7 @@
 #include "extract-word.h"
 #include "fd-util.h"
 #include "fileio.h"
+#include "fs-util.h"
 #include "glob-util.h"
 #include "hostname-util.h"
 #include "ima-util.h"
@@ -42,6 +43,7 @@
 #include "string-table.h"
 #include "string-util.h"
 #include "tomoyo-util.h"
+#include "user-record.h"
 #include "user-util.h"
 #include "util.h"
 #include "virt.h"
@@ -51,7 +53,7 @@ Condition* condition_new(ConditionType type, const char *parameter, bool trigger
 
         assert(type >= 0);
         assert(type < _CONDITION_TYPE_MAX);
-        assert((!parameter) == (type == CONDITION_NULL));
+        assert(parameter);
 
         c = new(Condition, 1);
         if (!c)
@@ -72,11 +74,11 @@ Condition* condition_new(ConditionType type, const char *parameter, bool trigger
         return c;
 }
 
-void condition_free(Condition *c) {
+Condition* condition_free(Condition *c) {
         assert(c);
 
         free(c->parameter);
-        free(c);
+        return mfree(c);
 }
 
 Condition* condition_free_list_type(Condition *head, ConditionType type) {
@@ -92,7 +94,7 @@ Condition* condition_free_list_type(Condition *head, ConditionType type) {
         return head;
 }
 
-static int condition_test_kernel_command_line(Condition *c) {
+static int condition_test_kernel_command_line(Condition *c, char **env) {
         _cleanup_free_ char *line = NULL;
         const char *p;
         bool equal;
@@ -201,7 +203,7 @@ static bool test_order(int k, OrderOperator p) {
         }
 }
 
-static int condition_test_kernel_version(Condition *c) {
+static int condition_test_kernel_version(Condition *c, char **env) {
         OrderOperator order;
         struct utsname u;
         const char *p;
@@ -259,7 +261,7 @@ static int condition_test_kernel_version(Condition *c) {
         return true;
 }
 
-static int condition_test_memory(Condition *c) {
+static int condition_test_memory(Condition *c, char **env) {
         OrderOperator order;
         uint64_t m, k;
         const char *p;
@@ -283,7 +285,7 @@ static int condition_test_memory(Condition *c) {
         return test_order(CMP(m, k), order);
 }
 
-static int condition_test_cpus(Condition *c) {
+static int condition_test_cpus(Condition *c, char **env) {
         OrderOperator order;
         const char *p;
         unsigned k;
@@ -309,7 +311,7 @@ static int condition_test_cpus(Condition *c) {
         return test_order(CMP((unsigned) n, k), order);
 }
 
-static int condition_test_user(Condition *c) {
+static int condition_test_user(Condition *c, char **env) {
         uid_t id;
         int r;
         _cleanup_free_ char *username = NULL;
@@ -344,7 +346,7 @@ static int condition_test_user(Condition *c) {
         return id == getuid() || id == geteuid();
 }
 
-static int condition_test_control_group_controller(Condition *c) {
+static int condition_test_control_group_controller(Condition *c, char **env) {
         int r;
         CGroupMask system_mask, wanted_mask = 0;
 
@@ -368,7 +370,7 @@ static int condition_test_control_group_controller(Condition *c) {
         return FLAGS_SET(system_mask, wanted_mask);
 }
 
-static int condition_test_group(Condition *c) {
+static int condition_test_group(Condition *c, char **env) {
         gid_t id;
         int r;
 
@@ -387,7 +389,7 @@ static int condition_test_group(Condition *c) {
         return in_group(c->parameter) > 0;
 }
 
-static int condition_test_virtualization(Condition *c) {
+static int condition_test_virtualization(Condition *c, char **env) {
         int b, v;
 
         assert(c);
@@ -417,7 +419,7 @@ static int condition_test_virtualization(Condition *c) {
         return v != VIRTUALIZATION_NONE && streq(c->parameter, virtualization_to_string(v));
 }
 
-static int condition_test_architecture(Condition *c) {
+static int condition_test_architecture(Condition *c, char **env) {
         int a, b;
 
         assert(c);
@@ -439,7 +441,7 @@ static int condition_test_architecture(Condition *c) {
         return a == b;
 }
 
-static int condition_test_host(Condition *c) {
+static int condition_test_host(Condition *c, char **env) {
         _cleanup_free_ char *h = NULL;
         sd_id128_t x, y;
         int r;
@@ -464,7 +466,7 @@ static int condition_test_host(Condition *c) {
         return fnmatch(c->parameter, h, FNM_CASEFOLD) == 0;
 }
 
-static int condition_test_ac_power(Condition *c) {
+static int condition_test_ac_power(Condition *c, char **env) {
         int r;
 
         assert(c);
@@ -478,7 +480,22 @@ static int condition_test_ac_power(Condition *c) {
         return (on_ac_power() != 0) == !!r;
 }
 
-static int condition_test_security(Condition *c) {
+static int has_tpm2(void) {
+        int r;
+
+        /* Checks whether the system has at least one TPM2 resource manager device, i.e. at least one "tpmrm"
+         * class device */
+
+        r = dir_is_empty("/sys/class/tpmrm");
+        if (r == -ENOENT)
+                return false;
+        if (r < 0)
+                return log_debug_errno(r, "Failed to determine whether system has TPM2 support: %m");
+
+        return !r;
+}
+
+static int condition_test_security(Condition *c, char **env) {
         assert(c);
         assert(c->parameter);
         assert(c->type == CONDITION_SECURITY);
@@ -497,11 +514,13 @@ static int condition_test_security(Condition *c) {
                 return mac_tomoyo_use();
         if (streq(c->parameter, "uefi-secureboot"))
                 return is_efi_secure_boot();
+        if (streq(c->parameter, "tpm2"))
+                return has_tpm2();
 
         return false;
 }
 
-static int condition_test_capability(Condition *c) {
+static int condition_test_capability(Condition *c, char **env) {
         unsigned long long capabilities = (unsigned long long) -1;
         _cleanup_fclose_ FILE *f = NULL;
         int value, r;
@@ -544,31 +563,48 @@ static int condition_test_capability(Condition *c) {
         return !!(capabilities & (1ULL << value));
 }
 
-static int condition_test_needs_update(Condition *c) {
-        const char *p;
+static int condition_test_needs_update(Condition *c, char **env) {
         struct stat usr, other;
+        const char *p;
+        bool b;
+        int r;
 
         assert(c);
         assert(c->parameter);
         assert(c->type == CONDITION_NEEDS_UPDATE);
 
+        r = proc_cmdline_get_bool("systemd.condition-needs-update", &b);
+        if (r < 0)
+                log_debug_errno(r, "Failed to parse systemd.condition-needs-update= kernel command line argument, ignoring: %m");
+        if (r > 0)
+                return b;
+
+        if (!path_is_absolute(c->parameter)) {
+                log_debug("Specified condition parameter '%s' is not absolute, assuming an update is needed.", c->parameter);
+                return true;
+        }
+
         /* If the file system is read-only we shouldn't suggest an update */
-        if (path_is_read_only_fs(c->parameter) > 0)
+        r = path_is_read_only_fs(c->parameter);
+        if (r < 0)
+                log_debug_errno(r, "Failed to determine if '%s' is read-only, ignoring: %m", c->parameter);
+        if (r > 0)
                 return false;
 
-        /* Any other failure means we should allow the condition to be true,
-         * so that we rather invoke too many update tools than too
-         * few. */
-
-        if (!path_is_absolute(c->parameter))
-                return true;
+        /* Any other failure means we should allow the condition to be true, so that we rather invoke too
+         * many update tools than too few. */
 
         p = strjoina(c->parameter, "/.updated");
-        if (lstat(p, &other) < 0)
+        if (lstat(p, &other) < 0) {
+                if (errno != ENOENT)
+                        log_debug_errno(errno, "Failed to stat() '%s', assuming an update is needed: %m", p);
                 return true;
+        }
 
-        if (lstat("/usr/", &usr) < 0)
+        if (lstat("/usr/", &usr) < 0) {
+                log_debug_errno(errno, "Failed to stat() /usr/, assuming an update is needed: %m");
                 return true;
+        }
 
         /*
          * First, compare seconds as they are always accurate...
@@ -584,47 +620,84 @@ static int condition_test_needs_update(Condition *c) {
          * AND the target file's nanoseconds == 0
          * (otherwise the filesystem supports nsec timestamps, see stat(2)).
          */
-        if (usr.st_mtim.tv_nsec > 0 && other.st_mtim.tv_nsec == 0) {
-                _cleanup_free_ char *timestamp_str = NULL;
-                uint64_t timestamp;
-                int r;
+        if (usr.st_mtim.tv_nsec == 0 || other.st_mtim.tv_nsec > 0)
+                return usr.st_mtim.tv_nsec > other.st_mtim.tv_nsec;
 
-                r = parse_env_file(NULL, p, "TIMESTAMP_NSEC", &timestamp_str);
-                if (r < 0) {
-                        log_error_errno(r, "Failed to parse timestamp file '%s', using mtime: %m", p);
-                        return true;
-                } else if (r == 0) {
-                        log_debug("No data in timestamp file '%s', using mtime", p);
-                        return true;
-                }
-
-                r = safe_atou64(timestamp_str, &timestamp);
-                if (r < 0) {
-                        log_error_errno(r, "Failed to parse timestamp value '%s' in file '%s', using mtime: %m", timestamp_str, p);
-                        return true;
-                }
-
-                timespec_store(&other.st_mtim, timestamp);
+        _cleanup_free_ char *timestamp_str = NULL;
+        r = parse_env_file(NULL, p, "TIMESTAMP_NSEC", &timestamp_str);
+        if (r < 0) {
+                log_debug_errno(r, "Failed to parse timestamp file '%s', using mtime: %m", p);
+                return true;
+        } else if (r == 0) {
+                log_debug("No data in timestamp file '%s', using mtime.", p);
+                return true;
         }
 
-        return usr.st_mtim.tv_nsec > other.st_mtim.tv_nsec;
+        uint64_t timestamp;
+        r = safe_atou64(timestamp_str, &timestamp);
+        if (r < 0) {
+                log_debug_errno(r, "Failed to parse timestamp value '%s' in file '%s', using mtime: %m", timestamp_str, p);
+                return true;
+        }
+
+        return timespec_load_nsec(&usr.st_mtim) > timestamp;
 }
 
-static int condition_test_first_boot(Condition *c) {
-        int r;
+static int condition_test_first_boot(Condition *c, char **env) {
+        int r, q;
+        bool b;
 
         assert(c);
         assert(c->parameter);
         assert(c->type == CONDITION_FIRST_BOOT);
 
+        r = proc_cmdline_get_bool("systemd.condition-first-boot", &b);
+        if (r < 0)
+                log_debug_errno(r, "Failed to parse systemd.condition-first-boot= kernel command line argument, ignoring: %m");
+        if (r > 0)
+                return b == !!r;
+
         r = parse_boolean(c->parameter);
         if (r < 0)
                 return r;
 
-        return (access("/run/systemd/first-boot", F_OK) >= 0) == !!r;
+        q = access("/run/systemd/first-boot", F_OK);
+        if (q < 0 && errno != ENOENT)
+                log_debug_errno(errno, "Failed to check if /run/systemd/first-boot exists, ignoring: %m");
+
+        return (q >= 0) == !!r;
 }
 
-static int condition_test_path_exists(Condition *c) {
+static int condition_test_environment(Condition *c, char **env) {
+        bool equal;
+        char **i;
+
+        assert(c);
+        assert(c->parameter);
+        assert(c->type == CONDITION_ENVIRONMENT);
+
+        equal = strchr(c->parameter, '=');
+
+        STRV_FOREACH(i, env) {
+                bool found;
+
+                if (equal)
+                        found = streq(c->parameter, *i);
+                else {
+                        const char *f;
+
+                        f = startswith(*i, c->parameter);
+                        found = f && IN_SET(*f, 0, '=');
+                }
+
+                if (found)
+                        return true;
+        }
+
+        return false;
+}
+
+static int condition_test_path_exists(Condition *c, char **env) {
         assert(c);
         assert(c->parameter);
         assert(c->type == CONDITION_PATH_EXISTS);
@@ -632,7 +705,7 @@ static int condition_test_path_exists(Condition *c) {
         return access(c->parameter, F_OK) >= 0;
 }
 
-static int condition_test_path_exists_glob(Condition *c) {
+static int condition_test_path_exists_glob(Condition *c, char **env) {
         assert(c);
         assert(c->parameter);
         assert(c->type == CONDITION_PATH_EXISTS_GLOB);
@@ -640,7 +713,7 @@ static int condition_test_path_exists_glob(Condition *c) {
         return glob_exists(c->parameter) > 0;
 }
 
-static int condition_test_path_is_directory(Condition *c) {
+static int condition_test_path_is_directory(Condition *c, char **env) {
         assert(c);
         assert(c->parameter);
         assert(c->type == CONDITION_PATH_IS_DIRECTORY);
@@ -648,7 +721,7 @@ static int condition_test_path_is_directory(Condition *c) {
         return is_dir(c->parameter, true) > 0;
 }
 
-static int condition_test_path_is_symbolic_link(Condition *c) {
+static int condition_test_path_is_symbolic_link(Condition *c, char **env) {
         assert(c);
         assert(c->parameter);
         assert(c->type == CONDITION_PATH_IS_SYMBOLIC_LINK);
@@ -656,7 +729,7 @@ static int condition_test_path_is_symbolic_link(Condition *c) {
         return is_symlink(c->parameter) > 0;
 }
 
-static int condition_test_path_is_mount_point(Condition *c) {
+static int condition_test_path_is_mount_point(Condition *c, char **env) {
         assert(c);
         assert(c->parameter);
         assert(c->type == CONDITION_PATH_IS_MOUNT_POINT);
@@ -664,7 +737,7 @@ static int condition_test_path_is_mount_point(Condition *c) {
         return path_is_mount_point(c->parameter, NULL, AT_SYMLINK_FOLLOW) > 0;
 }
 
-static int condition_test_path_is_read_write(Condition *c) {
+static int condition_test_path_is_read_write(Condition *c, char **env) {
         assert(c);
         assert(c->parameter);
         assert(c->type == CONDITION_PATH_IS_READ_WRITE);
@@ -672,7 +745,21 @@ static int condition_test_path_is_read_write(Condition *c) {
         return path_is_read_only_fs(c->parameter) <= 0;
 }
 
-static int condition_test_directory_not_empty(Condition *c) {
+static int condition_test_path_is_encrypted(Condition *c, char **env) {
+        int r;
+
+        assert(c);
+        assert(c->parameter);
+        assert(c->type == CONDITION_PATH_IS_ENCRYPTED);
+
+        r = path_is_encrypted(c->parameter);
+        if (r < 0 && r != -ENOENT)
+                log_debug_errno(r, "Failed to determine if '%s' is encrypted: %m", c->parameter);
+
+        return r > 0;
+}
+
+static int condition_test_directory_not_empty(Condition *c, char **env) {
         int r;
 
         assert(c);
@@ -683,7 +770,7 @@ static int condition_test_directory_not_empty(Condition *c) {
         return r <= 0 && r != -ENOENT;
 }
 
-static int condition_test_file_not_empty(Condition *c) {
+static int condition_test_file_not_empty(Condition *c, char **env) {
         struct stat st;
 
         assert(c);
@@ -695,7 +782,7 @@ static int condition_test_file_not_empty(Condition *c) {
                 st.st_size > 0);
 }
 
-static int condition_test_file_is_executable(Condition *c) {
+static int condition_test_file_is_executable(Condition *c, char **env) {
         struct stat st;
 
         assert(c);
@@ -707,24 +794,16 @@ static int condition_test_file_is_executable(Condition *c) {
                 (st.st_mode & 0111));
 }
 
-static int condition_test_null(Condition *c) {
-        assert(c);
-        assert(c->type == CONDITION_NULL);
+int condition_test(Condition *c, char **env) {
 
-        /* Note that during parsing we already evaluate the string and
-         * store it in c->negate */
-        return true;
-}
-
-int condition_test(Condition *c) {
-
-        static int (*const condition_tests[_CONDITION_TYPE_MAX])(Condition *c) = {
+        static int (*const condition_tests[_CONDITION_TYPE_MAX])(Condition *c, char **env) = {
                 [CONDITION_PATH_EXISTS]              = condition_test_path_exists,
                 [CONDITION_PATH_EXISTS_GLOB]         = condition_test_path_exists_glob,
                 [CONDITION_PATH_IS_DIRECTORY]        = condition_test_path_is_directory,
                 [CONDITION_PATH_IS_SYMBOLIC_LINK]    = condition_test_path_is_symbolic_link,
                 [CONDITION_PATH_IS_MOUNT_POINT]      = condition_test_path_is_mount_point,
                 [CONDITION_PATH_IS_READ_WRITE]       = condition_test_path_is_read_write,
+                [CONDITION_PATH_IS_ENCRYPTED]        = condition_test_path_is_encrypted,
                 [CONDITION_DIRECTORY_NOT_EMPTY]      = condition_test_directory_not_empty,
                 [CONDITION_FILE_NOT_EMPTY]           = condition_test_file_not_empty,
                 [CONDITION_FILE_IS_EXECUTABLE]       = condition_test_file_is_executable,
@@ -741,9 +820,9 @@ int condition_test(Condition *c) {
                 [CONDITION_USER]                     = condition_test_user,
                 [CONDITION_GROUP]                    = condition_test_group,
                 [CONDITION_CONTROL_GROUP_CONTROLLER] = condition_test_control_group_controller,
-                [CONDITION_NULL]                     = condition_test_null,
                 [CONDITION_CPUS]                     = condition_test_cpus,
                 [CONDITION_MEMORY]                   = condition_test_memory,
+                [CONDITION_ENVIRONMENT]              = condition_test_environment,
         };
 
         int r, b;
@@ -752,7 +831,7 @@ int condition_test(Condition *c) {
         assert(c->type >= 0);
         assert(c->type < _CONDITION_TYPE_MAX);
 
-        r = condition_tests[c->type](c);
+        r = condition_tests[c->type](c, env);
         if (r < 0) {
                 c->result = CONDITION_ERROR;
                 return r;
@@ -763,7 +842,13 @@ int condition_test(Condition *c) {
         return b;
 }
 
-bool condition_test_list(Condition *first, const char *(*to_string)(ConditionType t), condition_test_logger_t logger, void *userdata) {
+bool condition_test_list(
+                Condition *first,
+                char **env,
+                condition_to_string_t to_string,
+                condition_test_logger_t logger,
+                void *userdata) {
+
         Condition *c;
         int triggered = -1;
 
@@ -779,26 +864,23 @@ bool condition_test_list(Condition *first, const char *(*to_string)(ConditionTyp
         LIST_FOREACH(conditions, c, first) {
                 int r;
 
-                r = condition_test(c);
+                r = condition_test(c, env);
 
                 if (logger) {
-                        const char *p = c->type == CONDITION_NULL ? "true" : c->parameter;
-                        assert(p);
-
                         if (r < 0)
                                 logger(userdata, LOG_WARNING, r, PROJECT_FILE, __LINE__, __func__,
                                        "Couldn't determine result for %s=%s%s%s, assuming failed: %m",
                                        to_string(c->type),
                                        c->trigger ? "|" : "",
                                        c->negate ? "!" : "",
-                                       p);
+                                       c->parameter);
                         else
                                 logger(userdata, LOG_DEBUG, 0, PROJECT_FILE, __LINE__, __func__,
                                        "%s=%s%s%s %s.",
                                        to_string(c->type),
                                        c->trigger ? "|" : "",
                                        c->negate ? "!" : "",
-                                       p,
+                                       c->parameter,
                                        condition_result_to_string(c->result));
                 }
 
@@ -812,9 +894,10 @@ bool condition_test_list(Condition *first, const char *(*to_string)(ConditionTyp
         return triggered != 0;
 }
 
-void condition_dump(Condition *c, FILE *f, const char *prefix, const char *(*to_string)(ConditionType t)) {
+void condition_dump(Condition *c, FILE *f, const char *prefix, condition_to_string_t to_string) {
         assert(c);
         assert(f);
+        assert(to_string);
 
         prefix = strempty(prefix);
 
@@ -828,7 +911,7 @@ void condition_dump(Condition *c, FILE *f, const char *prefix, const char *(*to_
                 condition_result_to_string(c->result));
 }
 
-void condition_dump_list(Condition *first, FILE *f, const char *prefix, const char *(*to_string)(ConditionType t)) {
+void condition_dump_list(Condition *first, FILE *f, const char *prefix, condition_to_string_t to_string) {
         Condition *c;
 
         LIST_FOREACH(conditions, c, first)
@@ -852,15 +935,16 @@ static const char* const condition_type_table[_CONDITION_TYPE_MAX] = {
         [CONDITION_PATH_IS_SYMBOLIC_LINK] = "ConditionPathIsSymbolicLink",
         [CONDITION_PATH_IS_MOUNT_POINT] = "ConditionPathIsMountPoint",
         [CONDITION_PATH_IS_READ_WRITE] = "ConditionPathIsReadWrite",
+        [CONDITION_PATH_IS_ENCRYPTED] = "ConditionPathIsEncrypted",
         [CONDITION_DIRECTORY_NOT_EMPTY] = "ConditionDirectoryNotEmpty",
         [CONDITION_FILE_NOT_EMPTY] = "ConditionFileNotEmpty",
         [CONDITION_FILE_IS_EXECUTABLE] = "ConditionFileIsExecutable",
         [CONDITION_USER] = "ConditionUser",
         [CONDITION_GROUP] = "ConditionGroup",
         [CONDITION_CONTROL_GROUP_CONTROLLER] = "ConditionControlGroupController",
-        [CONDITION_NULL] = "ConditionNull",
         [CONDITION_CPUS] = "ConditionCPUs",
         [CONDITION_MEMORY] = "ConditionMemory",
+        [CONDITION_ENVIRONMENT] = "ConditionEnvironment",
 };
 
 DEFINE_STRING_TABLE_LOOKUP(condition_type, ConditionType);
@@ -882,15 +966,16 @@ static const char* const assert_type_table[_CONDITION_TYPE_MAX] = {
         [CONDITION_PATH_IS_SYMBOLIC_LINK] = "AssertPathIsSymbolicLink",
         [CONDITION_PATH_IS_MOUNT_POINT] = "AssertPathIsMountPoint",
         [CONDITION_PATH_IS_READ_WRITE] = "AssertPathIsReadWrite",
+        [CONDITION_PATH_IS_ENCRYPTED] = "AssertPathIsEncrypted",
         [CONDITION_DIRECTORY_NOT_EMPTY] = "AssertDirectoryNotEmpty",
         [CONDITION_FILE_NOT_EMPTY] = "AssertFileNotEmpty",
         [CONDITION_FILE_IS_EXECUTABLE] = "AssertFileIsExecutable",
         [CONDITION_USER] = "AssertUser",
         [CONDITION_GROUP] = "AssertGroup",
         [CONDITION_CONTROL_GROUP_CONTROLLER] = "AssertControlGroupController",
-        [CONDITION_NULL] = "AssertNull",
         [CONDITION_CPUS] = "AssertCPUs",
         [CONDITION_MEMORY] = "AssertMemory",
+        [CONDITION_ENVIRONMENT] = "AssertEnvironment",
 };
 
 DEFINE_STRING_TABLE_LOOKUP(assert_type, ConditionType);

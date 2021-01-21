@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 /***
   Copyright © 2014 Intel Corporation. All rights reserved.
 ***/
@@ -221,8 +221,7 @@ static int ndisc_recv(sd_event_source *s, int fd, uint32_t revents, void *userda
         if (!rt)
                 return -ENOMEM;
 
-        r = icmp6_receive(fd, NDISC_ROUTER_RAW(rt), rt->raw_size, &rt->address,
-                     &rt->timestamp);
+        r = icmp6_receive(fd, NDISC_ROUTER_RAW(rt), rt->raw_size, &rt->address, &rt->timestamp);
         if (r < 0) {
                 switch (r) {
                 case -EADDRNOTAVAIL:
@@ -321,7 +320,8 @@ static int ndisc_timeout_no_ra(sd_event_source *s, uint64_t usec, void *userdata
 }
 
 _public_ int sd_ndisc_stop(sd_ndisc *nd) {
-        assert_return(nd, -EINVAL);
+        if (!nd)
+                return 0;
 
         if (nd->fd < 0)
                 return 0;

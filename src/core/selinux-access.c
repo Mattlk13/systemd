@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "selinux-access.h"
 
@@ -123,12 +123,12 @@ _printf_(2, 3) static int log_callback(int type, const char *fmt, ...) {
         fmt2 = strjoina("selinux: ", fmt);
 
         va_start(ap, fmt);
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wformat-nonliteral"
+
+        DISABLE_WARNING_FORMAT_NONLITERAL;
         log_internalv(LOG_AUTH | callback_type_to_priority(type),
                       0, PROJECT_FILE, __LINE__, __FUNCTION__,
                       fmt2, ap);
-#pragma GCC diagnostic pop
+        REENABLE_WARNING;
         va_end(ap);
 
         return 0;
@@ -144,8 +144,9 @@ static int access_init(sd_bus_error *error) {
 
         if (avc_open(NULL, 0) != 0) {
                 int saved_errno = errno;
-                const bool enforce = mac_selinux_enforcing();
+                bool enforce;
 
+                enforce = security_getenforce() != 0;
                 log_full_errno(enforce ? LOG_ERR : LOG_WARNING, saved_errno, "Failed to open the SELinux AVC: %m");
 
                 /* If enforcement isn't on, then let's suppress this
@@ -227,7 +228,7 @@ int mac_selinux_generic_access_check(
                 if (getfilecon_raw(path, &fcon) < 0) {
                         r = -errno;
 
-                        log_warning_errno(r, "SELinux getfilecon_raw on '%s' failed%s (perm=%s): %m",
+                        log_warning_errno(r, "SELinux getfilecon_raw() on '%s' failed%s (perm=%s): %m",
                                           path,
                                           enforce ? "" : ", ignoring",
                                           permission);
@@ -243,7 +244,7 @@ int mac_selinux_generic_access_check(
                 if (getcon_raw(&fcon) < 0) {
                         r = -errno;
 
-                        log_warning_errno(r, "SELinux getcon_raw failed%s (perm=%s): %m",
+                        log_warning_errno(r, "SELinux getcon_raw() failed%s (perm=%s): %m",
                                           enforce ? "" : ", ignoring",
                                           permission);
                         if (!enforce)
@@ -272,12 +273,12 @@ int mac_selinux_generic_access_check(
                         sd_bus_error_setf(error, SD_BUS_ERROR_ACCESS_DENIED, "SELinux policy denies access.");
         }
 
-        log_debug_errno(r, "SELinux access check scon=%s tcon=%s tclass=%s perm=%s path=%s cmdline=%s: %m",
-                        scon, fcon, tclass, permission, path, cl);
+        log_debug_errno(r, "SELinux access check scon=%s tcon=%s tclass=%s perm=%s state=%s path=%s cmdline=%s: %m",
+                        scon, fcon, tclass, permission, enforce ? "enforcing" : "permissive", path, cl);
         return enforce ? r : 0;
 }
 
-#else
+#else /* HAVE_SELINUX */
 
 int mac_selinux_generic_access_check(
                 sd_bus_message *message,
@@ -288,4 +289,4 @@ int mac_selinux_generic_access_check(
         return 0;
 }
 
-#endif
+#endif /* HAVE_SELINUX */

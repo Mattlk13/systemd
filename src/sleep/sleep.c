@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 /***
   Copyright © 2010-2017 Canonical
   Copyright © 2018 Dell Inc.
@@ -23,6 +23,7 @@
 #include "fd-util.h"
 #include "fileio.h"
 #include "format-util.h"
+#include "io-util.h"
 #include "log.h"
 #include "main-func.h"
 #include "parse-util.h"
@@ -70,7 +71,7 @@ static int write_hibernate_location_info(const HibernateLocation *hibernate_loca
                         return 0;
                 }
 
-                return log_debug_errno(errno, "/sys/power/resume_offset not writeable: %m");
+                return log_debug_errno(errno, "/sys/power/resume_offset not writable: %m");
         }
 
         xsprintf(offset_str, "%" PRIu64, hibernate_location->offset);
@@ -106,6 +107,9 @@ static int write_mode(char **modes) {
 static int write_state(FILE **f, char **states) {
         char **state;
         int r = 0;
+
+        assert(f);
+        assert(*f);
 
         STRV_FOREACH(state, states) {
                 int k;
@@ -156,20 +160,16 @@ static int lock_all_homes(void) {
 
         r = sd_bus_call(bus, m, DEFAULT_TIMEOUT_USEC, &error, NULL);
         if (r < 0) {
-                if (sd_bus_error_has_name(&error, SD_BUS_ERROR_SERVICE_UNKNOWN) ||
-                    sd_bus_error_has_name(&error, SD_BUS_ERROR_NAME_HAS_NO_OWNER)) {
-                        log_debug("systemd-homed is not running, skipping locking of home directories.");
-                        return 0;
-                }
+                if (!bus_error_is_unknown_service(&error))
+                        return log_error_errno(r, "Failed to lock home directories: %s", bus_error_message(&error, r));
 
-                return log_error_errno(r, "Failed to lock home directories: %s", bus_error_message(&error, r));
+                return log_debug("systemd-homed is not running, locking of home directories skipped.");
         }
 
-        log_debug("Successfully requested for all home directories to be locked.");
-        return 0;
+        return log_debug("Successfully requested locking of all home directories.");
 }
 
-static int execute(char **modes, char **states) {
+static int execute(char **modes, char **states, const char *action) {
         char *arguments[] = {
                 NULL,
                 (char*) "pre",
@@ -193,12 +193,14 @@ static int execute(char **modes, char **states) {
 
         setvbuf(f, NULL, _IONBF, 0);
 
-        /* Configure the hibernation mode */
+        /* Configure hibernation settings if we are supposed to hibernate */
         if (!strv_isempty(modes)) {
                 r = find_hibernate_location(&hibernate_location);
                 if (r < 0)
-                        return r;
-                else if (r == 0) {
+                        return log_error_errno(r, "Failed to find location to hibernate to: %m");
+                if (r == 0) { /* 0 means: no hibernation location was configured in the kernel so far, let's
+                               * do it ourselves then. > 0 means: kernel already had a configured hibernation
+                               * location which we shouldn't touch. */
                         r = write_hibernate_location_info(hibernate_location);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to prepare for hibernation: %m");
@@ -208,6 +210,10 @@ static int execute(char **modes, char **states) {
                 if (r < 0)
                         return log_error_errno(r, "Failed to write mode to /sys/power/disk: %m");;
         }
+
+        r = setenv("SYSTEMD_SLEEP_ACTION", action, 1);
+        if (r != 0)
+                log_warning_errno(errno, "Error setting SYSTEMD_SLEEP_ACTION=%s: %m", action);
 
         (void) execute_directories(dirs, DEFAULT_TIMEOUT_USEC, NULL, NULL, arguments, NULL, EXEC_DIR_PARALLEL | EXEC_DIR_IGNORE_ERRORS);
         (void) lock_all_homes();
@@ -239,7 +245,6 @@ static int execute_s2h(const SleepConfig *sleep_config) {
         _cleanup_close_ int tfd = -1;
         char buf[FORMAT_TIMESPAN_MAX];
         struct itimerspec ts = {};
-        struct pollfd fds;
         int r;
 
         assert(sleep_config);
@@ -257,35 +262,29 @@ static int execute_s2h(const SleepConfig *sleep_config) {
         if (r < 0)
                 return log_error_errno(errno, "Error setting hibernate timer: %m");
 
-        r = execute(sleep_config->suspend_modes, sleep_config->suspend_states);
+        r = execute(sleep_config->suspend_modes, sleep_config->suspend_states, "suspend");
         if (r < 0)
                 return r;
 
-        fds = (struct pollfd) {
-                .fd = tfd,
-                .events = POLLIN,
-        };
-        r = poll(&fds, 1, 0);
+        r = fd_wait_for_event(tfd, POLLIN, 0);
         if (r < 0)
-                return log_error_errno(errno, "Error polling timerfd: %m");
+                return log_error_errno(r, "Error polling timerfd: %m");
+        if (!FLAGS_SET(r, POLLIN)) /* We woke up before the alarm time, we are done. */
+                return 0;
 
         tfd = safe_close(tfd);
-
-        if (!FLAGS_SET(fds.revents, POLLIN)) /* We woke up before the alarm time, we are done. */
-                return 0;
 
         /* If woken up after alarm time, hibernate */
         log_debug("Attempting to hibernate after waking from %s timer",
                   format_timespan(buf, sizeof(buf), sleep_config->hibernate_delay_sec, USEC_PER_SEC));
 
-        r = execute(sleep_config->hibernate_modes, sleep_config->hibernate_states);
+        r = execute(sleep_config->hibernate_modes, sleep_config->hibernate_states, "hibernate");
         if (r < 0) {
-                log_notice("Couldn't hibernate, will try to suspend again.");
-                r = execute(sleep_config->suspend_modes, sleep_config->suspend_states);
-                if (r < 0) {
-                        log_notice("Could neither hibernate nor suspend again, giving up.");
-                        return r;
-                }
+                log_notice_errno(r, "Couldn't hibernate, will try to suspend again: %m");
+
+                r = execute(sleep_config->suspend_modes, sleep_config->suspend_states, "suspend-after-failed-hibernate");
+                if (r < 0)
+                        return log_error_errno(r, "Could neither hibernate nor suspend, giving up: %m");
         }
 
         return 0;
@@ -392,7 +391,7 @@ static int run(int argc, char *argv[]) {
         if (streq(arg_verb, "suspend-then-hibernate"))
                 return execute_s2h(sleep_config);
         else
-                return execute(modes, states);
+                return execute(modes, states, arg_verb);
 }
 
 DEFINE_MAIN_FUNCTION(run);

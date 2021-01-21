@@ -1,4 +1,4 @@
-#  SPDX-License-Identifier: LGPL-2.1+
+#  SPDX-License-Identifier: LGPL-2.1-or-later
 #
 #  This file is part of systemd.
 #
@@ -19,7 +19,7 @@ Before=rescue.service
 [Service]
 Environment=HOME=/root
 WorkingDirectory=-/root
-ExecStartPre=-/bin/plymouth --wait quit
+ExecStartPre=-@rootbindir@/plymouth --wait quit
 ExecStart=-@rootlibexecdir@/systemd-sulogin-shell emergency
 Type=idle
 StandardInput=tty-force

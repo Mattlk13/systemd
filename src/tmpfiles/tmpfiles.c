@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
 #include <fcntl.h>
@@ -26,6 +26,7 @@
 #include "copy.h"
 #include "def.h"
 #include "dirent-util.h"
+#include "dissect-image.h"
 #include "escape.h"
 #include "fd-util.h"
 #include "fileio.h"
@@ -37,8 +38,12 @@
 #include "log.h"
 #include "macro.h"
 #include "main-func.h"
+#include "missing_stat.h"
+#include "missing_syscall.h"
 #include "mkdir.h"
+#include "mount-util.h"
 #include "mountpoint-util.h"
+#include "offline-passwd.h"
 #include "pager.h"
 #include "parse-util.h"
 #include "path-lookup.h"
@@ -55,6 +60,7 @@
 #include "string-table.h"
 #include "string-util.h"
 #include "strv.h"
+#include "terminal-util.h"
 #include "umask-util.h"
 #include "user-util.h"
 
@@ -163,6 +169,7 @@ static PagerFlags arg_pager_flags = 0;
 static char **arg_include_prefixes = NULL;
 static char **arg_exclude_prefixes = NULL;
 static char *arg_root = NULL;
+static char *arg_image = NULL;
 static char *arg_replace = NULL;
 
 #define MAX_DEPTH 256
@@ -176,28 +183,33 @@ STATIC_DESTRUCTOR_REGISTER(unix_sockets, set_free_freep);
 STATIC_DESTRUCTOR_REGISTER(arg_include_prefixes, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_exclude_prefixes, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_root, freep);
+STATIC_DESTRUCTOR_REGISTER(arg_image, freep);
 
 static int specifier_machine_id_safe(char specifier, const void *data, const void *userdata, char **ret);
 static int specifier_directory(char specifier, const void *data, const void *userdata, char **ret);
 
 static const Specifier specifier_table[] = {
-        { 'm', specifier_machine_id_safe, NULL },
+        { 'a', specifier_architecture,    NULL },
         { 'b', specifier_boot_id,         NULL },
+        { 'B', specifier_os_build_id,     NULL },
         { 'H', specifier_host_name,       NULL },
+        { 'l', specifier_short_host_name, NULL },
+        { 'm', specifier_machine_id_safe, NULL },
+        { 'o', specifier_os_id,           NULL },
         { 'v', specifier_kernel_release,  NULL },
+        { 'w', specifier_os_version_id,   NULL },
+        { 'W', specifier_os_variant_id,   NULL },
 
-        { 'g', specifier_group_name,      NULL },
-        { 'G', specifier_group_id,        NULL },
-        { 'U', specifier_user_id,         NULL },
-        { 'u', specifier_user_name,       NULL },
         { 'h', specifier_user_home,       NULL },
 
-        { 't', specifier_directory,       UINT_TO_PTR(DIRECTORY_RUNTIME) },
-        { 'S', specifier_directory,       UINT_TO_PTR(DIRECTORY_STATE) },
         { 'C', specifier_directory,       UINT_TO_PTR(DIRECTORY_CACHE) },
         { 'L', specifier_directory,       UINT_TO_PTR(DIRECTORY_LOGS) },
-        { 'T', specifier_tmp_dir,         NULL },
-        { 'V', specifier_var_tmp_dir,     NULL },
+        { 'S', specifier_directory,       UINT_TO_PTR(DIRECTORY_STATE) },
+        { 't', specifier_directory,       UINT_TO_PTR(DIRECTORY_RUNTIME) },
+
+        COMMON_CREDS_SPECIFIERS,
+
+        COMMON_TMP_SPECIFIERS,
         {}
 };
 
@@ -244,7 +256,7 @@ static int specifier_directory(char specifier, const void *data, const void *use
         i = PTR_TO_UINT(data);
         assert(i < ELEMENTSOF(paths_system));
 
-        return sd_path_home(paths[i].type, paths[i].suffix, ret);
+        return sd_path_lookup(paths[i].type, paths[i].suffix, ret);
 }
 
 static int log_unresolvable_specifier(const char *filename, unsigned line) {
@@ -256,10 +268,11 @@ static int log_unresolvable_specifier(const char *filename, unsigned line) {
          * not considered as an error so log at LOG_NOTICE only for the first time
          * and then downgrade this to LOG_DEBUG for the rest. */
 
-        log_full(notified ? LOG_DEBUG : LOG_NOTICE,
-                 "[%s:%u] Failed to resolve specifier: %s, skipping",
-                 filename, line,
-                 arg_user ? "Required $XDG_... variable not defined" : "uninitialized /etc detected");
+        log_syntax(NULL,
+                   notified ? LOG_DEBUG : LOG_NOTICE,
+                   filename, line, 0,
+                   "Failed to resolve specifier: %s, skipping",
+                   arg_user ? "Required $XDG_... variable not defined" : "uninitialized /etc detected");
 
         if (!notified)
                 log_notice("All rules containing unresolvable specifiers will be skipped.");
@@ -361,9 +374,8 @@ static bool takes_ownership(ItemType t) {
 
 static struct Item* find_glob(OrderedHashmap *h, const char *match) {
         ItemArray *j;
-        Iterator i;
 
-        ORDERED_HASHMAP_FOREACH(j, h, i) {
+        ORDERED_HASHMAP_FOREACH(j, h) {
                 size_t n;
 
                 for (n = 0; n < j->n_items; n++) {
@@ -478,59 +490,104 @@ static DIR* opendir_nomod(const char *path) {
         return xopendirat_nomod(AT_FDCWD, path);
 }
 
+static inline nsec_t load_statx_timestamp_nsec(const struct statx_timestamp *ts) {
+        assert(ts);
+
+        if (ts->tv_sec < 0)
+                return NSEC_INFINITY;
+
+        if ((nsec_t) ts->tv_sec >= (UINT64_MAX - ts->tv_nsec) / NSEC_PER_SEC)
+                return NSEC_INFINITY;
+
+        return ts->tv_sec * NSEC_PER_SEC + ts->tv_nsec;
+}
+
 static int dir_cleanup(
                 Item *i,
                 const char *p,
                 DIR *d,
-                const struct stat *ds,
-                usec_t cutoff,
-                dev_t rootdev,
+                nsec_t self_atime_nsec,
+                nsec_t self_mtime_nsec,
+                nsec_t cutoff_nsec,
+                dev_t rootdev_major,
+                dev_t rootdev_minor,
                 bool mountpoint,
                 int maxdepth,
                 bool keep_this_level) {
 
-        struct dirent *dent;
         bool deleted = false;
+        struct dirent *dent;
         int r = 0;
 
         FOREACH_DIRENT_ALL(dent, d, break) {
-                struct stat s;
-                usec_t age;
                 _cleanup_free_ char *sub_path = NULL;
+                nsec_t atime_nsec, mtime_nsec, ctime_nsec, btime_nsec;
 
                 if (dot_or_dot_dot(dent->d_name))
                         continue;
 
-                if (fstatat(dirfd(d), dent->d_name, &s, AT_SYMLINK_NOFOLLOW) < 0) {
-                        if (errno == ENOENT)
-                                continue;
+                /* If statx() is supported, use it. It's preferable over fstatat() since it tells us
+                 * explicitly where we are looking at a mount point, for free as side information. Determining
+                 * the same information without statx() is hard, see the complexity of path_is_mount_point(),
+                 * and also much slower as it requires a number of syscalls instead of just one. Hence, when
+                 * we have modern statx() we use it instead of fstat() and do proper mount point checks,
+                 * while on older kernels's well do traditional st_dev based detection of mount points.
+                 *
+                 * Using statx() for detecting mount points also has the benfit that we handle weird file
+                 * systems such as overlayfs better where each file is originating from a different
+                 * st_dev. */
 
+                STRUCT_STATX_DEFINE(sx);
+
+                r = statx_fallback(
+                                dirfd(d), dent->d_name,
+                                AT_SYMLINK_NOFOLLOW|AT_NO_AUTOMOUNT,
+                                STATX_TYPE|STATX_MODE|STATX_UID|STATX_ATIME|STATX_MTIME|STATX_CTIME|STATX_BTIME,
+                                &sx);
+                if (r == -ENOENT)
+                        continue;
+                if (r < 0) {
                         /* FUSE, NFS mounts, SELinux might return EACCES */
                         r = log_full_errno(errno == EACCES ? LOG_DEBUG : LOG_ERR, errno,
-                                           "stat(%s/%s) failed: %m", p, dent->d_name);
+                                           "statx(%s/%s) failed: %m", p, dent->d_name);
                         continue;
                 }
 
-                /* Stay on the same filesystem */
-                if (s.st_dev != rootdev) {
-                        log_debug("Ignoring \"%s/%s\": different filesystem.", p, dent->d_name);
-                        continue;
-                }
-
-                /* Try to detect bind mounts of the same filesystem instance; they
-                 * do not differ in device major/minors. This type of query is not
-                 * supported on all kernels or filesystem types though. */
-                if (S_ISDIR(s.st_mode)) {
-                        int q;
-
-                        q = fd_is_mount_point(dirfd(d), dent->d_name, 0);
-                        if (q < 0)
-                                log_debug_errno(q, "Failed to determine whether \"%s/%s\" is a mount point, ignoring: %m", p, dent->d_name);
-                        else if (q > 0) {
-                                log_debug("Ignoring \"%s/%s\": different mount of the same filesystem.", p, dent->d_name);
+                if (FLAGS_SET(sx.stx_attributes_mask, STATX_ATTR_MOUNT_ROOT)) {
+                        /* Yay, we have the mount point API, use it */
+                        if (FLAGS_SET(sx.stx_attributes, STATX_ATTR_MOUNT_ROOT)) {
+                                log_debug("Ignoring \"%s/%s\": different mount points.", p, dent->d_name);
                                 continue;
                         }
+                } else {
+                        /* So we might have statx() but the STATX_ATTR_MOUNT_ROOT flag is not supported, fall
+                         * back to traditional stx_dev checking. */
+                        if (sx.stx_dev_major != rootdev_major ||
+                            sx.stx_dev_minor != rootdev_minor) {
+                                log_debug("Ignoring \"%s/%s\": different filesystem.", p, dent->d_name);
+                                continue;
+                        }
+
+                        /* Try to detect bind mounts of the same filesystem instance; they do not differ in device
+                         * major/minors. This type of query is not supported on all kernels or filesystem types
+                         * though. */
+                        if (S_ISDIR(sx.stx_mode)) {
+                                int q;
+
+                                q = fd_is_mount_point(dirfd(d), dent->d_name, 0);
+                                if (q < 0)
+                                        log_debug_errno(q, "Failed to determine whether \"%s/%s\" is a mount point, ignoring: %m", p, dent->d_name);
+                                else if (q > 0) {
+                                        log_debug("Ignoring \"%s/%s\": different mount of the same filesystem.", p, dent->d_name);
+                                        continue;
+                                }
+                        }
                 }
+
+                atime_nsec = FLAGS_SET(sx.stx_mask, STATX_ATIME) ? load_statx_timestamp_nsec(&sx.stx_atime) : 0;
+                mtime_nsec = FLAGS_SET(sx.stx_mask, STATX_MTIME) ? load_statx_timestamp_nsec(&sx.stx_mtime) : 0;
+                ctime_nsec = FLAGS_SET(sx.stx_mask, STATX_CTIME) ? load_statx_timestamp_nsec(&sx.stx_ctime) : 0;
+                btime_nsec = FLAGS_SET(sx.stx_mask, STATX_BTIME) ? load_statx_timestamp_nsec(&sx.stx_btime) : 0;
 
                 sub_path = path_join(p, dent->d_name);
                 if (!sub_path) {
@@ -549,12 +606,12 @@ static int dir_cleanup(
                         continue;
                 }
 
-                if (S_ISDIR(s.st_mode)) {
+                if (S_ISDIR(sx.stx_mode)) {
                         _cleanup_closedir_ DIR *sub_dir = NULL;
 
                         if (mountpoint &&
                             streq(dent->d_name, "lost+found") &&
-                            s.st_uid == 0) {
+                            sx.stx_uid == 0) {
                                 log_debug("Ignoring directory \"%s\".", sub_path);
                                 continue;
                         }
@@ -577,7 +634,11 @@ static int dir_cleanup(
                                         continue;
                                 }
 
-                                q = dir_cleanup(i, sub_path, sub_dir, &s, cutoff, rootdev, false, maxdepth-1, false);
+                                q = dir_cleanup(i,
+                                                sub_path, sub_dir,
+                                                atime_nsec, mtime_nsec, cutoff_nsec,
+                                                rootdev_major, rootdev_minor,
+                                                false, maxdepth-1, false);
                                 if (q < 0)
                                         r = q;
                         }
@@ -593,22 +654,28 @@ static int dir_cleanup(
                         }
 
                         /* Ignore ctime, we change it when deleting */
-                        age = timespec_load(&s.st_mtim);
-                        if (age >= cutoff) {
+                        if (mtime_nsec != NSEC_INFINITY && mtime_nsec >= cutoff_nsec) {
                                 char a[FORMAT_TIMESTAMP_MAX];
                                 /* Follows spelling in stat(1). */
                                 log_debug("Directory \"%s\": modify time %s is too new.",
                                           sub_path,
-                                          format_timestamp_us(a, sizeof(a), age));
+                                          format_timestamp_style(a, sizeof(a), mtime_nsec / NSEC_PER_USEC, TIMESTAMP_US));
                                 continue;
                         }
 
-                        age = timespec_load(&s.st_atim);
-                        if (age >= cutoff) {
+                        if (atime_nsec != NSEC_INFINITY && atime_nsec >= cutoff_nsec) {
                                 char a[FORMAT_TIMESTAMP_MAX];
                                 log_debug("Directory \"%s\": access time %s is too new.",
                                           sub_path,
-                                          format_timestamp_us(a, sizeof(a), age));
+                                          format_timestamp_style(a, sizeof(a), atime_nsec / NSEC_PER_USEC, TIMESTAMP_US));
+                                continue;
+                        }
+
+                        if (btime_nsec != NSEC_INFINITY && btime_nsec >= cutoff_nsec) {
+                                char a[FORMAT_TIMESTAMP_MAX];
+                                log_debug("Directory \"%s\": birth time %s is too new.",
+                                          sub_path,
+                                          format_timestamp_style(a, sizeof(a), btime_nsec / NSEC_PER_USEC, TIMESTAMP_US));
                                 continue;
                         }
 
@@ -620,14 +687,14 @@ static int dir_cleanup(
                 } else {
                         /* Skip files for which the sticky bit is set. These are semantics we define, and are
                          * unknown elsewhere. See XDG_RUNTIME_DIR specification for details. */
-                        if (s.st_mode & S_ISVTX) {
+                        if (sx.stx_mode & S_ISVTX) {
                                 log_debug("Skipping \"%s\": sticky bit set.", sub_path);
                                 continue;
                         }
 
                         if (mountpoint &&
-                            S_ISREG(s.st_mode) &&
-                            s.st_uid == 0 &&
+                            S_ISREG(sx.stx_mode) &&
+                            sx.stx_uid == 0 &&
                             STR_IN_SET(dent->d_name,
                                        ".journal",
                                        "aquota.user",
@@ -637,13 +704,13 @@ static int dir_cleanup(
                         }
 
                         /* Ignore sockets that are listed in /proc/net/unix */
-                        if (S_ISSOCK(s.st_mode) && unix_socket_alive(sub_path)) {
+                        if (S_ISSOCK(sx.stx_mode) && unix_socket_alive(sub_path)) {
                                 log_debug("Skipping \"%s\": live socket.", sub_path);
                                 continue;
                         }
 
                         /* Ignore device nodes */
-                        if (S_ISCHR(s.st_mode) || S_ISBLK(s.st_mode)) {
+                        if (S_ISCHR(sx.stx_mode) || S_ISBLK(sx.stx_mode)) {
                                 log_debug("Skipping \"%s\": a device.", sub_path);
                                 continue;
                         }
@@ -654,31 +721,36 @@ static int dir_cleanup(
                                 continue;
                         }
 
-                        age = timespec_load(&s.st_mtim);
-                        if (age >= cutoff) {
+                        if (mtime_nsec != NSEC_INFINITY && mtime_nsec >= cutoff_nsec) {
                                 char a[FORMAT_TIMESTAMP_MAX];
                                 /* Follows spelling in stat(1). */
                                 log_debug("File \"%s\": modify time %s is too new.",
                                           sub_path,
-                                          format_timestamp_us(a, sizeof(a), age));
+                                          format_timestamp_style(a, sizeof(a), mtime_nsec / NSEC_PER_USEC, TIMESTAMP_US));
                                 continue;
                         }
 
-                        age = timespec_load(&s.st_atim);
-                        if (age >= cutoff) {
+                        if (atime_nsec != NSEC_INFINITY && atime_nsec >= cutoff_nsec) {
                                 char a[FORMAT_TIMESTAMP_MAX];
                                 log_debug("File \"%s\": access time %s is too new.",
                                           sub_path,
-                                          format_timestamp_us(a, sizeof(a), age));
+                                          format_timestamp_style(a, sizeof(a), atime_nsec / NSEC_PER_USEC, TIMESTAMP_US));
                                 continue;
                         }
 
-                        age = timespec_load(&s.st_ctim);
-                        if (age >= cutoff) {
+                        if (ctime_nsec != NSEC_INFINITY && ctime_nsec >= cutoff_nsec) {
                                 char a[FORMAT_TIMESTAMP_MAX];
                                 log_debug("File \"%s\": change time %s is too new.",
                                           sub_path,
-                                          format_timestamp_us(a, sizeof(a), age));
+                                          format_timestamp_style(a, sizeof(a), ctime_nsec / NSEC_PER_USEC, TIMESTAMP_US));
+                                continue;
+                        }
+
+                        if (btime_nsec != NSEC_INFINITY && btime_nsec >= cutoff_nsec) {
+                                char a[FORMAT_TIMESTAMP_MAX];
+                                log_debug("File \"%s\": birth time %s is too new.",
+                                          sub_path,
+                                          format_timestamp_style(a, sizeof(a), btime_nsec / NSEC_PER_USEC, TIMESTAMP_US));
                                 continue;
                         }
 
@@ -693,21 +765,19 @@ static int dir_cleanup(
 
 finish:
         if (deleted) {
-                char a[FORMAT_TIMESTAMP_MAX], b[FORMAT_TIMESTAMP_MAX];
-                usec_t age1, age2;
-
-                age1 = timespec_load(&ds->st_atim);
-                age2 = timespec_load(&ds->st_mtim);
+                char a[FORMAT_TIMESTAMP_MAX], m[FORMAT_TIMESTAMP_MAX];
+                struct timespec ts[2];
 
                 log_debug("Restoring access and modification time on \"%s\": %s, %s",
                           p,
-                          format_timestamp_us(a, sizeof(a), age1),
-                          format_timestamp_us(b, sizeof(b), age2));
+                          format_timestamp_style(a, sizeof(a), self_atime_nsec / NSEC_PER_USEC, TIMESTAMP_US),
+                          format_timestamp_style(m, sizeof(m), self_mtime_nsec / NSEC_PER_USEC, TIMESTAMP_US));
+
+                timespec_store_nsec(ts + 0, self_atime_nsec);
+                timespec_store_nsec(ts + 1, self_mtime_nsec);
 
                 /* Restore original directory timestamps */
-                if (futimens(dirfd(d), (struct timespec[]) {
-                                ds->st_atim,
-                                ds->st_mtim }) < 0)
+                if (futimens(dirfd(d), ts) < 0)
                         log_warning_errno(errno, "Failed to revert timestamps of '%s', ignoring: %m", p);
         }
 
@@ -765,6 +835,7 @@ static int fd_set_perms(Item *i, int fd, const char *path, const struct stat *st
         struct stat stbuf;
         mode_t new_mode;
         bool do_chown;
+        int r;
 
         assert(i);
         assert(fd);
@@ -810,8 +881,9 @@ static int fd_set_perms(Item *i, int fd, const char *path, const struct stat *st
                                 log_debug("\"%s\" matches temporary mode %o already.", path, m);
                         else {
                                 log_debug("Temporarily changing \"%s\" to mode %o.", path, m);
-                                if (fchmod_opath(fd, m) < 0)
-                                        return log_error_errno(errno, "fchmod() of %s failed: %m", path);
+                                r = fchmod_opath(fd, m);
+                                if (r < 0)
+                                        return log_error_errno(r, "fchmod() of %s failed: %m", path);
                         }
                 }
         }
@@ -842,8 +914,9 @@ static int fd_set_perms(Item *i, int fd, const char *path, const struct stat *st
                                 log_debug("\"%s\" matches mode %o already.", path, new_mode);
                         else {
                                 log_debug("Changing \"%s\" to mode %o.", path, new_mode);
-                                if (fchmod_opath(fd, new_mode) < 0)
-                                        return log_error_errno(errno, "fchmod() of %s failed: %m", path);
+                                r = fchmod_opath(fd, new_mode);
+                                if (r < 0)
+                                        return log_error_errno(r, "fchmod() of %s failed: %m", path);
                         }
                 }
         }
@@ -989,7 +1062,7 @@ static int parse_acls_from_arg(Item *item) {
         if (r < 0)
                 log_warning_errno(r, "Failed to parse ACL \"%s\": %m. Ignoring", item->argument);
 #else
-        log_warning_errno(SYNTHETIC_ERRNO(ENOSYS), "ACLs are not supported. Ignoring");
+        log_warning("ACLs are not supported. Ignoring.");
 #endif
 
         return 0;
@@ -1030,13 +1103,17 @@ static int path_set_acl(const char *path, const char *pretty, acl_type_t type, a
                   strna(t), pretty);
 
         r = acl_set_file(path, type, dup);
-        if (r < 0)
-                /* Return positive to indicate we already warned */
-                return -log_error_errno(errno,
-                                        "Setting %s ACL \"%s\" on %s failed: %m",
-                                        type == ACL_TYPE_ACCESS ? "access" : "default",
-                                        strna(t), pretty);
-
+        if (r < 0) {
+                if (ERRNO_IS_NOT_SUPPORTED(errno))
+                        /* No error if filesystem doesn't support ACLs. Return negative. */
+                        return -errno;
+                else
+                        /* Return positive to indicate we already warned */
+                        return -log_error_errno(errno,
+                                                "Setting %s ACL \"%s\" on %s failed: %m",
+                                                type == ACL_TYPE_ACCESS ? "access" : "default",
+                                                strna(t), pretty);
+        }
         return 0;
 }
 #endif
@@ -1076,12 +1153,18 @@ static int fd_set_acls(Item *item, int fd, const char *path, const struct stat *
         if (r == 0 && item->acl_default && S_ISDIR(st->st_mode))
                 r = path_set_acl(procfs_path, path, ACL_TYPE_DEFAULT, item->acl_default, item->append_or_force);
 
-        if (r > 0)
-                return -r; /* already warned */
-        if (r == -EOPNOTSUPP) {
+        if (ERRNO_IS_NOT_SUPPORTED(r)) {
                 log_debug_errno(r, "ACLs not supported by file system at %s", path);
                 return 0;
         }
+
+        if (r > 0)
+                return -r; /* already warned */
+
+        /* The above procfs paths don't work if /proc is not mounted. */
+        if (r == -ENOENT && proc_mounted() == 0)
+                r = -ENOSYS;
+
         if (r < 0)
                 return log_error_errno(r, "ACL operation on \"%s\" failed: %m", path);
 #endif
@@ -1226,11 +1309,15 @@ static int fd_set_attribute(Item *item, int fd, const char *path, const struct s
         if (procfs_fd < 0)
                 return log_error_errno(procfs_fd, "Failed to re-open '%s': %m", path);
 
-        r = chattr_fd(procfs_fd, f, item->attribute_mask, NULL);
-        if (r < 0)
-                log_full_errno(IN_SET(r, -ENOTTY, -EOPNOTSUPP) ? LOG_DEBUG : LOG_WARNING,
-                               r,
-                               "Cannot set file attribute for '%s', value=0x%08x, mask=0x%08x, ignoring: %m",
+        unsigned previous, current;
+        r = chattr_full(NULL, procfs_fd, f, item->attribute_mask, &previous, &current, true);
+        if (r == -ENOANO)
+                log_warning("Cannot set file attributes for '%s', maybe due to incompatibility in specified attributes, "
+                            "previous=0x%08x, current=0x%08x, expected=0x%08x, ignoring.",
+                            path, previous, current, (previous & ~item->attribute_mask) | (f & item->attribute_mask));
+        else if (r < 0)
+                log_full_errno(ERRNO_IS_NOT_SUPPORTED(r) ? LOG_DEBUG : LOG_WARNING, r,
+                               "Cannot set file attributes for '%s', value=0x%08x, mask=0x%08x, ignoring: %m",
                                path, item->attribute_value, item->attribute_mask);
 
         return 0;
@@ -1252,7 +1339,7 @@ static int path_set_attribute(Item *item, const char *path) {
 static int write_one_file(Item *i, const char *path) {
         _cleanup_close_ int fd = -1, dir_fd = -1;
         char *bn;
-        int flags, r;
+        int r;
 
         assert(i);
         assert(path);
@@ -1267,15 +1354,19 @@ static int write_one_file(Item *i, const char *path) {
 
         bn = basename(path);
 
-        flags = O_NONBLOCK|O_CLOEXEC|O_WRONLY|O_NOCTTY;
-
         /* Follows symlinks */
-        fd = openat(dir_fd, bn, i->append_or_force ? flags|O_APPEND : flags, i->mode);
+        fd = openat(dir_fd, bn,
+                    O_NONBLOCK|O_CLOEXEC|O_WRONLY|O_NOCTTY|(i->append_or_force ? O_APPEND : 0),
+                    i->mode);
         if (fd < 0) {
                 if (errno == ENOENT) {
                         log_debug_errno(errno, "Not writing missing file \"%s\": %m", path);
                         return 0;
                 }
+
+                if (i->allow_failure)
+                        return log_debug_errno(errno, "Failed to open file \"%s\", ignoring: %m", path);
+
                 return log_error_errno(errno, "Failed to open file \"%s\": %m", path);
         }
 
@@ -1334,10 +1425,10 @@ static int create_file(Item *i, const char *path) {
                 if (fstat(fd, &stbuf) < 0)
                         return log_error_errno(errno, "stat(%s) failed: %m", path);
 
-                if (!S_ISREG(stbuf.st_mode)) {
-                        log_error("%s exists and is not a regular file.", path);
-                        return -EEXIST;
-                }
+                if (!S_ISREG(stbuf.st_mode))
+                        return log_error_errno(SYNTHETIC_ERRNO(EEXIST),
+                                               "%s exists and is not a regular file.",
+                                               path);
 
                 st = &stbuf;
         } else {
@@ -1398,10 +1489,10 @@ static int truncate_file(Item *i, const char *path) {
 
                 fd = openat(dir_fd, bn, O_NOFOLLOW|O_CLOEXEC|O_PATH, i->mode);
                 if (fd < 0) {
-                        if (errno == ENOENT) {
-                                log_error("Cannot create file %s on a read-only file system.", path);
-                                return -EROFS;
-                        }
+                        if (errno == ENOENT)
+                                return log_error_errno(SYNTHETIC_ERRNO(EROFS),
+                                                       "Cannot create file %s on a read-only file system.",
+                                                       path);
 
                         return log_error_errno(errno, "Failed to re-open file %s: %m", path);
                 }
@@ -1412,10 +1503,10 @@ static int truncate_file(Item *i, const char *path) {
         if (fstat(fd, &stbuf) < 0)
                 return log_error_errno(errno, "stat(%s) failed: %m", path);
 
-        if (!S_ISREG(stbuf.st_mode)) {
-                log_error("%s exists and is not a regular file.", path);
-                return -EEXIST;
-        }
+        if (!S_ISREG(stbuf.st_mode))
+                return log_error_errno(SYNTHETIC_ERRNO(EEXIST),
+                                       "%s exists and is not a regular file.",
+                                       path);
 
         if (stbuf.st_size > 0) {
                 if (ftruncate(fd, 0) < 0) {
@@ -1460,7 +1551,7 @@ static int copy_files(Item *i) {
                          dfd, bn,
                          i->uid_set ? i->uid : UID_INVALID,
                          i->gid_set ? i->gid : GID_INVALID,
-                         COPY_REFLINK | COPY_MERGE_EMPTY | COPY_MAC_CREATE);
+                         COPY_REFLINK | COPY_MERGE_EMPTY | COPY_MAC_CREATE | COPY_HARDLINKS);
         if (r < 0) {
                 struct stat a, b;
 
@@ -1612,7 +1703,7 @@ static int create_subvolume(Item *i, const char *path) {
                         log_debug_errno(r, "Couldn't adjust quota for subvolume \"%s\" (unsupported fs or dir not a subvolume): %m", i->path);
                 else if (r == -EROFS)
                         log_debug_errno(r, "Couldn't adjust quota for subvolume \"%s\" (fs is read-only).", i->path);
-                else if (r == -ENOPROTOOPT)
+                else if (r == -ENOTCONN)
                         log_debug_errno(r, "Couldn't adjust quota for subvolume \"%s\" (quota support is disabled).", i->path);
                 else if (r < 0)
                         q = log_error_errno(r, "Failed to adjust quota for subvolume \"%s\": %m", i->path);
@@ -2165,11 +2256,11 @@ static int remove_item(Item *i) {
 }
 
 static int clean_item_instance(Item *i, const char* instance) {
-        _cleanup_closedir_ DIR *d = NULL;
-        struct stat s, ps;
-        bool mountpoint;
-        usec_t cutoff, n;
         char timestamp[FORMAT_TIMESTAMP_MAX];
+        _cleanup_closedir_ DIR *d = NULL;
+        STRUCT_STATX_DEFINE(sx);
+        int mountpoint, r;
+        usec_t cutoff, n;
 
         assert(i);
 
@@ -2192,24 +2283,34 @@ static int clean_item_instance(Item *i, const char* instance) {
                 return log_error_errno(errno, "Failed to open directory %s: %m", instance);
         }
 
-        if (fstat(dirfd(d), &s) < 0)
-                return log_error_errno(errno, "stat(%s) failed: %m", i->path);
+        r = statx_fallback(dirfd(d), "", AT_EMPTY_PATH, STATX_MODE|STATX_INO|STATX_ATIME|STATX_MTIME, &sx);
+        if (r < 0)
+                return log_error_errno(r, "statx(%s) failed: %m", instance);
 
-        if (!S_ISDIR(s.st_mode))
-                return log_error_errno(SYNTHETIC_ERRNO(ENOTDIR),
-                                       "%s is not a directory.", i->path);
+        if (FLAGS_SET(sx.stx_attributes_mask, STATX_ATTR_MOUNT_ROOT))
+                mountpoint = FLAGS_SET(sx.stx_attributes, STATX_ATTR_MOUNT_ROOT);
+        else {
+                struct stat ps;
 
-        if (fstatat(dirfd(d), "..", &ps, AT_SYMLINK_NOFOLLOW) != 0)
-                return log_error_errno(errno, "stat(%s/..) failed: %m", i->path);
+                if (fstatat(dirfd(d), "..", &ps, AT_SYMLINK_NOFOLLOW) != 0)
+                        return log_error_errno(errno, "stat(%s/..) failed: %m", i->path);
 
-        mountpoint = s.st_dev != ps.st_dev || s.st_ino == ps.st_ino;
+                mountpoint =
+                        sx.stx_dev_major != major(ps.st_dev) ||
+                        sx.stx_dev_minor != minor(ps.st_dev) ||
+                        sx.stx_ino != ps.st_ino;
+        }
 
         log_debug("Cleanup threshold for %s \"%s\" is %s",
                   mountpoint ? "mount point" : "directory",
                   instance,
-                  format_timestamp_us(timestamp, sizeof(timestamp), cutoff));
+                  format_timestamp_style(timestamp, sizeof(timestamp), cutoff, TIMESTAMP_US));
 
-        return dir_cleanup(i, instance, d, &s, cutoff, s.st_dev, mountpoint,
+        return dir_cleanup(i, instance, d,
+                           load_statx_timestamp_nsec(&sx.stx_atime),
+                           load_statx_timestamp_nsec(&sx.stx_mtime),
+                           cutoff * NSEC_PER_USEC,
+                           sx.stx_dev_major, sx.stx_dev_minor, mountpoint,
                            MAX_DEPTH, i->keep_first_level);
 }
 
@@ -2281,10 +2382,9 @@ static int process_item_array(ItemArray *array, OperationMask operation) {
 
         /* Clean up all children first */
         if ((operation & (OPERATION_REMOVE|OPERATION_CLEAN)) && !set_isempty(array->children)) {
-                Iterator i;
                 ItemArray *c;
 
-                SET_FOREACH(c, array->children, i) {
+                SET_FOREACH(c, array->children) {
                         int k;
 
                         k = process_item_array(c, operation & (OPERATION_REMOVE|OPERATION_CLEAN));
@@ -2388,8 +2488,7 @@ static bool should_include_path(const char *path) {
                         return true;
                 }
 
-        /* no matches, so we should include this path only if we
-         * have no whitelist at all */
+        /* no matches, so we should include this path only if we have no allow list at all */
         if (strv_isempty(arg_include_prefixes))
                 return true;
 
@@ -2426,9 +2525,7 @@ static int specifier_expansion_from_arg(Item *i) {
 
         case SET_XATTR:
         case RECURSIVE_SET_XATTR:
-                assert(i->xattrs);
-
-                STRV_FOREACH (xattr, i->xattrs) {
+                STRV_FOREACH(xattr, i->xattrs) {
                         r = specifier_printf(*xattr, specifier_table, NULL, &resolved);
                         if (r < 0)
                                 return r;
@@ -2478,7 +2575,63 @@ static int patch_var_run(const char *fname, unsigned line, char **path) {
         return 0;
 }
 
-static int parse_line(const char *fname, unsigned line, const char *buffer, bool *invalid_config) {
+static int find_uid(const char *user, uid_t *ret_uid, Hashmap **cache) {
+        int r;
+
+        assert(user);
+        assert(ret_uid);
+
+        /* First: parse as numeric UID string */
+        r = parse_uid(user, ret_uid);
+        if (r >= 0)
+                return r;
+
+        /* Second: pass to NSS if we are running "online" */
+        if (!arg_root)
+                return get_user_creds(&user, ret_uid, NULL, NULL, NULL, 0);
+
+        /* Third, synthesize "root" unconditionally */
+        if (streq(user, "root")) {
+                *ret_uid = 0;
+                return 0;
+        }
+
+        /* Fourth: use fgetpwent() to read /etc/passwd directly, if we are "offline" */
+        return name_to_uid_offline(arg_root, user, ret_uid, cache);
+}
+
+static int find_gid(const char *group, gid_t *ret_gid, Hashmap **cache) {
+        int r;
+
+        assert(group);
+        assert(ret_gid);
+
+        /* First: parse as numeric GID string */
+        r = parse_gid(group, ret_gid);
+        if (r >= 0)
+                return r;
+
+        /* Second: pass to NSS if we are running "online" */
+        if (!arg_root)
+                return get_group_creds(&group, ret_gid, 0);
+
+        /* Third, synthesize "root" unconditionally */
+        if (streq(group, "root")) {
+                *ret_gid = 0;
+                return 0;
+        }
+
+        /* Fourth: use fgetgrent() to read /etc/group directly, if we are "offline" */
+        return name_to_gid_offline(arg_root, group, ret_gid, cache);
+}
+
+static int parse_line(
+                const char *fname,
+                unsigned line,
+                const char *buffer,
+                bool *invalid_config,
+                Hashmap **uid_cache,
+                Hashmap **gid_cache) {
 
         _cleanup_free_ char *action = NULL, *mode = NULL, *user = NULL, *group = NULL, *age = NULL, *path = NULL;
         _cleanup_(item_free_contents) Item i = {};
@@ -2506,11 +2659,10 @@ static int parse_line(const char *fname, unsigned line, const char *buffer, bool
                 if (IN_SET(r, -EINVAL, -EBADSLT))
                         /* invalid quoting and such or an unknown specifier */
                         *invalid_config = true;
-                return log_error_errno(r, "[%s:%u] Failed to parse line: %m", fname, line);
+                return log_syntax(NULL, LOG_ERR, fname, line, r, "Failed to parse line: %m");
         } else if (r < 2) {
                 *invalid_config = true;
-                log_error("[%s:%u] Syntax error.", fname, line);
-                return -EIO;
+                return log_syntax(NULL, LOG_ERR, fname, line, SYNTHETIC_ERRNO(EBADMSG), "Syntax error.");
         }
 
         if (!empty_or_dash(buffer)) {
@@ -2521,8 +2673,7 @@ static int parse_line(const char *fname, unsigned line, const char *buffer, bool
 
         if (isempty(action)) {
                 *invalid_config = true;
-                log_error("[%s:%u] Command too short '%s'.", fname, line, action);
-                return -EINVAL;
+                return log_syntax(NULL, LOG_ERR, fname, line, SYNTHETIC_ERRNO(EBADMSG), "Command too short '%s'.", action);
         }
 
         for (pos = 1; action[pos]; pos++) {
@@ -2534,15 +2685,12 @@ static int parse_line(const char *fname, unsigned line, const char *buffer, bool
                         allow_failure = true;
                 else {
                         *invalid_config = true;
-                        log_error("[%s:%u] Unknown modifiers in command '%s'",
-                                  fname, line, action);
-                        return -EINVAL;
+                        return log_syntax(NULL, LOG_ERR, fname, line, SYNTHETIC_ERRNO(EBADMSG), "Unknown modifiers in command '%s'", action);
                 }
         }
 
         if (boot && !arg_boot) {
-                log_debug("Ignoring entry %s \"%s\" because --boot is not specified.",
-                          action, path);
+                log_syntax(NULL, LOG_DEBUG, fname, line, 0, "Ignoring entry %s \"%s\" because --boot is not specified.", action, path);
                 return 0;
         }
 
@@ -2556,7 +2704,7 @@ static int parse_line(const char *fname, unsigned line, const char *buffer, bool
         if (r < 0) {
                 if (IN_SET(r, -EINVAL, -EBADSLT))
                         *invalid_config = true;
-                return log_error_errno(r, "[%s:%u] Failed to replace specifiers: %s", fname, line, path);
+                return log_syntax(NULL, LOG_ERR, fname, line, r, "Failed to replace specifiers in '%s': %m", path);
         }
 
         r = patch_var_run(fname, line, &i.path);
@@ -2580,7 +2728,7 @@ static int parse_line(const char *fname, unsigned line, const char *buffer, bool
         case RELABEL_PATH:
         case RECURSIVE_RELABEL_PATH:
                 if (i.argument)
-                        log_warning("[%s:%u] %c lines don't take argument fields, ignoring.", fname, line, i.type);
+                        log_syntax(NULL, LOG_WARNING, fname, line, 0, "%c lines don't take argument fields, ignoring.", i.type);
 
                 break;
 
@@ -2599,23 +2747,23 @@ static int parse_line(const char *fname, unsigned line, const char *buffer, bool
         case WRITE_FILE:
                 if (!i.argument) {
                         *invalid_config = true;
-                        log_error("[%s:%u] Write file requires argument.", fname, line);
-                        return -EBADMSG;
+                        return log_syntax(NULL, LOG_ERR, fname, line, SYNTHETIC_ERRNO(EBADMSG), "Write file requires argument.");
                 }
                 break;
 
         case COPY_FILES:
                 if (!i.argument) {
-                        i.argument = path_join(arg_root, "/usr/share/factory", i.path);
+                        i.argument = path_join("/usr/share/factory", i.path);
                         if (!i.argument)
                                 return log_oom();
 
                 } else if (!path_is_absolute(i.argument)) {
                         *invalid_config = true;
-                        log_error("[%s:%u] Source path is not absolute.", fname, line);
-                        return -EBADMSG;
+                        return log_syntax(NULL, LOG_ERR, fname, line, SYNTHETIC_ERRNO(EBADMSG), "Source path '%s' is not absolute.", i.argument);
 
-                } else if (arg_root) {
+                }
+
+                if (!empty_or_root(arg_root)) {
                         char *p;
 
                         p = path_join(arg_root, i.argument);
@@ -2631,15 +2779,13 @@ static int parse_line(const char *fname, unsigned line, const char *buffer, bool
         case CREATE_BLOCK_DEVICE:
                 if (!i.argument) {
                         *invalid_config = true;
-                        log_error("[%s:%u] Device file requires argument.", fname, line);
-                        return -EBADMSG;
+                        return log_syntax(NULL, LOG_ERR, fname, line, SYNTHETIC_ERRNO(EBADMSG), "Device file requires argument.");
                 }
 
                 r = parse_dev(i.argument, &i.major_minor);
                 if (r < 0) {
                         *invalid_config = true;
-                        log_error_errno(r, "[%s:%u] Can't parse device file major/minor '%s'.", fname, line, i.argument);
-                        return -EBADMSG;
+                        return log_syntax(NULL, LOG_ERR, fname, line, r, "Can't parse device file major/minor '%s'.", i.argument);
                 }
 
                 break;
@@ -2648,8 +2794,8 @@ static int parse_line(const char *fname, unsigned line, const char *buffer, bool
         case RECURSIVE_SET_XATTR:
                 if (!i.argument) {
                         *invalid_config = true;
-                        log_error("[%s:%u] Set extended attribute requires argument.", fname, line);
-                        return -EBADMSG;
+                        return log_syntax(NULL, LOG_ERR, fname, line, SYNTHETIC_ERRNO(EBADMSG),
+                                          "Set extended attribute requires argument.");
                 }
                 r = parse_xattrs_from_arg(&i);
                 if (r < 0)
@@ -2660,8 +2806,8 @@ static int parse_line(const char *fname, unsigned line, const char *buffer, bool
         case RECURSIVE_SET_ACL:
                 if (!i.argument) {
                         *invalid_config = true;
-                        log_error("[%s:%u] Set ACLs requires argument.", fname, line);
-                        return -EBADMSG;
+                        return log_syntax(NULL, LOG_ERR, fname, line, SYNTHETIC_ERRNO(EBADMSG),
+                                          "Set ACLs requires argument.");
                 }
                 r = parse_acls_from_arg(&i);
                 if (r < 0)
@@ -2672,8 +2818,8 @@ static int parse_line(const char *fname, unsigned line, const char *buffer, bool
         case RECURSIVE_SET_ATTRIBUTE:
                 if (!i.argument) {
                         *invalid_config = true;
-                        log_error("[%s:%u] Set file attribute requires argument.", fname, line);
-                        return -EBADMSG;
+                        return log_syntax(NULL, LOG_ERR, fname, line, SYNTHETIC_ERRNO(EBADMSG),
+                                          "Set file attribute requires argument.");
                 }
                 r = parse_attribute_from_arg(&i);
                 if (IN_SET(r, -EINVAL, -EBADSLT))
@@ -2683,15 +2829,15 @@ static int parse_line(const char *fname, unsigned line, const char *buffer, bool
                 break;
 
         default:
-                log_error("[%s:%u] Unknown command type '%c'.", fname, line, (char) i.type);
                 *invalid_config = true;
-                return -EBADMSG;
+                return log_syntax(NULL, LOG_ERR, fname, line, SYNTHETIC_ERRNO(EBADMSG),
+                                  "Unknown command type '%c'.", (char) i.type);
         }
 
         if (!path_is_absolute(i.path)) {
-                log_error("[%s:%u] Path '%s' not absolute.", fname, line, i.path);
                 *invalid_config = true;
-                return -EBADMSG;
+                return log_syntax(NULL, LOG_ERR, fname, line, SYNTHETIC_ERRNO(EBADMSG),
+                                  "Path '%s' not absolute.", i.path);
         }
 
         path_simplify(i.path, false);
@@ -2705,11 +2851,10 @@ static int parse_line(const char *fname, unsigned line, const char *buffer, bool
         if (r < 0) {
                 if (IN_SET(r, -EINVAL, -EBADSLT))
                         *invalid_config = true;
-                return log_error_errno(r, "[%s:%u] Failed to substitute specifiers in argument: %m",
-                                       fname, line);
+                return log_syntax(NULL, LOG_ERR, fname, line, r, "Failed to substitute specifiers in argument: %m");
         }
 
-        if (arg_root) {
+        if (!empty_or_root(arg_root)) {
                 char *p;
 
                 p = path_join(arg_root, i.path);
@@ -2719,25 +2864,20 @@ static int parse_line(const char *fname, unsigned line, const char *buffer, bool
         }
 
         if (!empty_or_dash(user)) {
-                const char *u = user;
-
-                r = get_user_creds(&u, &i.uid, NULL, NULL, NULL, USER_CREDS_ALLOW_MISSING);
+                r = find_uid(user, &i.uid, uid_cache);
                 if (r < 0) {
                         *invalid_config = true;
-                        return log_error_errno(r, "[%s:%u] Unknown user '%s'.", fname, line, user);
+                        return log_syntax(NULL, LOG_ERR, fname, line, r, "Failed to resolve user '%s': %m", user);
                 }
 
                 i.uid_set = true;
         }
 
         if (!empty_or_dash(group)) {
-                const char *g = group;
-
-                r = get_group_creds(&g, &i.gid, USER_CREDS_ALLOW_MISSING);
+                r = find_gid(group, &i.gid, gid_cache);
                 if (r < 0) {
                         *invalid_config = true;
-                        log_error("[%s:%u] Unknown group '%s'.", fname, line, group);
-                        return r;
+                        return log_syntax(NULL, LOG_ERR, fname, line, r, "Failed to resolve group '%s'.", group);
                 }
 
                 i.gid_set = true;
@@ -2752,10 +2892,10 @@ static int parse_line(const char *fname, unsigned line, const char *buffer, bool
                         mm++;
                 }
 
-                if (parse_mode(mm, &m) < 0) {
+                r = parse_mode(mm, &m);
+                if (r < 0) {
                         *invalid_config = true;
-                        log_error("[%s:%u] Invalid mode '%s'.", fname, line, mode);
-                        return -EBADMSG;
+                        return log_syntax(NULL, LOG_ERR, fname, line, r, "Invalid mode '%s'.", mode);
                 }
 
                 i.mode = m;
@@ -2771,10 +2911,10 @@ static int parse_line(const char *fname, unsigned line, const char *buffer, bool
                         a++;
                 }
 
-                if (parse_sec(a, &i.age) < 0) {
+                r = parse_sec(a, &i.age);
+                if (r < 0) {
                         *invalid_config = true;
-                        log_error("[%s:%u] Invalid age '%s'.", fname, line, age);
-                        return -EBADMSG;
+                        return log_syntax(NULL, LOG_ERR, fname, line, r, "Invalid age '%s'.", age);
                 }
 
                 i.age_set = true;
@@ -2788,8 +2928,7 @@ static int parse_line(const char *fname, unsigned line, const char *buffer, bool
 
                 for (n = 0; n < existing->n_items; n++) {
                         if (!item_compatible(existing->items + n, &i) && !i.append_or_force) {
-                                log_notice("[%s:%u] Duplicate line for path \"%s\", ignoring.",
-                                           fname, line, i.path);
+                                log_syntax(NULL, LOG_NOTICE, fname, line, 0, "Duplicate line for path \"%s\", ignoring.", i.path);
                                 return 0;
                         }
                 }
@@ -2828,6 +2967,27 @@ static int cat_config(char **config_dirs, char **args) {
         return cat_files(NULL, files, 0);
 }
 
+static int exclude_default_prefixes(void) {
+        int r;
+
+        /* Provide an easy way to exclude virtual/memory file systems from what we do here. Useful in
+         * combination with --root= where we probably don't want to apply stuff to these dirs as they are
+         * likely over-mounted if the root directory is actually used, and it wouldbe less than ideal to have
+         * all kinds of files created/adjusted underneath these mount points. */
+
+        r = strv_extend_strv(
+                        &arg_exclude_prefixes,
+                        STRV_MAKE("/dev",
+                                  "/proc",
+                                  "/run",
+                                  "/sys"),
+                                 true);
+        if (r < 0)
+                return log_oom();
+
+        return 0;
+}
+
 static int help(void) {
         _cleanup_free_ char *link = NULL;
         int r;
@@ -2836,8 +2996,8 @@ static int help(void) {
         if (r < 0)
                 return log_oom();
 
-        printf("%s [OPTIONS...] [CONFIGURATION FILE...]\n\n"
-               "Creates, deletes and cleans up volatile and temporary files and directories.\n\n"
+        printf("%s [OPTIONS...] [CONFIGURATION FILE...]\n"
+               "\n%sCreates, deletes and cleans up volatile and temporary files and directories.%s\n\n"
                "  -h --help                 Show this help\n"
                "     --user                 Execute user configuration\n"
                "     --version              Show package version\n"
@@ -2848,11 +3008,14 @@ static int help(void) {
                "     --boot                 Execute actions only safe at boot\n"
                "     --prefix=PATH          Only apply rules with the specified prefix\n"
                "     --exclude-prefix=PATH  Ignore rules with the specified prefix\n"
+               "  -E                        Ignore rules prefixed with /dev, /proc, /run, /sys\n"
                "     --root=PATH            Operate on an alternate filesystem root\n"
+               "     --image=PATH           Operate on disk image as filesystem root\n"
                "     --replace=PATH         Treat arguments as replacement for PATH\n"
                "     --no-pager             Do not pipe output into a pager\n"
                "\nSee the %s for details.\n"
                , program_invocation_short_name
+               , ansi_highlight(), ansi_normal()
                , link
         );
 
@@ -2872,6 +3035,7 @@ static int parse_argv(int argc, char *argv[]) {
                 ARG_PREFIX,
                 ARG_EXCLUDE_PREFIX,
                 ARG_ROOT,
+                ARG_IMAGE,
                 ARG_REPLACE,
                 ARG_NO_PAGER,
         };
@@ -2888,6 +3052,7 @@ static int parse_argv(int argc, char *argv[]) {
                 { "prefix",         required_argument,   NULL, ARG_PREFIX         },
                 { "exclude-prefix", required_argument,   NULL, ARG_EXCLUDE_PREFIX },
                 { "root",           required_argument,   NULL, ARG_ROOT           },
+                { "image",          required_argument,   NULL, ARG_IMAGE          },
                 { "replace",        required_argument,   NULL, ARG_REPLACE        },
                 { "no-pager",       no_argument,         NULL, ARG_NO_PAGER       },
                 {}
@@ -2898,7 +3063,7 @@ static int parse_argv(int argc, char *argv[]) {
         assert(argc >= 0);
         assert(argv);
 
-        while ((c = getopt_long(argc, argv, "h", options, NULL)) >= 0)
+        while ((c = getopt_long(argc, argv, "hE", options, NULL)) >= 0)
 
                 switch (c) {
 
@@ -2943,9 +3108,28 @@ static int parse_argv(int argc, char *argv[]) {
                         break;
 
                 case ARG_ROOT:
-                        r = parse_path_argument_and_warn(optarg, true, &arg_root);
+                        r = parse_path_argument_and_warn(optarg, /* suppress_root= */ false, &arg_root);
                         if (r < 0)
                                 return r;
+                        break;
+
+                case ARG_IMAGE:
+#ifdef STANDALONE
+                        return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP),
+                                               "This systemd-tmpfiles version is compiled without support for --image=.");
+#else
+                        r = parse_path_argument_and_warn(optarg, /* suppress_root= */ false, &arg_image);
+                        if (r < 0)
+                                return r;
+#endif
+                        /* Imply -E here since it makes little sense to create files persistently in the /run mountpoint of a disk image */
+                        _fallthrough_;
+
+                case 'E':
+                        r = exclude_default_prefixes();
+                        if (r < 0)
+                                return r;
+
                         break;
 
                 case ARG_REPLACE:
@@ -2980,12 +3164,19 @@ static int parse_argv(int argc, char *argv[]) {
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "When --replace= is given, some configuration items must be specified");
 
+        if (arg_root && arg_user)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "Combination of --user and --root= is not supported.");
+
+        if (arg_image && arg_root)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Please specify either --root= or --image=, the combination of both is not supported.");
+
         return 1;
 }
 
 static int read_config_file(char **config_dirs, const char *fn, bool ignore_enoent, bool *invalid_config) {
+        _cleanup_(hashmap_freep) Hashmap *uid_cache = NULL, *gid_cache = NULL;
         _cleanup_fclose_ FILE *_f = NULL;
-        Iterator iterator;
         unsigned v = 0;
         FILE *f;
         Item *i;
@@ -3029,7 +3220,7 @@ static int read_config_file(char **config_dirs, const char *fn, bool ignore_enoe
                 if (IN_SET(*l, 0, '#'))
                         continue;
 
-                k = parse_line(fn, v, l, &invalid_line);
+                k = parse_line(fn, v, l, &invalid_line, &uid_cache, &gid_cache);
                 if (k < 0) {
                         if (invalid_line)
                                 /* Allow reporting with a special code if the caller requested this */
@@ -3041,14 +3232,13 @@ static int read_config_file(char **config_dirs, const char *fn, bool ignore_enoe
         }
 
         /* we have to determine age parameter for each entry of type X */
-        ORDERED_HASHMAP_FOREACH(i, globs, iterator) {
-                Iterator iter;
+        ORDERED_HASHMAP_FOREACH(i, globs) {
                 Item *j, *candidate_item = NULL;
 
                 if (i->type != IGNORE_DIRECTORY_PATH)
                         continue;
 
-                ORDERED_HASHMAP_FOREACH(j, items, iter) {
+                ORDERED_HASHMAP_FOREACH(j, items) {
                         if (!IN_SET(j->type, CREATE_DIRECTORY, TRUNCATE_DIRECTORY, CREATE_SUBVOLUME, CREATE_SUBVOLUME_INHERIT_QUOTA, CREATE_SUBVOLUME_NEW_QUOTA))
                                 continue;
 
@@ -3138,11 +3328,7 @@ static int link_parent(ItemArray *a) {
                 if (!j)
                         j = ordered_hashmap_get(globs, prefix);
                 if (j) {
-                        r = set_ensure_allocated(&j->children, NULL);
-                        if (r < 0)
-                                return log_oom();
-
-                        r = set_put(j->children, a);
+                        r = set_ensure_put(&j->children, NULL, a);
                         if (r < 0)
                                 return log_oom();
 
@@ -3158,9 +3344,13 @@ DEFINE_PRIVATE_HASH_OPS_WITH_VALUE_DESTRUCTOR(item_array_hash_ops, char, string_
                                               ItemArray, item_array_free);
 
 static int run(int argc, char *argv[]) {
+#ifndef STANDALONE
+        _cleanup_(loop_device_unrefp) LoopDevice *loop_device = NULL;
+        _cleanup_(decrypted_image_unrefp) DecryptedImage *decrypted_image = NULL;
+        _cleanup_(umount_and_rmdir_and_freep) char *unlink_dir = NULL;
+#endif
         _cleanup_strv_free_ char **config_dirs = NULL;
         bool invalid_config = false;
-        Iterator iterator;
         ItemArray *a;
         enum {
                 PHASE_REMOVE_AND_CLEAN,
@@ -3190,10 +3380,20 @@ static int run(int argc, char *argv[]) {
 
         if (DEBUG_LOGGING) {
                 _cleanup_free_ char *t = NULL;
+                char **i;
 
-                t = strv_join(config_dirs, "\n\t");
-                if (t)
-                        log_debug("Looking for configuration files in (higher priority first):\n\t%s", t);
+                STRV_FOREACH(i, config_dirs) {
+                        _cleanup_free_ char *j = NULL;
+
+                        j = path_join(arg_root, *i);
+                        if (!j)
+                                return log_oom();
+
+                        if (!strextend(&t, "\n\t", j))
+                                return log_oom();
+                }
+
+                log_debug("Looking for configuration files in (higher priority first):%s", t);
         }
 
         if (arg_cat_config) {
@@ -3204,7 +3404,30 @@ static int run(int argc, char *argv[]) {
 
         umask(0022);
 
-        mac_selinux_init();
+        r = mac_selinux_init();
+        if (r < 0)
+                return r;
+
+#ifndef STANDALONE
+        if (arg_image) {
+                assert(!arg_root);
+
+                r = mount_image_privately_interactively(
+                                arg_image,
+                                DISSECT_IMAGE_REQUIRE_ROOT|DISSECT_IMAGE_VALIDATE_OS|DISSECT_IMAGE_RELAX_VAR_CHECK|DISSECT_IMAGE_FSCK,
+                                &unlink_dir,
+                                &loop_device,
+                                &decrypted_image);
+                if (r < 0)
+                        return r;
+
+                arg_root = strdup(unlink_dir);
+                if (!arg_root)
+                        return log_oom();
+        }
+#else
+        assert(!arg_image);
+#endif
 
         items = ordered_hashmap_new(&item_array_hash_ops);
         globs = ordered_hashmap_new(&item_array_hash_ops);
@@ -3225,12 +3448,12 @@ static int run(int argc, char *argv[]) {
                 return r;
 
         /* Let's now link up all child/parent relationships */
-        ORDERED_HASHMAP_FOREACH(a, items, iterator) {
+        ORDERED_HASHMAP_FOREACH(a, items) {
                 r = link_parent(a);
                 if (r < 0)
                         return r;
         }
-        ORDERED_HASHMAP_FOREACH(a, globs, iterator) {
+        ORDERED_HASHMAP_FOREACH(a, globs) {
                 r = link_parent(a);
                 if (r < 0)
                         return r;
@@ -3252,21 +3475,21 @@ static int run(int argc, char *argv[]) {
                         continue;
 
                 /* The non-globbing ones usually create things, hence we apply them first */
-                ORDERED_HASHMAP_FOREACH(a, items, iterator) {
+                ORDERED_HASHMAP_FOREACH(a, items) {
                         k = process_item_array(a, op);
                         if (k < 0 && r >= 0)
                                 r = k;
                 }
 
                 /* The globbing ones usually alter things, hence we apply them second. */
-                ORDERED_HASHMAP_FOREACH(a, globs, iterator) {
+                ORDERED_HASHMAP_FOREACH(a, globs) {
                         k = process_item_array(a, op);
                         if (k < 0 && r >= 0)
                                 r = k;
                 }
         }
 
-        if (ERRNO_IS_RESOURCE(-r))
+        if (ERRNO_IS_RESOURCE(r))
                 return r;
         if (invalid_config)
                 return EX_DATAERR;

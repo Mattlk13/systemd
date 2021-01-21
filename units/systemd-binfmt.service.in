@@ -1,4 +1,4 @@
-#  SPDX-License-Identifier: LGPL-2.1+
+#  SPDX-License-Identifier: LGPL-2.1-or-later
 #
 #  This file is part of systemd.
 #
@@ -28,4 +28,5 @@ ConditionDirectoryNotEmpty=|/run/binfmt.d
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=@rootlibexecdir@/systemd-binfmt
+ExecStop=@rootlibexecdir@/systemd-binfmt --unregister
 TimeoutSec=90s

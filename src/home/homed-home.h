@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 typedef struct Home Home;
@@ -13,6 +13,7 @@ typedef enum HomeState {
         HOME_UNFIXATED,               /* home exists, but local record does not */
         HOME_ABSENT,                  /* local record exists, but home does not */
         HOME_INACTIVE,                /* record and home exist, but is not logged in */
+        HOME_DIRTY,                   /* like HOME_INACTIVE, but the home directory wasn't cleanly deactivated */
         HOME_FIXATING,                /* generating local record from home */
         HOME_FIXATING_FOR_ACTIVATION, /* fixating in order to activate soon */
         HOME_FIXATING_FOR_ACQUIRE,    /* fixating because Acquire() was called */
@@ -163,6 +164,8 @@ int home_schedule_operation(Home *h, Operation *o, sd_bus_error *error);
 int home_auto_login(Home *h, char ***ret_seats);
 
 int home_set_current_message(Home *h, sd_bus_message *m);
+
+int home_wait_for_worker(Home *h);
 
 const char *home_state_to_string(HomeState state);
 HomeState home_state_from_string(const char *s);

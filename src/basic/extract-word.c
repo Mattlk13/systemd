@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
 #include <stdarg.h>
@@ -14,16 +14,16 @@
 #include "log.h"
 #include "macro.h"
 #include "string-util.h"
+#include "strv.h"
 #include "utf8.h"
 
 int extract_first_word(const char **p, char **ret, const char *separators, ExtractFlags flags) {
         _cleanup_free_ char *s = NULL;
         size_t allocated = 0, sz = 0;
-        char c;
-        int r;
-
         char quote = 0;                 /* 0 or ' or " */
         bool backslash = false;         /* whether we've just seen a backslash */
+        char c;
+        int r;
 
         assert(p);
         assert(ret);
@@ -70,7 +70,7 @@ int extract_first_word(const char **p, char **ret, const char *separators, Extra
 
                         if (c == 0) {
                                 if ((flags & EXTRACT_CUNESCAPE_RELAX) &&
-                                    (!quote || flags & EXTRACT_RELAX)) {
+                                    (quote == 0 || flags & EXTRACT_RELAX)) {
                                         /* If we find an unquoted trailing backslash and we're in
                                          * EXTRACT_CUNESCAPE_RELAX mode, keep it verbatim in the
                                          * output.
@@ -86,31 +86,36 @@ int extract_first_word(const char **p, char **ret, const char *separators, Extra
                                 return -EINVAL;
                         }
 
-                        if (flags & EXTRACT_CUNESCAPE) {
+                        if (flags & (EXTRACT_CUNESCAPE|EXTRACT_UNESCAPE_SEPARATORS)) {
                                 bool eight_bit = false;
                                 char32_t u;
 
-                                r = cunescape_one(*p, (size_t) -1, &u, &eight_bit, false);
-                                if (r < 0) {
-                                        if (flags & EXTRACT_CUNESCAPE_RELAX) {
-                                                s[sz++] = '\\';
-                                                s[sz++] = c;
-                                        } else
-                                                return -EINVAL;
-                                } else {
+                                if ((flags & EXTRACT_CUNESCAPE) &&
+                                    (r = cunescape_one(*p, (size_t) -1, &u, &eight_bit, false)) >= 0) {
+                                        /* A valid escaped sequence */
+                                        assert(r >= 1);
+
                                         (*p) += r - 1;
 
                                         if (eight_bit)
                                                 s[sz++] = u;
                                         else
                                                 sz += utf8_encode_unichar(s + sz, u);
-                                }
+                                } else if ((flags & EXTRACT_UNESCAPE_SEPARATORS) &&
+                                           strchr(separators, **p))
+                                        /* An escaped separator char */
+                                        s[sz++] = c;
+                                else if (flags & EXTRACT_CUNESCAPE_RELAX) {
+                                        s[sz++] = '\\';
+                                        s[sz++] = c;
+                                } else
+                                        return -EINVAL;
                         } else
                                 s[sz++] = c;
 
                         backslash = false;
 
-                } else if (quote) {     /* inside either single or double quotes */
+                } else if (quote != 0) {     /* inside either single or double quotes */
                         for (;; (*p)++, c = **p) {
                                 if (c == 0) {
                                         if (flags & EXTRACT_RELAX)

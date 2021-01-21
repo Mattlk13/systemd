@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 #include <stdbool.h>
@@ -12,6 +12,7 @@ typedef enum TableDataType {
         TABLE_EMPTY,
         TABLE_STRING,
         TABLE_STRV,
+        TABLE_STRV_WRAPPED,
         TABLE_PATH,
         TABLE_BOOLEAN,
         TABLE_TIMESTAMP,
@@ -47,6 +48,8 @@ typedef enum TableDataType {
         TABLE_SET_ALIGN_PERCENT,
         TABLE_SET_ELLIPSIZE_PERCENT,
         TABLE_SET_COLOR,
+        TABLE_SET_RGAP_COLOR,
+        TABLE_SET_BOTH_COLORS,
         TABLE_SET_URL,
         TABLE_SET_UPPERCASE,
 
@@ -89,6 +92,7 @@ int table_set_weight(Table *t, TableCell *cell, unsigned weight);
 int table_set_align_percent(Table *t, TableCell *cell, unsigned percent);
 int table_set_ellipsize_percent(Table *t, TableCell *cell, unsigned percent);
 int table_set_color(Table *t, TableCell *cell, const char *color);
+int table_set_rgap_color(Table *t, TableCell *cell, const char *color);
 int table_set_url(Table *t, TableCell *cell, const char *url);
 int table_set_uppercase(Table *t, TableCell *cell, bool b);
 
@@ -127,3 +131,9 @@ int table_print_json(Table *t, FILE *f, JsonFormatFlags json_flags);
 
 #define table_log_add_error(r) \
         log_error_errno(r, "Failed to add cell(s) to table: %m")
+
+#define table_log_print_error(r) \
+        log_error_errno(r, "Failed to print table: %m")
+
+#define table_log_sort_error(r) \
+        log_error_errno(r, "Failed to sort table: %m")

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 #include <glob.h>
@@ -11,7 +11,7 @@
 int safe_glob(const char *path, int flags, glob_t *pglob);
 
 int glob_exists(const char *path);
-int glob_extend(char ***strv, const char *path);
+int glob_extend(char ***strv, const char *path, int flags);
 
 #define _cleanup_globfree_ _cleanup_(globfree)
 

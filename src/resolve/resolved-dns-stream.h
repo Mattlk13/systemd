@@ -1,9 +1,19 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
+#include "sd-event.h"
+
+#include "ordered-set.h"
 #include "socket-util.h"
 
+typedef struct DnsServer DnsServer;
 typedef struct DnsStream DnsStream;
+typedef struct DnsTransaction DnsTransaction;
+typedef struct Manager Manager;
+typedef struct DnsStubListenerExtra DnsStubListenerExtra;
+
+#include "resolved-dns-packet.h"
+#include "resolved-dnstls.h"
 
 typedef enum DnsStreamType {
         DNS_STREAM_LOOKUP,        /* Outgoing connection to a classic DNS server */
@@ -13,11 +23,6 @@ typedef enum DnsStreamType {
         _DNS_STREAM_TYPE_MAX,
         _DNS_STREAM_TYPE_INVALID = -1,
 } DnsStreamType;
-
-#include "resolved-dns-packet.h"
-#include "resolved-dns-transaction.h"
-#include "resolved-dnstls.h"
-#include "resolved-manager.h"
 
 #define DNS_STREAM_WRITE_TLS_DATA 1
 
@@ -70,6 +75,8 @@ struct DnsStream {
 
         /* used when DNS-over-TLS is enabled */
         bool encrypted:1;
+
+        DnsStubListenerExtra *stub_listener_extra;
 
         LIST_FIELDS(DnsStream, streams);
 };

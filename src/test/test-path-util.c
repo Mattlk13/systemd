@@ -1,13 +1,14 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <stdio.h>
 #include <unistd.h>
 
 #include "alloc-util.h"
+#include "exec-util.h"
 #include "fd-util.h"
 #include "macro.h"
-#include "mountpoint-util.h"
 #include "path-util.h"
+#include "process-util.h"
 #include "rm-rf.h"
 #include "stat-util.h"
 #include "string-util.h"
@@ -40,8 +41,6 @@ static void test_path_simplify(const char *in, const char *out, const char *out_
 }
 
 static void test_path(void) {
-        _cleanup_close_ int fd = -1;
-
         log_info("/* %s */", __func__);
 
         test_path_compare("/goo", "/goo", 0);
@@ -79,10 +78,6 @@ static void test_path(void) {
         assert_se(streq(basename("/aa///.file"), ".file"));
         assert_se(streq(basename("/aa///file..."), "file..."));
         assert_se(streq(basename("file.../"), ""));
-
-        fd = open("/", O_RDONLY|O_CLOEXEC|O_DIRECTORY|O_NOCTTY);
-        assert_se(fd >= 0);
-        assert_se(fd_is_mount_point(fd, "/", 0) > 0);
 
         test_path_simplify("aaa/bbb////ccc", "aaa/bbb/ccc", "aaa/bbb/ccc");
         test_path_simplify("//aaa/.////ccc", "/aaa/./ccc", "/aaa/ccc");
@@ -164,31 +159,113 @@ static void test_path_equal_root(void) {
         assert_se(!path_equal_or_files_same("/", "/.../", AT_SYMLINK_NOFOLLOW));
 }
 
-static void test_find_binary(const char *self) {
+static void test_find_executable_full(void) {
         char *p;
 
         log_info("/* %s */", __func__);
 
-        assert_se(find_binary("/bin/sh", &p) == 0);
+        assert_se(find_executable_full("sh", true, &p, NULL) == 0);
+        puts(p);
+        assert_se(streq(basename(p), "sh"));
+        free(p);
+
+        assert_se(find_executable_full("sh", false, &p, NULL) == 0);
+        puts(p);
+        assert_se(streq(basename(p), "sh"));
+        free(p);
+
+        _cleanup_free_ char *oldpath = NULL;
+        p = getenv("PATH");
+        if (p)
+                assert_se(oldpath = strdup(p));
+
+        assert_se(unsetenv("PATH") == 0);
+
+        assert_se(find_executable_full("sh", true, &p, NULL) == 0);
+        puts(p);
+        assert_se(streq(basename(p), "sh"));
+        free(p);
+
+        assert_se(find_executable_full("sh", false, &p, NULL) == 0);
+        puts(p);
+        assert_se(streq(basename(p), "sh"));
+        free(p);
+
+        if (oldpath)
+                assert_se(setenv("PATH", oldpath, true) >= 0);
+}
+
+static void test_find_executable(const char *self) {
+        char *p;
+
+        log_info("/* %s */", __func__);
+
+        assert_se(find_executable("/bin/sh", &p) == 0);
         puts(p);
         assert_se(path_equal(p, "/bin/sh"));
         free(p);
 
-        assert_se(find_binary(self, &p) == 0);
+        assert_se(find_executable(self, &p) == 0);
         puts(p);
-        /* libtool might prefix the binary name with "lt-" */
-        assert_se(endswith(p, "/lt-test-path-util") || endswith(p, "/test-path-util"));
+        assert_se(endswith(p, "/test-path-util"));
         assert_se(path_is_absolute(p));
         free(p);
 
-        assert_se(find_binary("sh", &p) == 0);
+        assert_se(find_executable("sh", &p) == 0);
         puts(p);
         assert_se(endswith(p, "/sh"));
         assert_se(path_is_absolute(p));
         free(p);
 
-        assert_se(find_binary("xxxx-xxxx", &p) == -ENOENT);
-        assert_se(find_binary("/some/dir/xxxx-xxxx", &p) == -ENOENT);
+        assert_se(find_executable("/bin/touch", &p) == 0);
+        assert_se(streq(p, "/bin/touch"));
+        free(p);
+
+        assert_se(find_executable("touch", &p) == 0);
+        assert_se(path_is_absolute(p));
+        assert_se(streq(basename(p), "touch"));
+        free(p);
+
+        assert_se(find_executable("xxxx-xxxx", &p) == -ENOENT);
+        assert_se(find_executable("/some/dir/xxxx-xxxx", &p) == -ENOENT);
+        assert_se(find_executable("/proc/filesystems", &p) == -EACCES);
+}
+
+static void test_find_executable_exec_one(const char *path) {
+        _cleanup_free_ char *t = NULL;
+        _cleanup_close_ int fd = -1;
+        pid_t pid;
+        int r;
+
+        r = find_executable_full(path, false, &t, &fd);
+
+        log_info_errno(r, "%s: %s → %s: %d/%m", __func__, path, t ?: "-", fd);
+
+        assert_se(fd > STDERR_FILENO);
+        assert_se(path_is_absolute(t));
+        if (path_is_absolute(path))
+                assert_se(streq(t, path));
+
+        pid = fork();
+        assert_se(pid >= 0);
+        if (pid == 0) {
+                r = fexecve_or_execve(fd, t, STRV_MAKE(t, "--version"), STRV_MAKE(NULL));
+                log_error_errno(r, "[f]execve: %m");
+                _exit(EXIT_FAILURE);
+        }
+
+        assert_se(wait_for_terminate_and_check(t, pid, WAIT_LOG) == 0);
+}
+
+static void test_find_executable_exec(void) {
+        log_info("/* %s */", __func__);
+
+        test_find_executable_exec_one("touch");
+        test_find_executable_exec_one("/bin/touch");
+
+        _cleanup_free_ char *script = NULL;
+        assert_se(get_testdata_dir("test-path-util/script.sh", &script) >= 0);
+        test_find_executable_exec_one(script);
 }
 
 static void test_prefixes(void) {
@@ -302,7 +379,7 @@ static void test_fsck_exists(void) {
         log_info("/* %s */", __func__);
 
         /* Ensure we use a sane default for PATH. */
-        unsetenv("PATH");
+        assert_se(unsetenv("PATH") == 0);
 
         /* fsck.minix is provided by util-linux and will probably exist. */
         assert_se(fsck_exists("minix") == 1);
@@ -537,6 +614,9 @@ static void test_filename_is_valid(void) {
         assert_se(!filename_is_valid("/"));
         assert_se(!filename_is_valid("."));
         assert_se(!filename_is_valid(".."));
+        assert_se(!filename_is_valid("bar/foo"));
+        assert_se(!filename_is_valid("bar/foo/"));
+        assert_se(!filename_is_valid("bar//"));
 
         for (i=0; i<FILENAME_MAX+1; i++)
                 foo[i] = 'a';
@@ -667,7 +747,9 @@ int main(int argc, char **argv) {
         test_print_paths();
         test_path();
         test_path_equal_root();
-        test_find_binary(argv[0]);
+        test_find_executable_full();
+        test_find_executable(argv[0]);
+        test_find_executable_exec();
         test_prefixes();
         test_path_join();
         test_fsck_exists();

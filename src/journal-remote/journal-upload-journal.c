@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <curl/curl.h>
 #include <stdbool.h>
@@ -410,5 +410,5 @@ int open_journal_for_upload(Uploader *u,
                                                cursor);
         }
 
-        return process_journal_input(u, 1 + !!after_cursor);
+        return process_journal_input(u, !!after_cursor);
 }

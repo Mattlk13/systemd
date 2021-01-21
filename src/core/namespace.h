@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 /***
@@ -8,11 +8,14 @@
 typedef struct NamespaceInfo NamespaceInfo;
 typedef struct BindMount BindMount;
 typedef struct TemporaryFileSystem TemporaryFileSystem;
+typedef struct MountImage MountImage;
 
 #include <stdbool.h>
 
 #include "dissect-image.h"
+#include "fs-util.h"
 #include "macro.h"
+#include "string-util.h"
 
 typedef enum ProtectHome {
         PROTECT_HOME_NO,
@@ -44,25 +47,45 @@ typedef enum ProtectSystem {
         _PROTECT_SYSTEM_INVALID = -1
 } ProtectSystem;
 
+typedef enum ProtectProc {
+        PROTECT_PROC_DEFAULT,
+        PROTECT_PROC_NOACCESS,   /* hidepid=noaccess */
+        PROTECT_PROC_INVISIBLE,  /* hidepid=invisible */
+        PROTECT_PROC_PTRACEABLE, /* hidepid=ptraceable */
+        _PROTECT_PROC_MAX,
+        _PROTECT_PROC_INVALID = -1,
+} ProtectProc;
+
+typedef enum ProcSubset {
+        PROC_SUBSET_ALL,
+        PROC_SUBSET_PID, /* subset=pid */
+        _PROC_SUBSET_MAX,
+        _PROC_SUBSET_INVALID = -1,
+} ProcSubset;
+
 struct NamespaceInfo {
-        bool ignore_protect_paths:1;
-        bool private_dev:1;
-        bool private_mounts:1;
-        bool protect_control_groups:1;
-        bool protect_kernel_tunables:1;
-        bool protect_kernel_modules:1;
-        bool protect_kernel_logs:1;
-        bool mount_apivfs:1;
-        bool protect_hostname:1;
+        bool ignore_protect_paths;
+        bool private_dev;
+        bool private_mounts;
+        bool protect_control_groups;
+        bool protect_kernel_tunables;
+        bool protect_kernel_modules;
+        bool protect_kernel_logs;
+        bool mount_apivfs;
+        bool protect_hostname;
+        ProtectHome protect_home;
+        ProtectSystem protect_system;
+        ProtectProc protect_proc;
+        ProcSubset proc_subset;
 };
 
 struct BindMount {
         char *source;
         char *destination;
-        bool read_only:1;
-        bool nosuid:1;
-        bool recursive:1;
-        bool ignore_enoent:1;
+        bool read_only;
+        bool nosuid;
+        bool recursive;
+        bool ignore_enoent;
 };
 
 struct TemporaryFileSystem {
@@ -70,9 +93,17 @@ struct TemporaryFileSystem {
         char *options;
 };
 
+struct MountImage {
+        char *source;
+        char *destination;
+        LIST_HEAD(MountOptions, mount_options);
+        bool ignore_enoent;
+};
+
 int setup_namespace(
                 const char *root_directory,
                 const char *root_image,
+                const MountOptions *root_image_options,
                 const NamespaceInfo *ns_info,
                 char **read_write_paths,
                 char **read_only_paths,
@@ -82,14 +113,35 @@ int setup_namespace(
                 size_t n_bind_mounts,
                 const TemporaryFileSystem *temporary_filesystems,
                 size_t n_temporary_filesystems,
+                const MountImage *mount_images,
+                size_t n_mount_images,
                 const char *tmp_dir,
                 const char *var_tmp_dir,
+                const char *creds_path,
                 const char *log_namespace,
-                ProtectHome protect_home,
-                ProtectSystem protect_system,
                 unsigned long mount_flags,
+                const void *root_hash,
+                size_t root_hash_size,
+                const char *root_hash_path,
+                const void *root_hash_sig,
+                size_t root_hash_sig_size,
+                const char *root_hash_sig_path,
+                const char *root_verity,
+                const char *propagate_dir,
+                const char *incoming_dir,
+                const char *notify_socket,
                 DissectImageFlags dissected_image_flags,
                 char **error_path);
+
+#define RUN_SYSTEMD_EMPTY "/run/systemd/empty"
+
+static inline void namespace_cleanup_tmpdir(char *p) {
+        PROTECT_ERRNO;
+        if (!streq_ptr(p, RUN_SYSTEMD_EMPTY))
+                (void) rmdir(p);
+        free(p);
+}
+DEFINE_TRIVIAL_CLEANUP_FUNC(char*, namespace_cleanup_tmpdir);
 
 int setup_tmp_dirs(
                 const char *id,
@@ -105,12 +157,21 @@ ProtectHome protect_home_from_string(const char *s) _pure_;
 const char* protect_system_to_string(ProtectSystem p) _const_;
 ProtectSystem protect_system_from_string(const char *s) _pure_;
 
+const char* protect_proc_to_string(ProtectProc i) _const_;
+ProtectProc protect_proc_from_string(const char *s) _pure_;
+
+const char* proc_subset_to_string(ProcSubset i) _const_;
+ProcSubset proc_subset_from_string(const char *s) _pure_;
+
 void bind_mount_free_many(BindMount *b, size_t n);
 int bind_mount_add(BindMount **b, size_t *n, const BindMount *item);
 
 void temporary_filesystem_free_many(TemporaryFileSystem *t, size_t n);
 int temporary_filesystem_add(TemporaryFileSystem **t, size_t *n,
                              const char *path, const char *options);
+
+MountImage* mount_image_free_many(MountImage *m, size_t *n);
+int mount_image_add(MountImage **m, size_t *n, const MountImage *item);
 
 const char* namespace_type_to_string(NamespaceType t) _const_;
 NamespaceType namespace_type_from_string(const char *s) _pure_;

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <getopt.h>
 
@@ -125,7 +125,9 @@ static int run(int argc, char *argv[]) {
         if (r <= 0)
                 return r;
 
-        mac_selinux_init();
+        r = mac_selinux_init();
+        if (r < 0)
+                return r;
 
         return hwdb_main(argc, argv);
 }

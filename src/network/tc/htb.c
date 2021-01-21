@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <linux/pkt_sched.h>
 
@@ -11,10 +11,12 @@
 #include "string-util.h"
 #include "tc-util.h"
 
+#define HTB_DEFAULT_RATE_TO_QUANTUM  10
+#define HTB_DEFAULT_MTU              1600  /* Ethernet packet length */
+
 static int hierarchy_token_bucket_fill_message(Link *link, QDisc *qdisc, sd_netlink_message *req) {
         HierarchyTokenBucket *htb;
         struct tc_htb_glob opt = {
-                .rate2quantum = 10,
                 .version = 3,
         };
         int r;
@@ -25,6 +27,7 @@ static int hierarchy_token_bucket_fill_message(Link *link, QDisc *qdisc, sd_netl
 
         htb = HTB(qdisc);
 
+        opt.rate2quantum = htb->rate_to_quantum;
         opt.defcls = htb->default_class;
 
         r = sd_netlink_message_open_container_union(req, TCA_OPTIONS, "htb");
@@ -66,28 +69,95 @@ int config_parse_hierarchy_token_bucket_default_class(
         r = qdisc_new_static(QDISC_KIND_HTB, network, filename, section_line, &qdisc);
         if (r == -ENOMEM)
                 return log_oom();
-        if (r < 0)
-                return log_syntax(unit, LOG_ERR, filename, line, r,
-                                  "More than one kind of queueing discipline, ignoring assignment: %m");
+        if (r < 0) {
+                log_syntax(unit, LOG_WARNING, filename, line, r,
+                           "More than one kind of queueing discipline, ignoring assignment: %m");
+                return 0;
+        }
 
         htb = HTB(qdisc);
 
         if (isempty(rvalue)) {
                 htb->default_class = 0;
 
-                qdisc = NULL;
+                TAKE_PTR(qdisc);
                 return 0;
         }
 
         r = safe_atou32_full(rvalue, 16, &htb->default_class);
         if (r < 0) {
-                log_syntax(unit, LOG_ERR, filename, line, r,
+                log_syntax(unit, LOG_WARNING, filename, line, r,
                            "Failed to parse '%s=', ignoring assignment: %s",
                            lvalue, rvalue);
                 return 0;
         }
 
-        qdisc = NULL;
+        TAKE_PTR(qdisc);
+
+        return 0;
+}
+
+int config_parse_hierarchy_token_bucket_u32(
+                const char *unit,
+                const char *filename,
+                unsigned line,
+                const char *section,
+                unsigned section_line,
+                const char *lvalue,
+                int ltype,
+                const char *rvalue,
+                void *data,
+                void *userdata) {
+
+        _cleanup_(qdisc_free_or_set_invalidp) QDisc *qdisc = NULL;
+        HierarchyTokenBucket *htb;
+        Network *network = data;
+        int r;
+
+        assert(filename);
+        assert(lvalue);
+        assert(rvalue);
+        assert(data);
+
+        r = qdisc_new_static(QDISC_KIND_HTB, network, filename, section_line, &qdisc);
+        if (r == -ENOMEM)
+                return log_oom();
+        if (r < 0) {
+                log_syntax(unit, LOG_WARNING, filename, line, r,
+                           "More than one kind of queueing discipline, ignoring assignment: %m");
+                return 0;
+        }
+
+        htb = HTB(qdisc);
+
+        if (isempty(rvalue)) {
+                htb->rate_to_quantum = HTB_DEFAULT_RATE_TO_QUANTUM;
+
+                TAKE_PTR(qdisc);
+                return 0;
+        }
+
+        r = safe_atou32(rvalue, &htb->rate_to_quantum);
+        if (r < 0) {
+                log_syntax(unit, LOG_WARNING, filename, line, r,
+                           "Failed to parse '%s=', ignoring assignment: %s",
+                           lvalue, rvalue);
+                return 0;
+        }
+
+        TAKE_PTR(qdisc);
+
+        return 0;
+}
+
+static int hierarchy_token_bucket_init(QDisc *qdisc) {
+        HierarchyTokenBucket *htb;
+
+        assert(qdisc);
+
+        htb = HTB(qdisc);
+
+        htb->rate_to_quantum = HTB_DEFAULT_RATE_TO_QUANTUM;
 
         return 0;
 }
@@ -96,12 +166,13 @@ const QDiscVTable htb_vtable = {
         .object_size = sizeof(HierarchyTokenBucket),
         .tca_kind = "htb",
         .fill_message = hierarchy_token_bucket_fill_message,
+        .init = hierarchy_token_bucket_init,
 };
 
 static int hierarchy_token_bucket_class_fill_message(Link *link, TClass *tclass, sd_netlink_message *req) {
         HierarchyTokenBucketClass *htb;
         struct tc_htb_opt opt = {};
-        uint32_t rtab[256], ctab[256], mtu = 1600; /* Ethernet packet length */
+        uint32_t rtab[256], ctab[256];
         int r;
 
         assert(link);
@@ -110,25 +181,26 @@ static int hierarchy_token_bucket_class_fill_message(Link *link, TClass *tclass,
 
         htb = TCLASS_TO_HTB(tclass);
 
-        if (htb->ceil_rate == 0)
-                htb->ceil_rate = htb->rate;
-
         opt.prio = htb->priority;
+        opt.quantum = htb->quantum;
         opt.rate.rate = (htb->rate >= (1ULL << 32)) ? ~0U : htb->rate;
         opt.ceil.rate = (htb->ceil_rate >= (1ULL << 32)) ? ~0U : htb->ceil_rate;
-        r = tc_transmit_time(htb->rate, mtu, &opt.buffer);
+        opt.rate.overhead = htb->overhead;
+        opt.ceil.overhead = htb->overhead;
+
+        r = tc_transmit_time(htb->rate, htb->buffer, &opt.buffer);
         if (r < 0)
                 return log_link_error_errno(link, r, "Failed to calculate buffer size: %m");
 
-        r = tc_transmit_time(htb->ceil_rate, mtu, &opt.cbuffer);
+        r = tc_transmit_time(htb->ceil_rate, htb->ceil_buffer, &opt.cbuffer);
         if (r < 0)
                 return log_link_error_errno(link, r, "Failed to calculate ceil buffer size: %m");
 
-        r = tc_fill_ratespec_and_table(&opt.rate, rtab, mtu);
+        r = tc_fill_ratespec_and_table(&opt.rate, rtab, htb->mtu);
         if (r < 0)
                 return log_link_error_errno(link, r, "Failed to calculate rate table: %m");
 
-        r = tc_fill_ratespec_and_table(&opt.ceil, ctab, mtu);
+        r = tc_fill_ratespec_and_table(&opt.ceil, ctab, htb->mtu);
         if (r < 0)
                 return log_link_error_errno(link, r, "Failed to calculate ceil rate table: %m");
 
@@ -166,7 +238,7 @@ static int hierarchy_token_bucket_class_fill_message(Link *link, TClass *tclass,
         return 0;
 }
 
-int config_parse_hierarchy_token_bucket_u32(
+int config_parse_hierarchy_token_bucket_class_u32(
                 const char *unit,
                 const char *filename,
                 unsigned line,
@@ -181,6 +253,7 @@ int config_parse_hierarchy_token_bucket_u32(
         _cleanup_(tclass_free_or_set_invalidp) TClass *tclass = NULL;
         HierarchyTokenBucketClass *htb;
         Network *network = data;
+        uint32_t v;
         int r;
 
         assert(filename);
@@ -189,33 +262,121 @@ int config_parse_hierarchy_token_bucket_u32(
         assert(data);
 
         r = tclass_new_static(TCLASS_KIND_HTB, network, filename, section_line, &tclass);
-        if (r < 0)
-                return log_syntax(unit, LOG_ERR, filename, line, r,
-                                  "Failed to create traffic control class, ignoring assignment: %m");
+        if (r == -ENOMEM)
+                return log_oom();
+        if (r < 0) {
+                log_syntax(unit, LOG_WARNING, filename, line, r,
+                           "Failed to create traffic control class, ignoring assignment: %m");
+                return 0;
+        }
 
         htb = TCLASS_TO_HTB(tclass);
 
         if (isempty(rvalue)) {
                 htb->priority = 0;
+                tclass = NULL;
+                return 0;
+        }
+
+        r = safe_atou32(rvalue, &v);
+        if (r < 0) {
+                log_syntax(unit, LOG_WARNING, filename, line, r,
+                           "Failed to parse '%s=', ignoring assignment: %s",
+                           lvalue, rvalue);
+                return 0;
+        }
+
+        htb->priority = v;
+        tclass = NULL;
+
+        return 0;
+}
+
+int config_parse_hierarchy_token_bucket_class_size(
+                const char *unit,
+                const char *filename,
+                unsigned line,
+                const char *section,
+                unsigned section_line,
+                const char *lvalue,
+                int ltype,
+                const char *rvalue,
+                void *data,
+                void *userdata) {
+
+        _cleanup_(tclass_free_or_set_invalidp) TClass *tclass = NULL;
+        HierarchyTokenBucketClass *htb;
+        Network *network = data;
+        uint64_t v;
+        int r;
+
+        assert(filename);
+        assert(lvalue);
+        assert(rvalue);
+        assert(data);
+
+        r = tclass_new_static(TCLASS_KIND_HTB, network, filename, section_line, &tclass);
+        if (r == -ENOMEM)
+                return log_oom();
+        if (r < 0) {
+                log_syntax(unit, LOG_WARNING, filename, line, r,
+                           "Failed to create traffic control class, ignoring assignment: %m");
+                return 0;
+        }
+
+        htb = TCLASS_TO_HTB(tclass);
+
+        if (isempty(rvalue)) {
+                if (streq(lvalue, "QuantumBytes"))
+                        htb->quantum = 0;
+                else if (streq(lvalue, "MTUBytes"))
+                        htb->mtu = HTB_DEFAULT_MTU;
+                else if (streq(lvalue, "OverheadBytes"))
+                        htb->overhead = 0;
+                else if (streq(lvalue, "BufferBytes"))
+                        htb->buffer = 0;
+                else if (streq(lvalue, "CeilBufferBytes"))
+                        htb->ceil_buffer = 0;
+                else
+                        assert_not_reached("Invalid lvalue");
 
                 tclass = NULL;
                 return 0;
         }
 
-        r = safe_atou32(rvalue, &htb->priority);
+        r = parse_size(rvalue, 1024, &v);
         if (r < 0) {
-                log_syntax(unit, LOG_ERR, filename, line, r,
+                log_syntax(unit, LOG_WARNING, filename, line, r,
                            "Failed to parse '%s=', ignoring assignment: %s",
                            lvalue, rvalue);
                 return 0;
         }
+        if ((streq(lvalue, "OverheadBytes") && v > UINT16_MAX) || v > UINT32_MAX) {
+                log_syntax(unit, LOG_WARNING, filename, line, 0,
+                           "Invalid '%s=', ignoring assignment: %s",
+                           lvalue, rvalue);
+                return 0;
+        }
+
+        if (streq(lvalue, "QuantumBytes"))
+                htb->quantum = v;
+        else if (streq(lvalue, "OverheadBytes"))
+                htb->overhead = v;
+        else if (streq(lvalue, "MTUBytes"))
+                htb->mtu = v;
+        else if (streq(lvalue, "BufferBytes"))
+                htb->buffer = v;
+        else if (streq(lvalue, "CeilBufferBytes"))
+                htb->ceil_buffer = v;
+        else
+                assert_not_reached("Invalid lvalue");
 
         tclass = NULL;
 
         return 0;
 }
 
-int config_parse_hierarchy_token_bucket_rate(
+int config_parse_hierarchy_token_bucket_class_rate(
                 const char *unit,
                 const char *filename,
                 unsigned line,
@@ -239,9 +400,13 @@ int config_parse_hierarchy_token_bucket_rate(
         assert(data);
 
         r = tclass_new_static(TCLASS_KIND_HTB, network, filename, section_line, &tclass);
-        if (r < 0)
-                return log_syntax(unit, LOG_ERR, filename, line, r,
-                                  "Failed to create traffic control class, ignoring assignment: %m");
+        if (r == -ENOMEM)
+                return log_oom();
+        if (r < 0) {
+                log_syntax(unit, LOG_WARNING, filename, line, r,
+                           "Failed to create traffic control class, ignoring assignment: %m");
+                return 0;
+        }
 
         htb = TCLASS_TO_HTB(tclass);
         if (streq(lvalue, "Rate"))
@@ -260,7 +425,7 @@ int config_parse_hierarchy_token_bucket_rate(
 
         r = parse_size(rvalue, 1000, v);
         if (r < 0) {
-                log_syntax(unit, LOG_ERR, filename, line, r,
+                log_syntax(unit, LOG_WARNING, filename, line, r,
                            "Failed to parse '%s=', ignoring assignment: %s",
                            lvalue, rvalue);
                 return 0;
@@ -272,8 +437,53 @@ int config_parse_hierarchy_token_bucket_rate(
         return 0;
 }
 
+static int hierarchy_token_bucket_class_init(TClass *tclass) {
+        HierarchyTokenBucketClass *htb;
+
+        assert(tclass);
+
+        htb = TCLASS_TO_HTB(tclass);
+
+        htb->mtu = HTB_DEFAULT_MTU;
+
+        return 0;
+}
+
+static int hierarchy_token_bucket_class_verify(TClass *tclass) {
+        HierarchyTokenBucketClass *htb;
+        uint32_t hz;
+        int r;
+
+        assert(tclass);
+
+        htb = TCLASS_TO_HTB(tclass);
+
+        if (htb->rate == 0)
+                return log_warning_errno(SYNTHETIC_ERRNO(EINVAL),
+                                         "%s: Rate= is mandatory. "
+                                         "Ignoring [HierarchyTokenBucketClass] section from line %u.",
+                                         tclass->section->filename, tclass->section->line);
+
+        /* if CeilRate= setting is missing, use the same as Rate= */
+        if (htb->ceil_rate == 0)
+                htb->ceil_rate = htb->rate;
+
+        r = tc_init(NULL, &hz);
+        if (r < 0)
+                return log_error_errno(r, "Failed to read /proc/net/psched: %m");
+
+        if (htb->buffer == 0)
+                htb->buffer = htb->rate / hz + htb->mtu;
+        if (htb->ceil_buffer == 0)
+                htb->ceil_buffer = htb->ceil_rate / hz + htb->mtu;
+
+        return 0;
+}
+
 const TClassVTable htb_tclass_vtable = {
         .object_size = sizeof(HierarchyTokenBucketClass),
         .tca_kind = "htb",
         .fill_message = hierarchy_token_bucket_class_fill_message,
+        .init = hierarchy_token_bucket_class_init,
+        .verify = hierarchy_token_bucket_class_verify,
 };

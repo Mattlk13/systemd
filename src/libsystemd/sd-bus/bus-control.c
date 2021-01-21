@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #if HAVE_VALGRIND_MEMCHECK_H
 #include <valgrind/memcheck.h>
@@ -13,7 +13,6 @@
 #include "bus-control.h"
 #include "bus-internal.h"
 #include "bus-message.h"
-#include "bus-util.h"
 #include "capability-util.h"
 #include "process-util.h"
 #include "stdio-util.h"
@@ -713,7 +712,7 @@ _public_ int sd_bus_get_name_creds(
                 }
 
                 r = bus_creds_add_more(c, mask, pid, 0);
-                if (r < 0)
+                if (r < 0 && r != -ESRCH) /* Return the error, but ignore ESRCH which just means the process is already gone */
                         return r;
         }
 
@@ -788,7 +787,7 @@ _public_ int sd_bus_get_owner_creds(sd_bus *bus, uint64_t mask, sd_bus_creds **r
         }
 
         r = bus_creds_add_more(c, mask, pid, 0);
-        if (r < 0)
+        if (r < 0 && r != -ESRCH) /* If the process vanished, then don't complain, just return what we got */
                 return r;
 
         *ret = TAKE_PTR(c);

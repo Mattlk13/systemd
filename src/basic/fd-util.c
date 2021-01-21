@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
 #include <fcntl.h>
@@ -21,9 +21,11 @@
 #include "path-util.h"
 #include "process-util.h"
 #include "socket-util.h"
+#include "sort-util.h"
+#include "stat-util.h"
 #include "stdio-util.h"
-#include "util.h"
 #include "tmpfile-util.h"
+#include "util.h"
 
 /* The maximum number of iterations in the loop to close descriptors in the fallback case
  * when /proc/self/fd/ is inaccessible. */
@@ -102,13 +104,16 @@ int fclose_nointr(FILE *f) {
 
         /* Same as close_nointr(), but for fclose() */
 
+        errno = 0; /* Extra safety: if the FILE* object is not encapsulating an fd, it might not set errno
+                    * correctly. Let's hence initialize it to zero first, so that we aren't confused by any
+                    * prior errno here */
         if (fclose(f) == 0)
                 return 0;
 
         if (errno == EINTR)
                 return 0;
 
-        return -errno;
+        return errno_or_else(EIO);
 }
 
 FILE* safe_fclose(FILE *f) {
@@ -144,11 +149,7 @@ int fd_nonblock(int fd, bool nonblock) {
         if (flags < 0)
                 return -errno;
 
-        if (nonblock)
-                nflags = flags | O_NONBLOCK;
-        else
-                nflags = flags & ~O_NONBLOCK;
-
+        nflags = UPDATE_FLAG(flags, O_NONBLOCK, nonblock);
         if (nflags == flags)
                 return 0;
 
@@ -167,11 +168,7 @@ int fd_cloexec(int fd, bool cloexec) {
         if (flags < 0)
                 return -errno;
 
-        if (cloexec)
-                nflags = flags | FD_CLOEXEC;
-        else
-                nflags = flags & ~FD_CLOEXEC;
-
+        nflags = UPDATE_FLAG(flags, FD_CLOEXEC, cloexec);
         if (nflags == flags)
                 return 0;
 
@@ -215,11 +212,96 @@ static int get_max_fd(void) {
 }
 
 int close_all_fds(const int except[], size_t n_except) {
+        static bool have_close_range = true; /* Assume we live in the future */
         _cleanup_closedir_ DIR *d = NULL;
         struct dirent *de;
         int r = 0;
 
         assert(n_except == 0 || except);
+
+        if (have_close_range) {
+                /* In the best case we have close_range() to close all fds between a start and an end fd,
+                 * which we can use on the "inverted" exception array, i.e. all intervals between all
+                 * adjacent pairs from the sorted exception array. This changes loop complexity from O(n)
+                 * where n is number of open fds to O(m⋅log(m)) where m is the number of fds to keep
+                 * open. Given that we assume n ≫ m that's preferable to us. */
+
+                if (n_except == 0) {
+                        /* Close everything. Yay! */
+
+                        if (close_range(3, -1, 0) >= 0)
+                                return 1;
+
+                        if (!ERRNO_IS_NOT_SUPPORTED(errno) && !ERRNO_IS_PRIVILEGE(errno))
+                                return -errno;
+
+                        have_close_range = false;
+                } else {
+                        _cleanup_free_ int *sorted_malloc = NULL;
+                        size_t n_sorted;
+                        int *sorted;
+
+                        assert(n_except < SIZE_MAX);
+                        n_sorted = n_except + 1;
+
+                        if (n_sorted > 64) /* Use heap for large numbers of fds, stack otherwise */
+                                sorted = sorted_malloc = new(int, n_sorted);
+                        else
+                                sorted = newa(int, n_sorted);
+
+                        if (sorted) {
+                                int c = 0;
+
+                                memcpy(sorted, except, n_except * sizeof(int));
+
+                                /* Let's add fd 2 to the list of fds, to simplify the loop below, as this
+                                 * allows us to cover the head of the array the same way as the body */
+                                sorted[n_sorted-1] = 2;
+
+                                typesafe_qsort(sorted, n_sorted, cmp_int);
+
+                                for (size_t i = 0; i < n_sorted-1; i++) {
+                                        int start, end;
+
+                                        start = MAX(sorted[i], 2); /* The first three fds shall always remain open */
+                                        end = MAX(sorted[i+1], 2);
+
+                                        assert(end >= start);
+
+                                        if (end - start <= 1)
+                                                continue;
+
+                                        /* Close everything between the start and end fds (both of which shall stay open) */
+                                        if (close_range(start + 1, end - 1, 0) < 0) {
+                                                if (!ERRNO_IS_NOT_SUPPORTED(errno) && !ERRNO_IS_PRIVILEGE(errno))
+                                                        return -errno;
+
+                                                have_close_range = false;
+                                                break;
+                                        }
+
+                                        c += end - start - 1;
+                                }
+
+                                if (have_close_range) {
+                                        /* The loop succeeded. Let's now close everything beyond the end */
+
+                                        if (sorted[n_sorted-1] >= INT_MAX) /* Dont let the addition below overflow */
+                                                return c;
+
+                                        if (close_range(sorted[n_sorted-1] + 1, -1, 0) >= 0)
+                                                return c + 1;
+
+                                        if (!ERRNO_IS_NOT_SUPPORTED(errno) && !ERRNO_IS_PRIVILEGE(errno))
+                                                return -errno;
+
+                                        have_close_range = false;
+                                }
+                        }
+                }
+
+                /* Fallback on OOM or if close_range() is not supported */
+        }
 
         d = opendir("/proc/self/fd");
         if (!d) {
@@ -389,11 +471,9 @@ int fd_get_path(int fd, char **ret) {
                 /* ENOENT can mean two things: that the fd does not exist or that /proc is not mounted. Let's make
                  * things debuggable and distinguish the two. */
 
-                if (access("/proc/self/fd/", F_OK) < 0)
-                        /* /proc is not available or not set up properly, we're most likely in some chroot
-                         * environment. */
-                        return errno == ENOENT ? -EOPNOTSUPP : -errno;
-
+                if (proc_mounted() == 0)
+                        return -ENOSYS;  /* /proc is not available or not set up properly, we're most likely in some chroot
+                                          * environment. */
                 return -EBADF; /* The directory exists, hence it's the fd that doesn't. */
         }
 
@@ -735,8 +815,7 @@ int fd_duplicate_data_fd(int fd) {
                 if (f != 0)
                         return -errno;
 
-                safe_close(copy_fd);
-                copy_fd = TAKE_FD(tmp_fd);
+                CLOSE_AND_REPLACE(copy_fd, tmp_fd);
 
                 remains = mfree(remains);
                 remains_size = 0;
@@ -869,8 +948,7 @@ int rearrange_stdio(int original_input_fd, int original_output_fd, int original_
                                 goto finish;
                         }
 
-                        safe_close(null_fd);
-                        null_fd = copy;
+                        CLOSE_AND_REPLACE(null_fd, copy);
                 }
         }
 
@@ -947,8 +1025,15 @@ int fd_reopen(int fd, int flags) {
 
         xsprintf(procfs_path, "/proc/self/fd/%i", fd);
         new_fd = open(procfs_path, flags);
-        if (new_fd < 0)
-                return -errno;
+        if (new_fd < 0) {
+                if (errno != ENOENT)
+                        return -errno;
+
+                if (proc_mounted() == 0)
+                        return -ENOSYS; /* if we have no /proc/, the concept is not implementable */
+
+                return -ENOENT;
+        }
 
         return new_fd;
 }
@@ -973,6 +1058,6 @@ int read_nr_open(void) {
                         return v;
         }
 
-        /* If we fail, fallback to the hard-coded kernel limit of 1024 * 1024. */
+        /* If we fail, fall back to the hard-coded kernel limit of 1024 * 1024. */
         return 1024 * 1024;
 }

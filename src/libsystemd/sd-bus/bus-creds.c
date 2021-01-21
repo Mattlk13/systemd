@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <linux/capability.h>
 #include <stdlib.h>
@@ -8,9 +8,9 @@
 #include "bus-creds.h"
 #include "bus-label.h"
 #include "bus-message.h"
-#include "bus-util.h"
 #include "capability-util.h"
 #include "cgroup-util.h"
+#include "errno-util.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "format-util.h"
@@ -650,16 +650,15 @@ _public_ int sd_bus_creds_get_description(sd_bus_creds *c, const char **ret) {
 }
 
 static int has_cap(sd_bus_creds *c, size_t offset, int capability) {
-        unsigned long lc;
         size_t sz;
 
         assert(c);
         assert(capability >= 0);
         assert(c->capability);
 
-        lc = cap_last_cap();
+        unsigned lc = cap_last_cap();
 
-        if ((unsigned long) capability > lc)
+        if ((unsigned) capability > lc)
                 return 0;
 
         /* If the last cap is 63, then there are 64 caps defined, and we need 2 entries á 32bit hence. *
@@ -802,7 +801,7 @@ int bus_creds_add_more(sd_bus_creds *c, uint64_t mask, pid_t pid, pid_t tid) {
                 if (!f) {
                         if (errno == ENOENT)
                                 return -ESRCH;
-                        else if (!IN_SET(errno, EPERM, EACCES))
+                        else if (!ERRNO_IS_PRIVILEGE(errno))
                                 return -errno;
                 } else {
 
@@ -974,7 +973,7 @@ int bus_creds_add_more(sd_bus_creds *c, uint64_t mask, pid_t pid, pid_t tid) {
         if (missing & SD_BUS_CREDS_COMM) {
                 r = get_process_comm(pid, &c->comm);
                 if (r < 0) {
-                        if (!IN_SET(r, -EPERM, -EACCES))
+                        if (!ERRNO_IS_PRIVILEGE(r))
                                 return r;
                 } else
                         c->mask |= SD_BUS_CREDS_COMM;
@@ -993,7 +992,7 @@ int bus_creds_add_more(sd_bus_creds *c, uint64_t mask, pid_t pid, pid_t tid) {
                         c->exe = NULL;
                         c->mask |= SD_BUS_CREDS_EXE;
                 } else if (r < 0) {
-                        if (!IN_SET(r, -EPERM, -EACCES))
+                        if (!ERRNO_IS_PRIVILEGE(r))
                                 return r;
                 } else
                         c->mask |= SD_BUS_CREDS_EXE;
@@ -1007,7 +1006,7 @@ int bus_creds_add_more(sd_bus_creds *c, uint64_t mask, pid_t pid, pid_t tid) {
                 if (r == -ENOENT)
                         return -ESRCH;
                 if (r < 0) {
-                        if (!IN_SET(r, -EPERM, -EACCES))
+                        if (!ERRNO_IS_PRIVILEGE(r))
                                 return r;
                 } else {
                         if (c->cmdline_size == 0)
@@ -1027,7 +1026,7 @@ int bus_creds_add_more(sd_bus_creds *c, uint64_t mask, pid_t pid, pid_t tid) {
                 if (r == -ENOENT)
                         return -ESRCH;
                 if (r < 0) {
-                        if (!IN_SET(r, -EPERM, -EACCES))
+                        if (!ERRNO_IS_PRIVILEGE(r))
                                 return r;
                 } else
                         c->mask |= SD_BUS_CREDS_TID_COMM;
@@ -1038,7 +1037,7 @@ int bus_creds_add_more(sd_bus_creds *c, uint64_t mask, pid_t pid, pid_t tid) {
                 if (!c->cgroup) {
                         r = cg_pid_get_path(NULL, pid, &c->cgroup);
                         if (r < 0) {
-                                if (!IN_SET(r, -EPERM, -EACCES))
+                                if (!ERRNO_IS_PRIVILEGE(r))
                                         return r;
                         }
                 }

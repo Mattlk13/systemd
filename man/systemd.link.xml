@@ -1,7 +1,7 @@
 <?xml version='1.0'?>
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
   "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
-<!-- SPDX-License-Identifier: LGPL-2.1+ -->
+<!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="systemd.link">
   <refentryinfo>
@@ -27,9 +27,9 @@
     <title>Description</title>
 
     <para>A plain ini-style text file that encodes configuration for matching network devices, used by
-    <citerefentry><refentrytitle>systemd-udev</refentrytitle><manvolnum>8</manvolnum></citerefentry> and in
+    <citerefentry><refentrytitle>systemd-udevd</refentrytitle><manvolnum>8</manvolnum></citerefentry> and in
     particular its <command>net_setup_link</command> builtin. See
-    <citerefentry><refentrytitle>systemd.syntax</refentrytitle><manvolnum>5</manvolnum></citerefentry> for a
+    <citerefentry><refentrytitle>systemd.syntax</refentrytitle><manvolnum>7</manvolnum></citerefentry> for a
     general description of the syntax.</para>
 
     <para>The link files are read from the files located in the system
@@ -42,9 +42,9 @@
     ignored. All link files are collectively sorted and processed in
     lexical order, regardless of the directories in which they live.
     However, files with identical filenames replace each other. Files
-    in <filename>/etc</filename> have the highest priority, files in
-    <filename>/run</filename> take precedence over files with the same
-    name in <filename>/usr/lib</filename>. This can be used to
+    in <filename>/etc/</filename> have the highest priority, files in
+    <filename>/run/</filename> take precedence over files with the same
+    name in <filename>/usr/lib/</filename>. This can be used to
     override a system-supplied link file with a local file if needed.
     As a special case, an empty file (file size 0) or symlink with the
     same name pointing to <filename>/dev/null</filename> disables the
@@ -64,8 +64,8 @@
     <title>[Match] Section Options</title>
 
     <para>A link file is said to match a device if all matches specified by the
-    <literal>[Match]</literal> section are satisfied. When a link file does not contain valid settings
-    in <literal>[Match]</literal> section, then the file will match all devices and
+    [Match] section are satisfied. When a link file does not contain valid settings
+    in [Match] section, then the file will match all devices and
     <command>systemd-udevd</command> warns about that. Hint: to avoid the warning and to make it clear
     that all interfaces shall be matched, add the following:
     <programlisting>OriginalName=*</programlisting>
@@ -273,18 +273,21 @@
             <varlistentry>
               <term><option>none</option></term>
               <listitem>
-                <para>Keeps the MAC address assigned by the kernel.</para>
+                <para>Keeps the MAC address assigned by the kernel. Or use the MAC address specified in
+                <varname>MACAddress=</varname>.</para>
               </listitem>
             </varlistentry>
           </variablelist>
+
+          <para>An empty string assignment is equivalent to setting <literal>none</literal>.</para>
         </listitem>
       </varlistentry>
       <varlistentry>
         <term><varname>MACAddress=</varname></term>
         <listitem>
-          <para>The MAC address to use, if no
-          <varname>MACAddressPolicy=</varname>
-          is specified.</para>
+          <para>The interface MAC address to use. For this setting to take effect,
+          <varname>MACAddressPolicy=</varname> must either be unset, empty, or <literal>none</literal>.
+          </para>
         </listitem>
       </varlistentry>
       <varlistentry>
@@ -404,6 +407,13 @@
           If the empty string is assigned to this option, the list is reset, and all prior assignments
           have no effect. If the kernel does not support the alternative names, then this setting will
           be ignored.</para>
+        </listitem>
+      </varlistentry>
+      <varlistentry>
+        <term><varname>TxQueueLength=</varname></term>
+        <listitem>
+          <para>Specifies the transmit queue length of the device in number of packets. An unsigned integer
+          in the range 0..4294967294. When unset, the kernel's default will be used.</para>
         </listitem>
       </varlistentry>
       <varlistentry>
@@ -691,13 +701,29 @@
       <varlistentry>
         <term><varname>RxBufferSize=</varname></term>
         <listitem>
-          <para>Takes a integer. Specifies the NIC receive ring buffer size. When unset, the kernel's default will be used.</para>
+          <para>Takes an integer. Specifies the maximum number of pending packets in the NIC receive buffer.
+          When unset, the kernel's default will be used.</para>
+        </listitem>
+      </varlistentry>
+      <varlistentry>
+        <term><varname>RxMiniBufferSize=</varname></term>
+        <listitem>
+          <para>Takes an integer. Specifies the maximum number of pending packets in the NIC mini receive buffer.
+          When unset, the kernel's default will be used.</para>
+        </listitem>
+      </varlistentry>
+      <varlistentry>
+        <term><varname>RxJumboBufferSize=</varname></term>
+        <listitem>
+          <para>Takes an integer. Specifies the maximum number of pending packets in the NIC jumbo receive buffer.
+          When unset, the kernel's default will be used.</para>
         </listitem>
       </varlistentry>
       <varlistentry>
         <term><varname>TxBufferSize=</varname></term>
         <listitem>
-          <para>Takes a integer. Specifies the NIC transmit ring buffer size. When unset, the kernel's default will be used.</para>
+          <para>Takes an integer. Specifies the maximum number of pending packets in the NIC transmit buffer.
+          When unset, the kernel's default will be used.</para>
         </listitem>
       </varlistentry>
       <varlistentry>
@@ -722,6 +748,22 @@
           <para>Takes a boolean. When set, the auto negotiation enables the interface to exchange state
           advertisements with the connected peer so that the two devices can agree on the ethernet
           PAUSE configuration. When unset, the kernel's default will be used.</para>
+        </listitem>
+      </varlistentry>
+      <varlistentry>
+        <term><varname>GenericSegmentOffloadMaxBytes=</varname></term>
+        <listitem>
+          <para>Specifies the maximum size of a Generic Segment Offload (GSO) packet the
+          device should accept. The usual suffixes K, M, G, are supported and are
+          understood to the base of 1024. An unsigned integer in the range 1—65536.
+          Defaults to unset.</para>
+        </listitem>
+      </varlistentry>
+      <varlistentry>
+        <term><varname>GenericSegmentOffloadMaxSegments=</varname></term>
+        <listitem>
+          <para>Specifies the maximum number of a Generic Segment Offload (GSO) segments the device should accept.
+          An unsigned integer in the range 1—65535. Defaults to unset.</para>
         </listitem>
       </varlistentry>
 

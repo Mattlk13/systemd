@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
 #include <getopt.h>
@@ -119,10 +119,9 @@ static int sysctl_write_or_warn(const char *key, const char *value, bool ignore_
 
 static int apply_all(OrderedHashmap *sysctl_options) {
         Option *option;
-        Iterator i;
         int r = 0;
 
-        ORDERED_HASHMAP_FOREACH(option, sysctl_options, i) {
+        ORDERED_HASHMAP_FOREACH(option, sysctl_options) {
                 int k;
 
                 /* Ignore "negative match" options, they are there only to exclude stuff from globs. */
@@ -138,9 +137,9 @@ static int apply_all(OrderedHashmap *sysctl_options) {
                         if (!pattern)
                                 return log_oom();
 
-                        k = glob_extend(&paths, pattern);
+                        k = glob_extend(&paths, pattern, GLOB_NOCHECK);
                         if (k < 0) {
-                                if (option->ignore_failure || ERRNO_IS_PRIVILEGE(r))
+                                if (option->ignore_failure || ERRNO_IS_PRIVILEGE(k))
                                         log_debug_errno(k, "Failed to resolve glob '%s', ignoring: %m",
                                                         option->key);
                                 else {

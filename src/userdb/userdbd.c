@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -11,7 +11,7 @@
 
 /* This service offers two Varlink services, both implementing io.systemd.UserDatabase:
  *
- *         → io.systemd.NameServiceSwitch: this is a compatibility interface for glibc NSS: it response to
+ *         → io.systemd.NameServiceSwitch: this is a compatibility interface for glibc NSS: it responds to
  *           name lookups by checking the classic NSS interfaces and responding that.
  *
  *         → io.systemd.Multiplexer: this multiplexes lookup requests to all Varlink services that have a
@@ -20,8 +20,8 @@
  */
 
 static int run(int argc, char *argv[]) {
-        _cleanup_(notify_on_cleanup) const char *notify_stop = NULL;
         _cleanup_(manager_freep) Manager *m = NULL;
+        _cleanup_(notify_on_cleanup) const char *notify_stop = NULL;
         int r;
 
         log_setup_service();

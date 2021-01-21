@@ -4,8 +4,13 @@ LooseBinding=
 ReorderHeader=
 Id=
 GVRP=
+Protocol=
+EgressQOSMaps=
+IngressQOSMaps=
 [MACVLAN]
 Mode=
+SourceMACAddress=
+BroadcastMulticastQueueLength=
 [WireGuard]
 ListenPort=
 PrivateKey=
@@ -14,6 +19,7 @@ FwMark=
 FirewallMark=
 [MACVTAP]
 Mode=
+SourceMACAddress=
 [Match]
 Architecture=
 Host=
@@ -45,6 +51,7 @@ AgeingTimeSec=
 Priority=
 GroupForwardMask=
 VLANFiltering=
+VLANProtocol=
 MulticastIGMPVersion=
 [VRF]
 TableId=
@@ -113,6 +120,7 @@ PortRange=
 UDPChecksum=
 UDP6ZeroCheckSumTx=
 IPDoNotFragment=
+Independent=
 [VXCAN]
 Peer=
 [Bond]
@@ -212,3 +220,6 @@ Activate=
 [Xfrm]
 Independent=
 InterfaceId=
+[BareUDP]
+DestinationPort=
+EtherType=

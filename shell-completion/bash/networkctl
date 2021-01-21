@@ -1,5 +1,5 @@
 # networkctl(1) completion                               -*- shell-script -*-
-# SPDX-License-Identifier: LGPL-2.1+
+# SPDX-License-Identifier: LGPL-2.1-or-later
 #
 # This file is part of systemd.
 #
@@ -37,8 +37,8 @@ _networkctl() {
     )
 
     local -A VERBS=(
-        [STANDALONE]='label'
-        [LINKS]='status list lldp delete renew'
+        [STANDALONE]='label reload'
+        [LINKS]='status list lldp delete renew up down forcerenew reconfigure'
     )
 
     _init_completion || return

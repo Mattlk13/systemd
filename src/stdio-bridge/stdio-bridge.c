@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
 #include <getopt.h>
@@ -23,6 +23,7 @@
 
 static const char *arg_bus_path = DEFAULT_BUS_PATH;
 static BusTransport arg_transport = BUS_TRANSPORT_LOCAL;
+static bool arg_user = false;
 
 static int help(void) {
 
@@ -30,8 +31,10 @@ static int help(void) {
                "STDIO or socket-activatable proxy to a given DBus endpoint.\n\n"
                "  -h --help              Show this help\n"
                "     --version           Show package version\n"
-               "  -p --bus-path=PATH     Path to the kernel bus (default: %s)\n"
-               "  -M --machine=MACHINE   Name of machine to connect to\n",
+               "  -p --bus-path=PATH     Path to the bus address (default: %s)\n"
+               "     --system            Connect to system bus\n"
+               "     --user              Connect to user bus\n"
+               "  -M --machine=CONTAINER Name of local container to connect to\n",
                program_invocation_short_name, DEFAULT_BUS_PATH);
 
         return 0;
@@ -42,12 +45,16 @@ static int parse_argv(int argc, char *argv[]) {
         enum {
                 ARG_VERSION = 0x100,
                 ARG_MACHINE,
+                ARG_USER,
+                ARG_SYSTEM,
         };
 
         static const struct option options[] = {
                 { "help",            no_argument,       NULL, 'h'         },
                 { "version",         no_argument,       NULL, ARG_VERSION },
                 { "bus-path",        required_argument, NULL, 'p'         },
+                { "user",            no_argument,       NULL, ARG_USER    },
+                { "system",          no_argument,       NULL, ARG_SYSTEM  },
                 { "machine",         required_argument, NULL, 'M'         },
                 {},
         };
@@ -66,6 +73,14 @@ static int parse_argv(int argc, char *argv[]) {
 
                 case ARG_VERSION:
                         return version();
+
+                case ARG_USER:
+                        arg_user = true;
+                        break;
+
+                case ARG_SYSTEM:
+                        arg_user = false;
+                        break;
 
                 case 'p':
                         arg_bus_path = optarg;
@@ -121,7 +136,7 @@ static int run(int argc, char *argv[]) {
                 return log_error_errno(r, "Failed to allocate bus: %m");
 
         if (arg_transport == BUS_TRANSPORT_MACHINE)
-                r = bus_set_address_system_machine(a, arg_bus_path);
+                r = bus_set_address_machine(a, arg_user, arg_bus_path);
         else
                 r = sd_bus_set_address(a, arg_bus_path);
         if (r < 0)
@@ -238,17 +253,19 @@ static int run(int argc, char *argv[]) {
                         ts = timespec_store(&_ts, t);
                 }
 
-                {
-                        struct pollfd p[3] = {
-                                {.fd = fd,            .events = events_a           },
-                                {.fd = STDIN_FILENO,  .events = events_b & POLLIN  },
-                                {.fd = STDOUT_FILENO, .events = events_b & POLLOUT },
-                        };
+                struct pollfd p[3] = {
+                        { .fd = fd,            .events = events_a           },
+                        { .fd = STDIN_FILENO,  .events = events_b & POLLIN  },
+                        { .fd = STDOUT_FILENO, .events = events_b & POLLOUT },
+                };
 
-                        r = ppoll(p, ELEMENTSOF(p), ts, NULL);
-                }
+                r = ppoll(p, ELEMENTSOF(p), ts, NULL);
                 if (r < 0)
                         return log_error_errno(errno, "ppoll() failed: %m");
+                if (p[0].revents & POLLNVAL ||
+                    p[1].revents & POLLNVAL ||
+                    p[2].revents & POLLNVAL)
+                        return log_error_errno(SYNTHETIC_ERRNO(EBADF), "Invalid file descriptor to poll on?");
         }
 
         return 0;

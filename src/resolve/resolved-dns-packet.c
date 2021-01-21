@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #if HAVE_GCRYPT
 #include <gcrypt.h>
@@ -75,12 +75,16 @@ int dns_packet_new(
         if (!p)
                 return -ENOMEM;
 
-        p->size = p->rindex = DNS_PACKET_HEADER_SIZE;
-        p->allocated = a;
-        p->max_size = max_size;
-        p->protocol = protocol;
-        p->opt_start = p->opt_size = (size_t) -1;
-        p->n_ref = 1;
+        *p = (DnsPacket) {
+                .n_ref = 1,
+                .protocol = protocol,
+                .size = DNS_PACKET_HEADER_SIZE,
+                .rindex = DNS_PACKET_HEADER_SIZE,
+                .allocated = a,
+                .max_size = max_size,
+                .opt_start = (size_t) -1,
+                .opt_size = (size_t) -1,
+        };
 
         *ret = p;
 
@@ -354,7 +358,6 @@ static int dns_packet_extend(DnsPacket *p, size_t add, void **ret, size_t *start
 }
 
 void dns_packet_truncate(DnsPacket *p, size_t sz) {
-        Iterator i;
         char *s;
         void *n;
 
@@ -363,7 +366,7 @@ void dns_packet_truncate(DnsPacket *p, size_t sz) {
         if (p->size <= sz)
                 return;
 
-        HASHMAP_FOREACH_KEY(n, s, p->names, i) {
+        HASHMAP_FOREACH_KEY(n, s, p->names) {
 
                 if (PTR_TO_SIZE(n) < sz)
                         continue;
@@ -554,15 +557,11 @@ int dns_packet_append_name(
                                 goto fail;
                         }
 
-                        r = hashmap_ensure_allocated(&p->names, &dns_name_hash_ops);
+                        r = hashmap_ensure_put(&p->names, &dns_name_hash_ops, s, SIZE_TO_PTR(n));
                         if (r < 0)
                                 goto fail;
 
-                        r = hashmap_put(p->names, s, SIZE_TO_PTR(n));
-                        if (r < 0)
-                                goto fail;
-
-                        s = NULL;
+                        TAKE_PTR(s);
                 }
         }
 
@@ -646,7 +645,6 @@ fail:
 }
 
 static int dns_packet_append_types(DnsPacket *p, Bitmap *types, size_t *start) {
-        Iterator i;
         uint8_t window = 0;
         uint8_t entry = 0;
         uint8_t bitmaps[32] = {};
@@ -658,7 +656,7 @@ static int dns_packet_append_types(DnsPacket *p, Bitmap *types, size_t *start) {
 
         saved_size = p->size;
 
-        BITMAP_FOREACH(n, types, i) {
+        BITMAP_FOREACH(n, types) {
                 assert(n <= 0xffff);
 
                 if ((n >> 8) != window && bitmaps[entry / 8] != 0) {
@@ -691,7 +689,14 @@ fail:
 }
 
 /* Append the OPT pseudo-RR described in RFC6891 */
-int dns_packet_append_opt(DnsPacket *p, uint16_t max_udp_size, bool edns0_do, int rcode, size_t *start) {
+int dns_packet_append_opt(
+                DnsPacket *p,
+                uint16_t max_udp_size,
+                bool edns0_do,
+                bool include_rfc6975,
+                int rcode,
+                size_t *start) {
+
         size_t saved_size;
         int r;
 
@@ -734,8 +739,10 @@ int dns_packet_append_opt(DnsPacket *p, uint16_t max_udp_size, bool edns0_do, in
                 goto fail;
 
         /* RDLENGTH */
-        if (edns0_do && !DNS_PACKET_QR(p)) {
-                /* If DO is on and this is not a reply, also append RFC6975 Algorithm data */
+        if (edns0_do && include_rfc6975) {
+                /* If DO is on and this is requested, also append RFC6975 Algorithm data. This is supposed to
+                 * be done on queries, not on replies, hencer callers should turn this off when finishing off
+                 * replies. */
 
                 static const uint8_t rfc6975[] = {
 
@@ -839,7 +846,7 @@ int dns_packet_append_rr(DnsPacket *p, const DnsResourceRecord *rr, const DnsAns
 
         rds = p->size - saved_size;
 
-        switch (rr->unparseable ? _DNS_TYPE_INVALID : rr->key->type) {
+        switch (rr->unparsable ? _DNS_TYPE_INVALID : rr->key->type) {
 
         case DNS_TYPE_SRV:
                 r = dns_packet_append_uint16(p, rr->srv.priority, NULL);
@@ -856,14 +863,14 @@ int dns_packet_append_rr(DnsPacket *p, const DnsResourceRecord *rr, const DnsAns
 
                 /* RFC 2782 states "Unless and until permitted by future standards
                  * action, name compression is not to be used for this field." */
-                r = dns_packet_append_name(p, rr->srv.name, false, false, NULL);
+                r = dns_packet_append_name(p, rr->srv.name, false, true, NULL);
                 break;
 
         case DNS_TYPE_PTR:
         case DNS_TYPE_NS:
         case DNS_TYPE_CNAME:
         case DNS_TYPE_DNAME:
-                r = dns_packet_append_name(p, rr->ptr.name, true, false, NULL);
+                r = dns_packet_append_name(p, rr->ptr.name, true, true, NULL);
                 break;
 
         case DNS_TYPE_HINFO:
@@ -906,11 +913,11 @@ int dns_packet_append_rr(DnsPacket *p, const DnsResourceRecord *rr, const DnsAns
                 break;
 
         case DNS_TYPE_SOA:
-                r = dns_packet_append_name(p, rr->soa.mname, true, false, NULL);
+                r = dns_packet_append_name(p, rr->soa.mname, true, true, NULL);
                 if (r < 0)
                         goto fail;
 
-                r = dns_packet_append_name(p, rr->soa.rname, true, false, NULL);
+                r = dns_packet_append_name(p, rr->soa.rname, true, true, NULL);
                 if (r < 0)
                         goto fail;
 
@@ -938,7 +945,7 @@ int dns_packet_append_rr(DnsPacket *p, const DnsResourceRecord *rr, const DnsAns
                 if (r < 0)
                         goto fail;
 
-                r = dns_packet_append_name(p, rr->mx.exchange, true, false, NULL);
+                r = dns_packet_append_name(p, rr->mx.exchange, true, true, NULL);
                 break;
 
         case DNS_TYPE_LOC:
@@ -1125,7 +1132,7 @@ int dns_packet_append_rr(DnsPacket *p, const DnsResourceRecord *rr, const DnsAns
 
         case DNS_TYPE_OPT:
         case DNS_TYPE_OPENPGPKEY:
-        case _DNS_TYPE_INVALID: /* unparseable */
+        case _DNS_TYPE_INVALID: /* unparsable */
         default:
 
                 r = dns_packet_append_blob(p, rr->generic.data, rr->generic.data_size, NULL);
@@ -1428,7 +1435,7 @@ int dns_packet_read_name(
 
                         n += r;
                         continue;
-                } else if (allow_compression && (c & 0xc0) == 0xc0) {
+                } else if (allow_compression && FLAGS_SET(c, 0xc0)) {
                         uint16_t ptr;
 
                         /* Pointer */
@@ -1815,8 +1822,8 @@ int dns_packet_read_rr(DnsPacket *p, DnsResourceRecord **ret, bool *ret_cache_fl
                         break;
                 } else {
                         dns_packet_rewind(p, pos);
-                        rr->unparseable = true;
-                        goto unparseable;
+                        rr->unparsable = true;
+                        goto unparsable;
                 }
         }
 
@@ -2059,7 +2066,7 @@ int dns_packet_read_rr(DnsPacket *p, DnsResourceRecord **ret, bool *ret_cache_fl
         case DNS_TYPE_OPT: /* we only care about the header of OPT for now. */
         case DNS_TYPE_OPENPGPKEY:
         default:
-        unparseable:
+        unparsable:
                 r = dns_packet_read_memdup(p, rdlength, &rr->generic.data, &rr->generic.data_size, NULL);
 
                 break;
@@ -2142,7 +2149,7 @@ static int dns_packet_extract_question(DnsPacket *p, DnsQuestion **ret_question)
                         return log_oom();
 
                 r = set_reserve(keys, n * 2); /* Higher multipliers give slightly higher efficiency through
-                                               * hash collisions, but the gains quickly drop of after 2. */
+                                               * hash collisions, but the gains quickly drop off after 2. */
                 if (r < 0)
                         return r;
 
@@ -2243,12 +2250,11 @@ static int dns_packet_extract_answer(DnsPacket *p, DnsAnswer **ret_answer) {
                         if (DNS_PACKET_QR(p)) {
                                 /* Additional checks for responses */
 
-                                if (!DNS_RESOURCE_RECORD_OPT_VERSION_SUPPORTED(rr)) {
+                                if (!DNS_RESOURCE_RECORD_OPT_VERSION_SUPPORTED(rr))
                                         /* If this is a reply and we don't know the EDNS version
                                          * then something is weird... */
-                                        log_debug("EDNS version newer that our request, bad server.");
-                                        return -EBADMSG;
-                                }
+                                        return log_debug_errno(SYNTHETIC_ERRNO(EBADMSG),
+                                                               "EDNS version newer that our request, bad server.");
 
                                 if (has_rfc6975) {
                                         /* If the OPT RR contains RFC6975 algorithm data, then this

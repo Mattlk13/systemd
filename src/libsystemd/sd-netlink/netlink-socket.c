@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <netinet/in.h>
 #include <stdbool.h>
@@ -238,34 +238,55 @@ int socket_write_message(sd_netlink *nl, sd_netlink_message *m) {
         return k;
 }
 
-static int socket_recv_message(int fd, struct iovec *iov, uint32_t *_group, bool peek) {
+int socket_writev_message(sd_netlink *nl, sd_netlink_message **m, size_t msgcount) {
+        _cleanup_free_ struct iovec *iovs = NULL;
+        ssize_t k;
+        size_t i;
+
+        assert(nl);
+        assert(m);
+        assert(msgcount > 0);
+
+        iovs = new0(struct iovec, msgcount);
+        if (!iovs)
+                return -ENOMEM;
+
+        for (i = 0; i < msgcount; i++) {
+                assert(m[i]->hdr != NULL);
+                assert(m[i]->hdr->nlmsg_len > 0);
+                iovs[i] = IOVEC_MAKE(m[i]->hdr, m[i]->hdr->nlmsg_len);
+        }
+
+        k = writev(nl->fd, iovs, msgcount);
+        if (k < 0)
+                return -errno;
+
+        return k;
+}
+
+static int socket_recv_message(int fd, struct iovec *iov, uint32_t *ret_mcast_group, bool peek) {
         union sockaddr_union sender;
-        uint8_t cmsg_buffer[CMSG_SPACE(sizeof(struct nl_pktinfo))];
+        CMSG_BUFFER_TYPE(CMSG_SPACE(sizeof(struct nl_pktinfo))) control;
         struct msghdr msg = {
                 .msg_iov = iov,
                 .msg_iovlen = 1,
                 .msg_name = &sender,
                 .msg_namelen = sizeof(sender),
-                .msg_control = cmsg_buffer,
-                .msg_controllen = sizeof(cmsg_buffer),
+                .msg_control = &control,
+                .msg_controllen = sizeof(control),
         };
-        struct cmsghdr *cmsg;
-        uint32_t group = 0;
         ssize_t n;
 
         assert(fd >= 0);
         assert(iov);
 
-        n = recvmsg(fd, &msg, MSG_TRUNC | (peek ? MSG_PEEK : 0));
-        if (n < 0) {
-                /* no data */
-                if (errno == ENOBUFS)
-                        log_debug("rtnl: kernel receive buffer overrun");
-                else if (errno == EAGAIN)
-                        log_debug("rtnl: no data in socket");
-
-                return IN_SET(errno, EAGAIN, EINTR) ? 0 : -errno;
-        }
+        n = recvmsg_safe(fd, &msg, MSG_TRUNC | (peek ? MSG_PEEK : 0));
+        if (n == -ENOBUFS)
+                return log_debug_errno(n, "rtnl: kernel receive buffer overrun");
+        if (IN_SET(n, -EAGAIN, -EINTR))
+                return 0;
+        if (n < 0)
+                return (int) n;
 
         if (sender.nl.nl_pid != 0) {
                 /* not from the kernel, ignore */
@@ -273,27 +294,23 @@ static int socket_recv_message(int fd, struct iovec *iov, uint32_t *_group, bool
 
                 if (peek) {
                         /* drop the message */
-                        n = recvmsg(fd, &msg, 0);
+                        n = recvmsg_safe(fd, &msg, 0);
                         if (n < 0)
-                                return IN_SET(errno, EAGAIN, EINTR) ? 0 : -errno;
+                                return (int) n;
                 }
 
                 return 0;
         }
 
-        CMSG_FOREACH(cmsg, &msg) {
-                if (cmsg->cmsg_level == SOL_NETLINK &&
-                    cmsg->cmsg_type == NETLINK_PKTINFO &&
-                    cmsg->cmsg_len == CMSG_LEN(sizeof(struct nl_pktinfo))) {
-                        struct nl_pktinfo *pktinfo = (void *)CMSG_DATA(cmsg);
+        if (ret_mcast_group) {
+                struct nl_pktinfo *pi;
 
-                        /* multi-cast group */
-                        group = pktinfo->group;
-                }
+                pi = CMSG_FIND_DATA(&msg, SOL_NETLINK, NETLINK_PKTINFO, struct nl_pktinfo);
+                if (pi)
+                        *ret_mcast_group = pi->group;
+                else
+                        *ret_mcast_group = 0;
         }
-
-        if (_group)
-                *_group = group;
 
         return (int) n;
 }

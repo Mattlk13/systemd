@@ -1,9 +1,11 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <net/if.h>
 #include <netinet/in.h>
+#include <unistd.h>
 
 #include "alloc-util.h"
+#include "bareudp.h"
 #include "bond.h"
 #include "bridge.h"
 #include "conf-files.h"
@@ -21,9 +23,9 @@
 #include "netdev.h"
 #include "netdevsim.h"
 #include "netlink-util.h"
-#include "network-internal.h"
 #include "networkd-manager.h"
 #include "nlmon.h"
+#include "path-lookup.h"
 #include "siphash24.h"
 #include "stat-util.h"
 #include "string-table.h"
@@ -75,9 +77,11 @@ const NetDevVTable * const netdev_vtable[_NETDEV_KIND_MAX] = {
         [NETDEV_KIND_NLMON] = &nlmon_vtable,
         [NETDEV_KIND_XFRM] = &xfrm_vtable,
         [NETDEV_KIND_IFB] = &ifb_vtable,
+        [NETDEV_KIND_BAREUDP] = &bare_udp_vtable,
 };
 
 static const char* const netdev_kind_table[_NETDEV_KIND_MAX] = {
+        [NETDEV_KIND_BAREUDP] = "bareudp",
         [NETDEV_KIND_BRIDGE] = "bridge",
         [NETDEV_KIND_BOND] = "bond",
         [NETDEV_KIND_VLAN] = "vlan",
@@ -135,12 +139,12 @@ int config_parse_netdev_kind(
 
         k = netdev_kind_from_string(rvalue);
         if (k < 0) {
-                log_syntax(unit, LOG_ERR, filename, line, 0, "Failed to parse netdev kind, ignoring assignment: %s", rvalue);
+                log_syntax(unit, LOG_WARNING, filename, line, 0, "Failed to parse netdev kind, ignoring assignment: %s", rvalue);
                 return 0;
         }
 
         if (*kind != _NETDEV_KIND_INVALID && *kind != k) {
-                log_syntax(unit, LOG_ERR, filename, line, 0,
+                log_syntax(unit, LOG_WARNING, filename, line, 0,
                            "Specified netdev kind is different from the previous value '%s', ignoring assignment: %s",
                            netdev_kind_to_string(*kind), rvalue);
                 return 0;
@@ -362,7 +366,7 @@ static int netdev_enslave(NetDev *netdev, Link *link, link_netlink_message_handl
                 if (r >= 0)
                         callback(netdev->manager->rtnl, m, link);
         } else {
-                /* the netdev is not yet read, save this request for when it is */
+                /* the netdev is not yet ready, save this request for when it is */
                 netdev_join_callback *cb;
 
                 cb = new(netdev_join_callback, 1);
@@ -396,10 +400,8 @@ int netdev_set_ifindex(NetDev *netdev, sd_netlink_message *message) {
         if (r < 0)
                 return log_netdev_error_errno(netdev, r, "Could not get rtnl message type: %m");
 
-        if (type != RTM_NEWLINK) {
-                log_netdev_error(netdev, "Cannot set ifindex from unexpected rtnl message type.");
-                return -EINVAL;
-        }
+        if (type != RTM_NEWLINK)
+                return log_netdev_error_errno(netdev, SYNTHETIC_ERRNO(EINVAL), "Cannot set ifindex from unexpected rtnl message type.");
 
         r = sd_rtnl_message_link_get_ifindex(message, &ifindex);
         if (r < 0) {
@@ -430,7 +432,7 @@ int netdev_set_ifindex(NetDev *netdev, sd_netlink_message *message) {
         if (!streq(netdev->ifname, received_name)) {
                 log_netdev_error(netdev, "Received newlink with wrong IFNAME %s", received_name);
                 netdev_enter_failed(netdev);
-                return r;
+                return -EINVAL;
         }
 
         r = sd_netlink_message_enter_container(message, IFLA_LINKINFO);
@@ -458,11 +460,10 @@ int netdev_set_ifindex(NetDev *netdev, sd_netlink_message *message) {
         }
 
         if (!streq(kind, received_kind)) {
-                log_netdev_error(netdev,
-                                 "Received newlink with wrong KIND %s, "
-                                 "expected %s", received_kind, kind);
+                log_netdev_error(netdev, "Received newlink with wrong KIND %s, expected %s",
+                                 received_kind, kind);
                 netdev_enter_failed(netdev);
-                return r;
+                return -EINVAL;
         }
 
         netdev->ifindex = ifindex;
@@ -551,7 +552,7 @@ static int netdev_create(NetDev *netdev, Link *link, link_netlink_message_handle
                                 return log_netdev_error_errno(netdev, r, "Could not append IFLA_ADDRESS attribute: %m");
                 }
 
-                if (netdev->mtu) {
+                if (netdev->mtu != 0) {
                         r = sd_netlink_message_append_u32(m, IFLA_MTU, netdev->mtu);
                         if (r < 0)
                                 return log_netdev_error_errno(netdev, r, "Could not append IFLA_MTU attribute: %m");
@@ -644,7 +645,7 @@ int netdev_join(NetDev *netdev, Link *link, link_netlink_message_handler_t callb
                         return r;
                 break;
         default:
-                assert_not_reached("Can not join independent netdev");
+                assert_not_reached("Cannot join independent netdev");
         }
 
         return 0;
@@ -684,15 +685,18 @@ int netdev_load_one(Manager *manager, const char *filename) {
         };
 
         dropin_dirname = strjoina(basename(filename), ".d");
-        r = config_parse_many(filename, NETWORK_DIRS, dropin_dirname,
-                              NETDEV_COMMON_SECTIONS NETDEV_OTHER_SECTIONS,
-                              config_item_perf_lookup, network_netdev_gperf_lookup,
-                              CONFIG_PARSE_WARN, netdev_raw);
+        r = config_parse_many(
+                        filename, NETWORK_DIRS, dropin_dirname,
+                        NETDEV_COMMON_SECTIONS NETDEV_OTHER_SECTIONS,
+                        config_item_perf_lookup, network_netdev_gperf_lookup,
+                        CONFIG_PARSE_WARN,
+                        netdev_raw,
+                        NULL);
         if (r < 0)
                 return r;
 
         /* skip out early if configuration does not match the environment */
-        if (!condition_test_list(netdev_raw->conditions, NULL, NULL, NULL)) {
+        if (!condition_test_list(netdev_raw->conditions, environ, NULL, NULL, NULL)) {
                 log_debug("%s: Conditions in the file do not match the system environment, skipping.", filename);
                 return 0;
         }
@@ -724,10 +728,12 @@ int netdev_load_one(Manager *manager, const char *filename) {
         if (NETDEV_VTABLE(netdev)->init)
                 NETDEV_VTABLE(netdev)->init(netdev);
 
-        r = config_parse_many(filename, NETWORK_DIRS, dropin_dirname,
-                              NETDEV_VTABLE(netdev)->sections,
-                              config_item_perf_lookup, network_netdev_gperf_lookup,
-                              CONFIG_PARSE_WARN, netdev);
+        r = config_parse_many(
+                        filename, NETWORK_DIRS, dropin_dirname,
+                        NETDEV_VTABLE(netdev)->sections,
+                        config_item_perf_lookup, network_netdev_gperf_lookup,
+                        CONFIG_PARSE_WARN,
+                        netdev, NULL);
         if (r < 0)
                 return r;
 
@@ -750,11 +756,9 @@ int netdev_load_one(Manager *manager, const char *filename) {
                                                       netdev->ifname);
         }
 
-        r = hashmap_ensure_allocated(&netdev->manager->netdevs, &string_hash_ops);
-        if (r < 0)
-                return r;
-
-        r = hashmap_put(netdev->manager->netdevs, netdev->ifname, netdev);
+        r = hashmap_ensure_put(&netdev->manager->netdevs, &string_hash_ops, netdev->ifname, netdev);
+        if (r == -ENOMEM)
+                return log_oom();
         if (r == -EEXIST) {
                 NetDev *n = hashmap_get(netdev->manager->netdevs, netdev->ifname);
 
@@ -815,6 +819,9 @@ int netdev_load_one(Manager *manager, const char *filename) {
                 break;
         case NETDEV_KIND_XFRM:
                 independent = XFRM(netdev)->independent;
+                break;
+        case NETDEV_KIND_VXLAN:
+                independent = VXLAN(netdev)->independent;
                 break;
         default:
                 break;

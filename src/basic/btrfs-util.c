@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
 #include <fcntl.h>
@@ -160,6 +160,31 @@ int btrfs_subvol_make(const char *path) {
         return btrfs_subvol_make_fd(fd, subvolume);
 }
 
+int btrfs_subvol_make_fallback(const char *path, mode_t mode) {
+        mode_t old, combined;
+        int r;
+
+        assert(path);
+
+        /* Let's work like mkdir(), i.e. take the specified mode, and mask it with the current umask. */
+        old = umask(~mode);
+        combined = old | ~mode;
+        if (combined != ~mode)
+                umask(combined);
+        r = btrfs_subvol_make(path);
+        umask(old);
+
+        if (r >= 0)
+                return 1; /* subvol worked */
+        if (r != -ENOTTY)
+                return r;
+
+        if (mkdir(path, mode) < 0)
+                return -errno;
+
+        return 0; /* plain directory */
+}
+
 int btrfs_subvol_set_read_only_fd(int fd, bool b) {
         uint64_t flags, nflags;
         struct stat st;
@@ -175,11 +200,7 @@ int btrfs_subvol_set_read_only_fd(int fd, bool b) {
         if (ioctl(fd, BTRFS_IOC_SUBVOL_GETFLAGS, &flags) < 0)
                 return -errno;
 
-        if (b)
-                nflags = flags | BTRFS_SUBVOL_RDONLY;
-        else
-                nflags = flags & ~BTRFS_SUBVOL_RDONLY;
-
+        nflags = UPDATE_FLAG(flags, BTRFS_SUBVOL_RDONLY, b);
         if (flags == nflags)
                 return 0;
 
@@ -294,11 +315,20 @@ int btrfs_get_block_device_fd(int fd, dev_t *dev) {
                         return -errno;
                 }
 
+                /* For the root fs — when no initrd is involved — btrfs returns /dev/root on any kernels from
+                 * the past few years. That sucks, as we have no API to determine the actual root then. let's
+                 * return an recognizable error for this case, so that the caller can maybe print a nice
+                 * message about this.
+                 *
+                 * https://bugzilla.kernel.org/show_bug.cgi?id=89721 */
+                if (path_equal((char*) di.path, "/dev/root"))
+                        return -EUCLEAN;
+
                 if (stat((char*) di.path, &st) < 0)
                         return -errno;
 
                 if (!S_ISBLK(st.st_mode))
-                        return -ENODEV;
+                        return -ENOTBLK;
 
                 if (major(st.st_rdev) == 0)
                         return -ENODEV;
@@ -643,7 +673,7 @@ int btrfs_qgroup_get_quota(const char *path, uint64_t qgroupid, BtrfsQuotaInfo *
 int btrfs_subvol_find_subtree_qgroup(int fd, uint64_t subvol_id, uint64_t *ret) {
         uint64_t level, lowest = (uint64_t) -1, lowest_qgroupid = 0;
         _cleanup_free_ uint64_t *qgroups = NULL;
-        int r, n, i;
+        int r, n;
 
         assert(fd >= 0);
         assert(ret);
@@ -673,7 +703,7 @@ int btrfs_subvol_find_subtree_qgroup(int fd, uint64_t subvol_id, uint64_t *ret) 
         if (n < 0)
                 return n;
 
-        for (i = 0; i < n; i++) {
+        for (int i = 0; i < n; i++) {
                 uint64_t id;
 
                 r = btrfs_qgroupid_split(qgroups[i], &level, &id);
@@ -794,7 +824,6 @@ int btrfs_qgroup_set_limit_fd(int fd, uint64_t qgroupid, uint64_t referenced_max
                 .lim.max_rfer = referenced_max,
                 .lim.flags = BTRFS_QGROUP_LIMIT_MAX_RFER,
         };
-        unsigned c;
         int r;
 
         assert(fd >= 0);
@@ -813,7 +842,7 @@ int btrfs_qgroup_set_limit_fd(int fd, uint64_t qgroupid, uint64_t referenced_max
 
         args.qgroupid = qgroupid;
 
-        for (c = 0;; c++) {
+        for (unsigned c = 0;; c++) {
                 if (ioctl(fd, BTRFS_IOC_QGROUP_LIMIT, &args) < 0) {
 
                         if (errno == EBUSY && c < 10) {
@@ -894,7 +923,6 @@ static int qgroup_create_or_destroy(int fd, bool b, uint64_t qgroupid) {
                 .create = b,
                 .qgroupid = qgroupid,
         };
-        unsigned c;
         int r;
 
         r = btrfs_is_filesystem(fd);
@@ -903,12 +931,15 @@ static int qgroup_create_or_destroy(int fd, bool b, uint64_t qgroupid) {
         if (r == 0)
                 return -ENOTTY;
 
-        for (c = 0;; c++) {
+        for (unsigned c = 0;; c++) {
                 if (ioctl(fd, BTRFS_IOC_QGROUP_CREATE, &args) < 0) {
 
-                        /* If quota is not enabled, we get EINVAL. Turn this into a recognizable error */
-                        if (errno == EINVAL)
-                                return -ENOPROTOOPT;
+                        /* On old kernels if quota is not enabled, we get EINVAL. On newer kernels we get
+                         * ENOTCONN. Let's always convert this to ENOTCONN to make this recognizable
+                         * everywhere the same way. */
+
+                        if (IN_SET(errno, EINVAL, ENOTCONN))
+                                return -ENOTCONN;
 
                         if (errno == EBUSY && c < 10) {
                                 (void) btrfs_quota_scan_wait(fd);
@@ -935,7 +966,7 @@ int btrfs_qgroup_destroy(int fd, uint64_t qgroupid) {
 int btrfs_qgroup_destroy_recursive(int fd, uint64_t qgroupid) {
         _cleanup_free_ uint64_t *qgroups = NULL;
         uint64_t subvol_id;
-        int i, n, r;
+        int n, r;
 
         /* Destroys the specified qgroup, but unassigns it from all
          * its parents first. Also, it recursively destroys all
@@ -950,7 +981,7 @@ int btrfs_qgroup_destroy_recursive(int fd, uint64_t qgroupid) {
         if (n < 0)
                 return n;
 
-        for (i = 0; i < n; i++) {
+        for (int i = 0; i < n; i++) {
                 uint64_t id;
 
                 r = btrfs_qgroupid_split(qgroups[i], NULL, &id);
@@ -1010,7 +1041,6 @@ static int qgroup_assign_or_unassign(int fd, bool b, uint64_t child, uint64_t pa
                 .src = child,
                 .dst = parent,
         };
-        unsigned c;
         int r;
 
         r = btrfs_is_filesystem(fd);
@@ -1019,7 +1049,7 @@ static int qgroup_assign_or_unassign(int fd, bool b, uint64_t child, uint64_t pa
         if (r == 0)
                 return -ENOTTY;
 
-        for (c = 0;; c++) {
+        for (unsigned c = 0;; c++) {
                 r = ioctl(fd, BTRFS_IOC_QGROUP_ASSIGN, &args);
                 if (r < 0) {
                         if (errno == EBUSY && c < 10) {
@@ -1128,7 +1158,6 @@ static int subvol_remove_children(int fd, const char *subvolume, uint64_t subvol
                 FOREACH_BTRFS_IOCTL_SEARCH_HEADER(i, sh, args) {
                         _cleanup_free_ char *p = NULL;
                         const struct btrfs_root_ref *ref;
-                        struct btrfs_ioctl_ino_lookup_args ino_args;
 
                         btrfs_ioctl_search_args_set(&args, sh);
 
@@ -1143,9 +1172,10 @@ static int subvol_remove_children(int fd, const char *subvolume, uint64_t subvol
                         if (!p)
                                 return -ENOMEM;
 
-                        zero(ino_args);
-                        ino_args.treeid = subvol_id;
-                        ino_args.objectid = htole64(ref->dirid);
+                        struct btrfs_ioctl_ino_lookup_args ino_args = {
+                                .treeid = subvol_id,
+                                .objectid = htole64(ref->dirid),
+                        };
 
                         if (ioctl(fd, BTRFS_IOC_INO_LOOKUP, &ino_args) < 0)
                                 return -errno;
@@ -1318,7 +1348,7 @@ int btrfs_qgroup_copy_limits(int fd, uint64_t old_qgroupid, uint64_t new_qgroupi
 static int copy_quota_hierarchy(int fd, uint64_t old_subvol_id, uint64_t new_subvol_id) {
         _cleanup_free_ uint64_t *old_qgroups = NULL, *old_parent_qgroups = NULL;
         bool copy_from_parent = false, insert_intermediary_qgroup = false;
-        int n_old_qgroups, n_old_parent_qgroups, r, i;
+        int n_old_qgroups, n_old_parent_qgroups, r;
         uint64_t old_parent_id;
 
         assert(fd >= 0);
@@ -1342,9 +1372,8 @@ static int copy_quota_hierarchy(int fd, uint64_t old_subvol_id, uint64_t new_sub
                         return n_old_parent_qgroups;
         }
 
-        for (i = 0; i < n_old_qgroups; i++) {
+        for (int i = 0; i < n_old_qgroups; i++) {
                 uint64_t id;
-                int j;
 
                 r = btrfs_qgroupid_split(old_qgroups[i], NULL, &id);
                 if (r < 0)
@@ -1359,14 +1388,13 @@ static int copy_quota_hierarchy(int fd, uint64_t old_subvol_id, uint64_t new_sub
                         break;
                 }
 
-                for (j = 0; j < n_old_parent_qgroups; j++)
-                        if (old_parent_qgroups[j] == old_qgroups[i]) {
+                for (int j = 0; j < n_old_parent_qgroups; j++)
+                        if (old_parent_qgroups[j] == old_qgroups[i])
                                 /* The old subvolume shared a common
                                  * parent qgroup with its parent
                                  * subvolume. Let's set up something
                                  * similar in the destination. */
                                 copy_from_parent = true;
-                        }
         }
 
         if (!insert_intermediary_qgroup && !copy_from_parent)
@@ -1483,7 +1511,6 @@ static int subvol_snapshot_children(
 
                 FOREACH_BTRFS_IOCTL_SEARCH_HEADER(i, sh, args) {
                         _cleanup_free_ char *p = NULL, *c = NULL, *np = NULL;
-                        struct btrfs_ioctl_ino_lookup_args ino_args;
                         const struct btrfs_root_ref *ref;
                         _cleanup_close_ int old_child_fd = -1, new_child_fd = -1;
 
@@ -1507,9 +1534,10 @@ static int subvol_snapshot_children(
                         if (!p)
                                 return -ENOMEM;
 
-                        zero(ino_args);
-                        ino_args.treeid = old_subvol_id;
-                        ino_args.objectid = htole64(ref->dirid);
+                        struct btrfs_ioctl_ino_lookup_args ino_args = {
+                                .treeid = old_subvol_id,
+                                .objectid = htole64(ref->dirid),
+                        };
 
                         if (ioctl(old_fd, BTRFS_IOC_INO_LOOKUP, &ino_args) < 0)
                                 return -errno;
@@ -1621,7 +1649,10 @@ int btrfs_subvol_snapshot_fd_full(
                 } else if (r < 0)
                         return r;
 
-                r = copy_directory_fd_full(old_fd, new_path, COPY_MERGE|COPY_REFLINK|COPY_SAME_MOUNT|(FLAGS_SET(flags, BTRFS_SNAPSHOT_SIGINT) ? COPY_SIGINT : 0), progress_path, progress_bytes, userdata);
+                r = copy_directory_fd_full(
+                                old_fd, new_path,
+                                COPY_MERGE|COPY_REFLINK|COPY_SAME_MOUNT|COPY_HARDLINKS|(FLAGS_SET(flags, BTRFS_SNAPSHOT_SIGINT) ? COPY_SIGINT : 0),
+                                progress_path, progress_bytes, userdata);
                 if (r < 0)
                         goto fallback_fail;
 
@@ -1845,12 +1876,11 @@ int btrfs_subvol_auto_qgroup_fd(int fd, uint64_t subvol_id, bool insert_intermed
         if (insert_intermediary_qgroup) {
                 uint64_t lowest = 256, new_qgroupid;
                 bool created = false;
-                int i;
 
                 /* Determine the lowest qgroup that the parent
                  * subvolume is assigned to. */
 
-                for (i = 0; i < n; i++) {
+                for (int i = 0; i < n; i++) {
                         uint64_t level;
 
                         r = btrfs_qgroupid_split(qgroups[i], &level, NULL);
@@ -1875,7 +1905,7 @@ int btrfs_subvol_auto_qgroup_fd(int fd, uint64_t subvol_id, bool insert_intermed
                 if (r >= 0)
                         changed = created = true;
 
-                for (i = 0; i < n; i++) {
+                for (int i = 0; i < n; i++) {
                         r = btrfs_qgroup_assign(fd, new_qgroupid, qgroups[i]);
                         if (r < 0 && r != -EEXIST) {
                                 if (created)

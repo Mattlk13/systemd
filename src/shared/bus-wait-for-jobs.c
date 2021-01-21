@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "alloc-util.h"
 #include "bus-wait-for-jobs.h"
@@ -65,7 +65,7 @@ void bus_wait_for_jobs_free(BusWaitForJobs *d) {
         if (!d)
                 return;
 
-        set_free_free(d->jobs);
+        set_free(d->jobs);
 
         sd_bus_slot_unref(d->slot_disconnected);
         sd_bus_slot_unref(d->slot_job_removed);
@@ -200,22 +200,24 @@ static void log_job_error_with_service_result(const char* service, const char *r
 
                 if (i < ELEMENTSOF(explanations)) {
                         log_error("Job for %s failed because %s.\n"
-                                  "See \"%s status %s\" and \"%s -xe\" for details.\n",
+                                  "See \"%s status %s\" and \"%s -xeu %s\" for details.\n",
                                   service,
                                   explanations[i].explanation,
                                   systemctl,
                                   service_shell_quoted ?: "<service>",
-                                  journalctl);
+                                  journalctl,
+                                  service_shell_quoted ?: "<service>");
                         goto finish;
                 }
         }
 
         log_error("Job for %s failed.\n"
-                  "See \"%s status %s\" and \"%s -xe\" for details.\n",
+                  "See \"%s status %s\" and \"%s -xeu %s\" for details.\n",
                   service,
                   systemctl,
                   service_shell_quoted ?: "<service>",
-                  journalctl);
+                  journalctl,
+                  service_shell_quoted ?: "<service>");
 
 finish:
         /* For some results maybe additional explanation is required */
@@ -315,15 +317,9 @@ int bus_wait_for_jobs(BusWaitForJobs *d, bool quiet, const char* const* extra_ar
 }
 
 int bus_wait_for_jobs_add(BusWaitForJobs *d, const char *path) {
-        int r;
-
         assert(d);
 
-        r = set_ensure_allocated(&d->jobs, &string_hash_ops);
-        if (r < 0)
-                return r;
-
-        return set_put_strdup(d->jobs, path);
+        return set_put_strdup(&d->jobs, path);
 }
 
 int bus_wait_for_jobs_one(BusWaitForJobs *d, const char *path, bool quiet) {

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 #include <stdbool.h>
@@ -47,6 +47,10 @@ static inline bool UNIT_IS_INACTIVE_OR_DEACTIVATING(UnitActiveState t) {
 
 static inline bool UNIT_IS_INACTIVE_OR_FAILED(UnitActiveState t) {
         return IN_SET(t, UNIT_INACTIVE, UNIT_FAILED);
+}
+
+static inline bool UNIT_IS_LOAD_COMPLETE(UnitLoadState t) {
+        return t >= 0 && t < _UNIT_LOAD_STATE_MAX && t != UNIT_STUB && t != UNIT_MERGED;
 }
 
 /* Stores the 'reason' a dependency was created as a bit mask, i.e. due to which configuration source it came to be. We
@@ -114,10 +118,13 @@ typedef struct Unit {
         UnitLoadState load_state;
         Unit *merged_into;
 
-        char *id; /* One name is special because we use it for identification. Points to an entry in the names set */
+        FreezerState freezer_state;
+        sd_bus_message *pending_freezer_message;
+
+        char *id;   /* The one special name that we use for identification */
         char *instance;
 
-        Set *names;
+        Set *aliases; /* All the other names. */
 
         /* For each dependency type we maintain a Hashmap whose key is the Unit* object, and the value encodes why the
          * dependency exists, using the UnitDependencyInfo type */
@@ -133,6 +140,7 @@ typedef struct Unit {
         char *source_path; /* if converted, the source file */
         char **dropin_paths;
 
+        usec_t fragment_not_found_timestamp_hash;
         usec_t fragment_mtime;
         usec_t source_mtime;
         usec_t dropin_mtime;
@@ -252,7 +260,10 @@ typedef struct Unit {
         nsec_t cpu_usage_base;
         nsec_t cpu_usage_last; /* the most recently read value */
 
-        /* The  current counter of the oom_kill field in the memory.events cgroup attribute */
+        /* The current counter of processes sent SIGKILL by systemd-oomd */
+        uint64_t managed_oom_kill_last;
+
+        /* The current counter of the oom_kill field in the memory.events cgroup attribute */
         uint64_t oom_kill_last;
 
         /* Where the io.stat data was at the time the unit was started */
@@ -483,6 +494,11 @@ typedef struct UnitVTable {
         /* Clear out the various runtime/state/cache/logs/configuration data */
         int (*clean)(Unit *u, ExecCleanMask m);
 
+        /* Freeze the unit */
+        int (*freeze)(Unit *u);
+        int (*thaw)(Unit *u);
+        bool (*can_freeze)(Unit *u);
+
         /* Return which kind of data can be cleaned */
         int (*can_clean)(Unit *u, ExecCleanMask *ret);
 
@@ -515,6 +531,9 @@ typedef struct UnitVTable {
          * even though nothing references it and it isn't active in any way. */
         bool (*may_gc)(Unit *u);
 
+        /* Return true when the unit is not controlled by the manager (e.g. extrinsic mounts). */
+        bool (*is_extrinsic)(Unit *u);
+
         /* When the unit is not running and no job for it queued we shall release its runtime resources */
         void (*release_resources)(Unit *u);
 
@@ -531,7 +550,7 @@ typedef struct UnitVTable {
         void (*notify_cgroup_oom)(Unit *u);
 
         /* Called whenever a process of this unit sends us a message */
-        void (*notify_message)(Unit *u, const struct ucred *ucred, char **tags, FDSet *fds);
+        void (*notify_message)(Unit *u, const struct ucred *ucred, char * const *tags, FDSet *fds);
 
         /* Called whenever a name this Unit registered for comes or goes away. */
         void (*bus_name_owner_change)(Unit *u, const char *new_owner);
@@ -592,9 +611,6 @@ typedef struct UnitVTable {
          * of this type will immediately fail. */
         bool (*supported)(void);
 
-        /* The bus vtable */
-        const sd_bus_vtable *bus_vtable;
-
         /* The strings to print in status messages */
         UnitStatusMessageFormats status_message_formats;
 
@@ -610,14 +626,14 @@ typedef struct UnitVTable {
         /* True if the unit type knows a failure state, and thus can be source of an OnFailure= dependency */
         bool can_fail:1;
 
-        /* True if After= dependencies should be refused */
-        bool refuse_after:1;
-
         /* True if units of this type shall be startable only once and then never again */
         bool once_only:1;
 
         /* True if queued jobs of this type should be GC'ed if no other job needs them anymore */
         bool gc_jobs:1;
+
+        /* True if systemd-oomd can monitor and act on this unit's recursive children's cgroup(s)  */
+        bool can_set_managed_oom:1;
 } UnitVTable;
 
 extern const UnitVTable * const unit_vtable[_UNIT_TYPE_MAX];
@@ -671,6 +687,11 @@ int unit_set_description(Unit *u, const char *description);
 
 bool unit_may_gc(Unit *u);
 
+static inline bool unit_is_extrinsic(Unit *u) {
+        return u->perpetual ||
+                (UNIT_VTABLE(u)->is_extrinsic && UNIT_VTABLE(u)->is_extrinsic(u));
+}
+
 void unit_add_to_load_queue(Unit *u);
 void unit_add_to_dbus_queue(Unit *u);
 void unit_add_to_cleanup_queue(Unit *u);
@@ -695,6 +716,8 @@ const char *unit_status_string(Unit *u) _pure_;
 bool unit_has_name(const Unit *u, const char *name);
 
 UnitActiveState unit_active_state(Unit *u);
+FreezerState unit_freezer_state(Unit *u);
+int unit_freezer_state_kernel(Unit *u, FreezerState *ret);
 
 const char* unit_sub_state_to_string(Unit *u);
 
@@ -825,7 +848,6 @@ void unit_unref_uid_gid(Unit *u, bool destroy_now);
 
 void unit_notify_user_lookup(Unit *u, uid_t uid, gid_t gid);
 
-int unit_set_invocation_id(Unit *u, sd_id128_t id);
 int unit_acquire_invocation_id(Unit *u);
 
 bool unit_shall_confirm_spawn(Unit *u);
@@ -842,7 +864,9 @@ void unit_unlink_state_files(Unit *u);
 
 int unit_prepare_exec(Unit *u);
 
-int unit_warn_leftover_processes(Unit *u);
+int unit_log_leftover_process_start(pid_t pid, int sig, void *userdata);
+int unit_log_leftover_process_stop(pid_t pid, int sig, void *userdata);
+int unit_warn_leftover_processes(Unit *u, cg_kill_log_func_t log_func);
 
 bool unit_needs_console(Unit *u);
 
@@ -874,30 +898,43 @@ int unit_failure_action_exit_status(Unit *u);
 
 int unit_test_trigger_loaded(Unit *u);
 
-void unit_destroy_runtime_directory(Unit *u, const ExecContext *context);
+void unit_destroy_runtime_data(Unit *u, const ExecContext *context);
 int unit_clean(Unit *u, ExecCleanMask mask);
 int unit_can_clean(Unit *u, ExecCleanMask *ret_mask);
 
+bool unit_can_freeze(Unit *u);
+int unit_freeze(Unit *u);
+void unit_frozen(Unit *u);
+
+int unit_thaw(Unit *u);
+void unit_thawed(Unit *u);
+
+int unit_freeze_vtable_common(Unit *u);
+int unit_thaw_vtable_common(Unit *u);
+
 /* Macros which append UNIT= or USER_UNIT= to the message */
 
-#define log_unit_full(unit, level, error, ...)                          \
+#define log_unit_full_errno(unit, level, error, ...)                    \
         ({                                                              \
                 const Unit *_u = (unit);                                \
-                _u ? log_object_internal(level, error, PROJECT_FILE, __LINE__, __func__, _u->manager->unit_log_field, _u->id, _u->manager->invocation_log_field, _u->invocation_id_string, ##__VA_ARGS__) : \
-                        log_internal(level, error, PROJECT_FILE, __LINE__, __func__, ##__VA_ARGS__); \
+                (log_get_max_level() < LOG_PRI(level)) ? -ERRNO_VALUE(error) : \
+                        _u ? log_object_internal(level, error, PROJECT_FILE, __LINE__, __func__, _u->manager->unit_log_field, _u->id, _u->manager->invocation_log_field, _u->invocation_id_string, ##__VA_ARGS__) : \
+                                log_internal(level, error, PROJECT_FILE, __LINE__, __func__, ##__VA_ARGS__); \
         })
 
-#define log_unit_debug(unit, ...)   log_unit_full(unit, LOG_DEBUG, 0, ##__VA_ARGS__)
-#define log_unit_info(unit, ...)    log_unit_full(unit, LOG_INFO, 0, ##__VA_ARGS__)
-#define log_unit_notice(unit, ...)  log_unit_full(unit, LOG_NOTICE, 0, ##__VA_ARGS__)
-#define log_unit_warning(unit, ...) log_unit_full(unit, LOG_WARNING, 0, ##__VA_ARGS__)
-#define log_unit_error(unit, ...)   log_unit_full(unit, LOG_ERR, 0, ##__VA_ARGS__)
+#define log_unit_full(unit, level, ...) (void) log_unit_full_errno(unit, level, 0, __VA_ARGS__)
 
-#define log_unit_debug_errno(unit, error, ...)   log_unit_full(unit, LOG_DEBUG, error, ##__VA_ARGS__)
-#define log_unit_info_errno(unit, error, ...)    log_unit_full(unit, LOG_INFO, error, ##__VA_ARGS__)
-#define log_unit_notice_errno(unit, error, ...)  log_unit_full(unit, LOG_NOTICE, error, ##__VA_ARGS__)
-#define log_unit_warning_errno(unit, error, ...) log_unit_full(unit, LOG_WARNING, error, ##__VA_ARGS__)
-#define log_unit_error_errno(unit, error, ...)   log_unit_full(unit, LOG_ERR, error, ##__VA_ARGS__)
+#define log_unit_debug(unit, ...)   log_unit_full_errno(unit, LOG_DEBUG, 0, __VA_ARGS__)
+#define log_unit_info(unit, ...)    log_unit_full(unit, LOG_INFO, __VA_ARGS__)
+#define log_unit_notice(unit, ...)  log_unit_full(unit, LOG_NOTICE, __VA_ARGS__)
+#define log_unit_warning(unit, ...) log_unit_full(unit, LOG_WARNING, __VA_ARGS__)
+#define log_unit_error(unit, ...)   log_unit_full(unit, LOG_ERR, __VA_ARGS__)
+
+#define log_unit_debug_errno(unit, error, ...)   log_unit_full_errno(unit, LOG_DEBUG, error, __VA_ARGS__)
+#define log_unit_info_errno(unit, error, ...)    log_unit_full_errno(unit, LOG_INFO, error, __VA_ARGS__)
+#define log_unit_notice_errno(unit, error, ...)  log_unit_full_errno(unit, LOG_NOTICE, error, __VA_ARGS__)
+#define log_unit_warning_errno(unit, error, ...) log_unit_full_errno(unit, LOG_WARNING, error, __VA_ARGS__)
+#define log_unit_error_errno(unit, error, ...)   log_unit_full_errno(unit, LOG_ERR, error, __VA_ARGS__)
 
 #define LOG_UNIT_MESSAGE(unit, fmt, ...) "MESSAGE=%s: " fmt, (unit)->id, ##__VA_ARGS__
 #define LOG_UNIT_ID(unit) (unit)->manager->unit_log_format_string, (unit)->id

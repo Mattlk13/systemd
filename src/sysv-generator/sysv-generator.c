@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
 #include <stdio.h>
@@ -655,7 +655,6 @@ static int load_sysv(SysvStub *s) {
 
 static int fix_order(SysvStub *s, Hashmap *all_services) {
         SysvStub *other;
-        Iterator j;
         int r;
 
         assert(s);
@@ -666,7 +665,7 @@ static int fix_order(SysvStub *s, Hashmap *all_services) {
         if (s->sysv_start_priority < 0)
                 return 0;
 
-        HASHMAP_FOREACH(other, all_services, j) {
+        HASHMAP_FOREACH(other, all_services) {
                 if (s == other)
                         continue;
 
@@ -788,19 +787,25 @@ static int enumerate_sysv(const LookupPaths *lp, Hashmap *all_services) {
                         if (!fpath)
                                 return log_oom();
 
-                        service = new0(SysvStub, 1);
+                        log_warning("SysV service '%s' lacks a native systemd unit file. "
+                                    "Automatically generating a unit file for compatibility. "
+                                    "Please update package to include a native systemd unit file, in order to make it more safe and robust.", fpath);
+
+                        service = new(SysvStub, 1);
                         if (!service)
                                 return log_oom();
 
-                        service->sysv_start_priority = -1;
-                        service->name = TAKE_PTR(name);
-                        service->path = TAKE_PTR(fpath);
+                        *service = (SysvStub) {
+                                .sysv_start_priority = -1,
+                                .name = TAKE_PTR(name),
+                                .path = TAKE_PTR(fpath),
+                        };
 
                         r = hashmap_put(all_services, service->name, service);
                         if (r < 0)
                                 return log_oom();
 
-                        service = NULL;
+                        TAKE_PTR(service);
                 }
         }
 
@@ -811,8 +816,6 @@ static int set_dependencies_from_rcnd(const LookupPaths *lp, Hashmap *all_servic
         Set *runlevel_services[ELEMENTSOF(rcnd_table)] = {};
         _cleanup_strv_free_ char **sysvrcnd_path = NULL;
         SysvStub *service;
-        unsigned i;
-        Iterator j;
         char **p;
         int r;
 
@@ -822,9 +825,8 @@ static int set_dependencies_from_rcnd(const LookupPaths *lp, Hashmap *all_servic
         if (r < 0)
                 return r;
 
-        STRV_FOREACH(p, sysvrcnd_path) {
-                for (i = 0; i < ELEMENTSOF(rcnd_table); i ++) {
-
+        STRV_FOREACH(p, sysvrcnd_path)
+                for (unsigned i = 0; i < ELEMENTSOF(rcnd_table); i ++) {
                         _cleanup_closedir_ DIR *d = NULL;
                         _cleanup_free_ char *path = NULL;
                         struct dirent *de;
@@ -843,7 +845,7 @@ static int set_dependencies_from_rcnd(const LookupPaths *lp, Hashmap *all_servic
                                 continue;
                         }
 
-                        FOREACH_DIRENT(de, d, log_error_errno(errno, "Failed to enumerate directory %s, ignoring: %m", path)) {
+                        FOREACH_DIRENT(de, d, log_warning_errno(errno, "Failed to enumerate directory %s, ignoring: %m", path)) {
                                 _cleanup_free_ char *name = NULL, *fpath = NULL;
                                 int a, b;
 
@@ -879,23 +881,16 @@ static int set_dependencies_from_rcnd(const LookupPaths *lp, Hashmap *all_servic
 
                                 service->sysv_start_priority = MAX(a*10 + b, service->sysv_start_priority);
 
-                                r = set_ensure_allocated(&runlevel_services[i], NULL);
-                                if (r < 0) {
-                                        log_oom();
-                                        goto finish;
-                                }
-
-                                r = set_put(runlevel_services[i], service);
+                                r = set_ensure_put(&runlevel_services[i], NULL, service);
                                 if (r < 0) {
                                         log_oom();
                                         goto finish;
                                 }
                         }
                 }
-        }
 
-        for (i = 0; i < ELEMENTSOF(rcnd_table); i ++)
-                SET_FOREACH(service, runlevel_services[i], j) {
+        for (unsigned i = 0; i < ELEMENTSOF(rcnd_table); i++)
+                SET_FOREACH(service, runlevel_services[i]) {
                         r = strv_extend(&service->before, rcnd_table[i].target);
                         if (r < 0) {
                                 log_oom();
@@ -911,7 +906,7 @@ static int set_dependencies_from_rcnd(const LookupPaths *lp, Hashmap *all_servic
         r = 0;
 
 finish:
-        for (i = 0; i < ELEMENTSOF(rcnd_table); i++)
+        for (unsigned i = 0; i < ELEMENTSOF(rcnd_table); i++)
                 set_free(runlevel_services[i]);
 
         return r;
@@ -921,7 +916,6 @@ static int run(const char *dest, const char *dest_early, const char *dest_late) 
         _cleanup_(free_sysvstub_hashmapp) Hashmap *all_services = NULL;
         _cleanup_(lookup_paths_free) LookupPaths lp = {};
         SysvStub *service;
-        Iterator j;
         int r;
 
         assert_se(arg_dest = dest_late);
@@ -942,10 +936,10 @@ static int run(const char *dest, const char *dest_early, const char *dest_late) 
         if (r < 0)
                 return r;
 
-        HASHMAP_FOREACH(service, all_services, j)
+        HASHMAP_FOREACH(service, all_services)
                 (void) load_sysv(service);
 
-        HASHMAP_FOREACH(service, all_services, j) {
+        HASHMAP_FOREACH(service, all_services) {
                 (void) fix_order(service, all_services);
                 (void) generate_unit_file(service);
         }

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 /***
   Copyright © 2017 Intel Corporation. All rights reserved.
 ***/
@@ -75,6 +75,12 @@ _public_ sd_event *sd_radv_get_event(sd_radv *ra) {
         assert_return(ra, NULL);
 
         return ra->event;
+}
+
+_public_ int sd_radv_is_running(sd_radv *ra) {
+        assert_return(ra, false);
+
+        return ra->state != SD_RADV_STATE_IDLE;
 }
 
 static void radv_reset(sd_radv *ra) {
@@ -347,7 +353,8 @@ fail:
 _public_ int sd_radv_stop(sd_radv *ra) {
         int r;
 
-        assert_return(ra, -EINVAL);
+        if (!ra)
+                return 0;
 
         if (ra->state == SD_RADV_STATE_IDLE)
                 return 0;
@@ -415,7 +422,7 @@ _public_ int sd_radv_start(sd_radv *ra) {
 
 _public_ int sd_radv_set_ifindex(sd_radv *ra, int ifindex) {
         assert_return(ra, -EINVAL);
-        assert_return(ifindex >= -1, -EINVAL);
+        assert_return(ifindex > 0, -EINVAL);
 
         if (ra->state != SD_RADV_STATE_IDLE)
                 return -EBUSY;
@@ -459,14 +466,14 @@ _public_ int sd_radv_set_hop_limit(sd_radv *ra, uint8_t hop_limit) {
         return 0;
 }
 
-_public_ int sd_radv_set_router_lifetime(sd_radv *ra, uint32_t router_lifetime) {
+_public_ int sd_radv_set_router_lifetime(sd_radv *ra, uint16_t router_lifetime) {
         assert_return(ra, -EINVAL);
 
         if (ra->state != SD_RADV_STATE_IDLE)
                 return -EBUSY;
 
-        /* RFC 4191, Section 2.2, "...If the Router Lifetime is zero, the
-           preference value MUST be set to (00) by the sender..." */
+        /* RFC 4191, Section 2.2, "...If the Router Lifetime is zero, the preference value MUST be set
+         * to (00) by the sender..." */
         if (router_lifetime == 0 &&
             (ra->flags & (0x3 << 3)) != (SD_NDISC_PREFERENCE_MEDIUM << 3))
                 return -ETIME;
@@ -499,17 +506,20 @@ _public_ int sd_radv_set_other_information(sd_radv *ra, int other) {
 }
 
 _public_ int sd_radv_set_preference(sd_radv *ra, unsigned preference) {
-        int r = 0;
-
         assert_return(ra, -EINVAL);
         assert_return(IN_SET(preference,
                              SD_NDISC_PREFERENCE_LOW,
                              SD_NDISC_PREFERENCE_MEDIUM,
                              SD_NDISC_PREFERENCE_HIGH), -EINVAL);
 
+        /* RFC 4191, Section 2.2, "...If the Router Lifetime is zero, the preference value MUST be set
+         * to (00) by the sender..." */
+        if (ra->lifetime == 0 && preference != SD_NDISC_PREFERENCE_MEDIUM)
+                return -EINVAL;
+
         ra->flags = (ra->flags & ~(0x3 << 3)) | (preference << 3);
 
-        return r;
+        return 0;
 }
 
 _public_ int sd_radv_add_prefix(sd_radv *ra, sd_radv_prefix *p, int dynamic) {
@@ -572,6 +582,15 @@ _public_ int sd_radv_add_prefix(sd_radv *ra, sd_radv_prefix *p, int dynamic) {
 
         cur = p;
 
+        /* If RAs have already been sent, send an RA immediately to announce the newly-added prefix */
+        if (ra->ra_sent > 0) {
+                r = radv_send(ra, NULL, ra->lifetime);
+                if (r < 0)
+                        log_radv_errno(r, "Unable to send Router Advertisement for added prefix: %m");
+                else
+                        log_radv("Sent Router Advertisement for added prefix");
+        }
+
  update:
         r = sd_event_now(ra->event, clock_boottime_or_monotonic(), &time_now);
         if (r < 0)
@@ -590,8 +609,7 @@ _public_ int sd_radv_add_prefix(sd_radv *ra, sd_radv_prefix *p, int dynamic) {
         cur->valid_until = valid_until;
         cur->preferred_until = preferred_until;
 
-        log_radv("%s prefix %s/%u preferred %s valid %s",
-                 cur? "Updated": "Added",
+        log_radv("Updated prefix %s/%u preferred %s valid %s",
                  addr_p, p->opt.prefixlen,
                  format_timespan(time_string_preferred, FORMAT_TIMESPAN_MAX,
                                  preferred, USEC_PER_SEC),
@@ -675,10 +693,18 @@ _public_ int sd_radv_add_route_prefix(sd_radv *ra, sd_radv_route_prefix *p, int 
         LIST_APPEND(prefix, ra->route_prefixes, p);
         ra->n_route_prefixes++;
 
-        cur = p;
         if (!dynamic) {
                 log_radv("Added prefix %s/%u", strempty(pretty), p->opt.prefixlen);
                 return 0;
+        }
+
+        /* If RAs have already been sent, send an RA immediately to announce the newly-added route prefix */
+        if (ra->ra_sent > 0) {
+                r = radv_send(ra, NULL, ra->lifetime);
+                if (r < 0)
+                        log_radv_errno(r, "Unable to send Router Advertisement for added route prefix: %m");
+                else
+                        log_radv("Sent Router Advertisement for added route prefix");
         }
 
  update:
@@ -691,8 +717,7 @@ _public_ int sd_radv_add_route_prefix(sd_radv *ra, sd_radv_route_prefix *p, int 
         if (valid_until == USEC_INFINITY)
                 return -EOVERFLOW;
 
-        log_radv("%s route prefix %s/%u valid %s",
-                 cur? "Updated": "Added",
+        log_radv("Updated route prefix %s/%u valid %s",
                  strempty(pretty), p->opt.prefixlen,
                  format_timespan(time_string_valid, FORMAT_TIMESPAN_MAX, valid, USEC_PER_SEC));
 
